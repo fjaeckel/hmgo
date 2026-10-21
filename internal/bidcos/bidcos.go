@@ -87,6 +87,11 @@ type Packet struct {
 	Source  [3]byte
 	Dest    [3]byte
 	Payload []byte // at most 17 bytes
+
+	// FixedMsgcnt makes Encode use Msgcnt even when it is 0. Without
+	// it, a zero Msgcnt means “assign the next counter”. Responses that
+	// must echo the request's counter (e.g. time responses) set it.
+	FixedMsgcnt bool
 }
 
 var messageCounter struct {
@@ -100,7 +105,7 @@ func (p *Packet) Encode() []byte {
 	messageCounter.Lock()
 	defer messageCounter.Unlock()
 	cnt := p.Msgcnt
-	if cnt == 0 {
+	if cnt == 0 && !p.FixedMsgcnt {
 		cnt = messageCounter.counter
 		// The Homematic CCU2 increments its message counter by 9 between
 		// each message. My guess is that the resulting pattern has better

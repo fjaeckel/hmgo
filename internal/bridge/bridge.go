@@ -16,6 +16,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"reflect"
 	"sort"
 	"sync"
 	"time"
@@ -106,12 +107,15 @@ type device struct {
 	lastOnTarget float64
 	// preBoostMode is the control mode before the last boost.
 	preBoostMode string
+	// warnedForeignDest is set once a message to another address was logged.
+	warnedForeignDest bool
 }
 
 type group struct {
 	name        string
 	slug        string
 	thermostats []*device // wall thermostats first
+	targets     []*device // receivers of group commands
 	contacts    []*device
 	climate     *device // source of temperature/humidity/target/mode
 	state       ha.State
@@ -221,6 +225,9 @@ func New(opts Options) (*Bridge, error) {
 		if rg.Climate != nil {
 			g.climate = b.byAddr[rg.Climate.Addr()]
 		}
+		for _, dc := range rg.CommandTargets {
+			g.targets = append(g.targets, b.byAddr[dc.Addr()])
+		}
 		b.groups = append(b.groups, g)
 		b.bySlug[slug] = g
 	}
@@ -230,7 +237,6 @@ func New(opts Options) (*Bridge, error) {
 // Setup registers all configured devices as peers of the radio module,
 // so that it acknowledges their messages and handles AES for them.
 func (b *Bridge) Setup(ctx context.Context) error {
-	current, _ := b.cfg.Keys()
 	for _, d := range b.devices {
 		p := uartgw.Peer{
 			Addr: d.cfg.Addr(),
@@ -238,9 +244,7 @@ func (b *Bridge) Setup(ctx context.Context) error {
 			// wants the number of channels including channel 0.
 			Channels: d.cfg.Channels() + 1,
 		}
-		if current != nil {
-			p.KeyIndex = current.Index
-		}
+		p.KeyIndex = d.cfg.KeyIndex()
 		if d.cfg.AESEnabled() {
 			p.AESChannels = d.cfg.AESChannelList()
 		}
@@ -380,20 +384,40 @@ func (b *Bridge) handleFrame(frame []byte) {
 	metricFrames.WithLabelValues("known").Inc()
 	now := b.now()
 
+	// Messages addressed neither to us nor broadcast are either direct
+	// device-to-device traffic (e.g. wall thermostat → valves) or a sign
+	// of a wrong central_address: the devices keep reporting to the old
+	// CCU address and will ignore our commands.
+	if pkt.Dest != central && pkt.Dest != ([3]byte{}) {
+		metricForeignDest.WithLabelValues(d.desc.Addr, d.cfg.Name).Inc()
+		b.mu.Lock()
+		first := !d.warnedForeignDest
+		d.warnedForeignDest = true
+		b.mu.Unlock()
+		if first {
+			b.logf("%s (%s) sent cmd %02x to %x, not to central_address %x. Direct device links do this; if all its messages go to %x, central_address is probably wrong", d.cfg.Name, d.desc.Addr, pkt.Cmd, pkt.Dest[:], central[:], pkt.Dest[:])
+		}
+	}
+
 	auth := pkt.Auth()
 	metricAuth.WithLabelValues(d.desc.Addr, d.cfg.Name, auth.String()).Inc()
 	if auth == bidcos.AuthFailed {
-		b.logf("%s (%s): message failed AES authentication, ignoring it (cmd %02x)", d.cfg.Name, d.desc.Addr, pkt.Cmd)
+		b.logf("%s (%s): message failed AES authentication, ignoring it (cmd %02x). If the key is right, the device may use another key index than %d: set key_index for this device", d.cfg.Name, d.desc.Addr, pkt.Cmd, d.cfg.KeyIndex())
 		return
 	}
 
 	ev, err := d.dev.Decode(pkt)
+	if err != nil || isNilEvent(ev) {
+		// Decoders may return a typed nil pointer together with the
+		// error; never let it reach stateFromEvent.
+		ev = nil
+	}
 	if err != nil {
 		metricDecodeErrors.WithLabelValues(d.desc.Addr, d.cfg.Name).Inc()
 		b.logf("%s (%s): decoding cmd %02x payload %x: %v", d.cfg.Name, d.desc.Addr, pkt.Cmd, pkt.Payload, err)
 	}
 
-	if tr, ok := ev.(*hm.TimeRequest); ok && tr.Dest == central {
+	if tr, ok := ev.(*hm.TimeRequest); ok && tr.Dest == central && b.cfg.AnswersTimeRequests() {
 		b.queue.push(job{
 			key:   "time:" + d.desc.Addr,
 			kind:  jobTimeResponse,
@@ -613,6 +637,15 @@ func (b *Bridge) Snapshot() Snapshot {
 }
 
 func ptr[T any](v T) *T { return &v }
+
+// isNilEvent reports whether ev is nil or a typed nil pointer.
+func isNilEvent(ev any) bool {
+	if ev == nil {
+		return true
+	}
+	v := reflect.ValueOf(ev)
+	return v.Kind() == reflect.Pointer && v.IsNil()
+}
 
 func authString(a bidcos.Auth) string {
 	switch a {

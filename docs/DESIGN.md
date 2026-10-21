@@ -72,7 +72,7 @@ The dual-coprocessor firmware (used for Homematic IP) answers on dst
 fail with `uartgw.ErrDualCoProFirmware` and a message telling the user
 to install the classic firmware.
 
-Commands we use: OS 0x02 get firmware, 0x0A enable CSMA/CA, 0x0B get
+Commands we use: OS 0x02 get firmware, 0x06 normal mode (leave update mode), 0x0A CSMA/CA (off by default, like FHEM/Homegear), 0x0B get
 serial, 0x0E set time (uint32 BE unix time + int8 UTC offset in 30 min);
 App 0x00 set HMID, 0x02 send, 0x03 set current key, 0x0F set previous
 key, 0x0B set temp key (key payload: 16 key bytes + 1 index byte; 17

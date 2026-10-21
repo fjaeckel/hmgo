@@ -102,12 +102,12 @@ func (q *jobQueue) push(j job) uint64 {
 // the meantime (which supersedes the retry).
 func (q *jobQueue) retry(j job) bool {
 	q.mu.Lock()
-	superseded := q.lastSeq[j.key] != j.seq
-	q.mu.Unlock()
-	if superseded {
+	// Check and re-insert under one lock, so that a newer job pushed
+	// concurrently can never be replaced by this stale retry.
+	if q.lastSeq[j.key] != j.seq {
+		q.mu.Unlock()
 		return false
 	}
-	q.mu.Lock()
 	if _, queued := q.jobs[j.key]; !queued {
 		q.order = append(q.order, j.key)
 	}
@@ -236,7 +236,7 @@ func (b *Bridge) handleCommand(cmd ha.Command) {
 			metricCommands.WithLabelValues("unknown_target", "rejected").Inc()
 			return
 		}
-		targets = g.thermostats
+		targets = g.targets
 		what = "group " + g.name
 	default:
 		var d *device
@@ -359,6 +359,10 @@ func (b *Bridge) handleResult(res jobResult) {
 			return
 		}
 		b.logf("%s: %s %v failed: %v", d.cfg.Name, j.action, j.temp, res.err)
+		b.mu.Lock()
+		b.applyUpdate(d, ha.State{LastCommand: fmt.Sprintf("failed: %s (%v)", describeAction(j), res.err)})
+		b.mu.Unlock()
+		b.publishDevice(d)
 		return
 	}
 	metricCommands.WithLabelValues(string(j.action), "ok").Inc()
@@ -366,6 +370,7 @@ func (b *Bridge) handleResult(res jobResult) {
 
 	b.mu.Lock()
 	upd := stateFromEvent(d, res.ev)
+	upd.LastCommand = "ok: " + describeAction(j)
 	// Fill in what the device confirmed implicitly when its ACK carried
 	// no status (or less than we asked for).
 	switch j.action {
@@ -422,4 +427,13 @@ func isRetryable(err error) bool {
 		errors.Is(err, uartgw.ErrNoCredits) ||
 		errors.Is(err, uartgw.ErrTimeout) ||
 		errors.Is(err, context.DeadlineExceeded)
+}
+
+// describeAction renders a climate job for the last_command sensor.
+func describeAction(j job) string {
+	switch j.action {
+	case actionSetTemperature, actionManual:
+		return fmt.Sprintf("%s %.1f", j.action, j.temp)
+	}
+	return string(j.action)
 }

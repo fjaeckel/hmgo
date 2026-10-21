@@ -103,6 +103,16 @@ type Config struct {
 	// (Go duration string). Default "1h".
 	TimeSyncInterval Duration `json:"time_sync_interval"`
 
+	// CSMACA enables listen-before-talk on the radio module. Default
+	// false, like the CCU, FHEM and Homegear.
+	CSMACA bool `json:"csma_ca,omitempty"`
+
+	// AnswerTimeRequests makes hmbridge answer the devices' time
+	// requests itself. Default true. The radio module may already answer
+	// them from its own clock (which hmbridge keeps in sync); set false
+	// if the debug log shows duplicate answers.
+	AnswerTimeRequests *bool `json:"answer_time_requests,omitempty"`
+
 	Devices []Device `json:"devices"`
 	Groups  []Group  `json:"groups,omitempty"`
 
@@ -162,9 +172,19 @@ type Device struct {
 	// functional channels 1..ModelChannels(model) are used (channel 0,
 	// maintenance, is excluded). Setting AESChannels implies AES.
 	AESChannels []int `json:"aes_channels,omitempty"`
+	// KeyIndexOverride is the AES key index this device uses, if it
+	// differs from security.index (e.g. a device that was not re-keyed
+	// after the CCU's key change still uses security.previous.index).
+	// Must be the index of the current or previous key.
+	KeyIndexOverride *int `json:"key_index,omitempty"`
 
-	addr [3]byte
+	addr     [3]byte
+	keyIndex byte
 }
+
+// KeyIndex returns the AES key index the device uses: key_index if set,
+// otherwise the index of the current key.
+func (d Device) KeyIndex() byte { return d.keyIndex }
 
 // Addr returns the parsed BidCoS address.
 func (d Device) Addr() [3]byte { return d.addr }
@@ -206,6 +226,12 @@ type Group struct {
 	Comment Comment  `json:"_comment,omitempty"`
 	Name    string   `json:"name"`
 	Members []string `json:"members"`
+	// ViaWallThermostat sends group commands only to the group's wall
+	// thermostat(s), which forward them to their peered radiator
+	// thermostats. This halves the radio airtime of group commands but
+	// requires the direct TC↔RT-DN links the CCU sets up for a group.
+	// Default false: every thermostat gets the command.
+	ViaWallThermostat bool `json:"via_wall_thermostat,omitempty"`
 
 	thermostats []int // indexes into Config.Devices, TC first
 	contacts    []int
@@ -223,6 +249,10 @@ type ResolvedGroup struct {
 	// (and humidity): the first wall thermostat if any, else the first
 	// radiator thermostat.
 	Climate *Device
+	// CommandTargets are the thermostats that receive group commands:
+	// all Thermostats, or only the wall thermostats if the group has
+	// via_wall_thermostat set and contains one.
+	CommandTargets []*Device
 }
 
 // Comment is ignored. JSON has no comments, so every object in the
@@ -472,9 +502,22 @@ func (c *Config) resolve() error {
 			return fmt.Errorf("%s: serial %q: want 10 characters", where, d.Serial)
 		}
 		for _, ch := range d.AESChannels {
-			if ch < 0 || ch > d.Channels() {
-				return fmt.Errorf("%s: aes_channels: channel %d out of range 0..%d for %s", where, ch, d.Channels(), d.Model)
+			if ch < 1 || ch > d.Channels() {
+				return fmt.Errorf("%s: aes_channels: channel %d out of range 1..%d for %s (channel 0 is the maintenance channel)", where, ch, d.Channels(), d.Model)
 			}
+		}
+		d.keyIndex = c.current.Index
+		if d.KeyIndexOverride != nil {
+			ki := *d.KeyIndexOverride
+			valid := ki == int(c.current.Index) || (c.previous != nil && ki == int(c.previous.Index))
+			if !valid {
+				known := fmt.Sprintf("%d (current)", c.current.Index)
+				if c.previous != nil {
+					known += fmt.Sprintf(" or %d (previous)", c.previous.Index)
+				}
+				return fmt.Errorf("%s: key_index %d is not the index of a configured key; must be %s", where, ki, known)
+			}
+			d.keyIndex = byte(ki)
 		}
 		if j, ok := byName[strings.ToLower(d.Name)]; ok {
 			return fmt.Errorf("%s: duplicate name (also used by devices[%d])", where, j)
@@ -532,6 +575,12 @@ func (c *Config) resolve() error {
 	return nil
 }
 
+// AnswersTimeRequests reports whether hmbridge answers time requests
+// (default true).
+func (c *Config) AnswersTimeRequests() bool {
+	return c.AnswerTimeRequests == nil || *c.AnswerTimeRequests
+}
+
 // CentralAddr returns the parsed central address.
 func (c *Config) CentralAddr() [3]byte { return c.centralAddr }
 
@@ -579,6 +628,11 @@ func (c *Config) ResolvedGroups() []ResolvedGroup {
 		}
 		if len(rg.Thermostats) > 0 {
 			rg.Climate = rg.Thermostats[0]
+		}
+		for _, d := range rg.Thermostats {
+			if !g.ViaWallThermostat || rg.Climate.Model != ModelTC || d.Model == ModelTC {
+				rg.CommandTargets = append(rg.CommandTargets, d)
+			}
 		}
 		res = append(res, rg)
 	}

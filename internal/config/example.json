@@ -2,7 +2,8 @@
   "_comment": [
     "hmbridge example configuration. Every object accepts an optional _comment field.",
     "Only central_address and devices are required; all other fields show their defaults or typical values.",
-    "http_listen serves the status page and Prometheus /metrics (\"\" disables it). time_sync_interval: how often the radio module clock is set."
+    "http_listen serves the status page and Prometheus /metrics (\"\" disables it; use 127.0.0.1:8013 to keep it local). time_sync_interval: how often the radio module clock is set.",
+    "csma_ca enables listen-before-talk (default false, like the CCU). answer_time_requests (default true): set false if the radio module already answers the devices' time requests (duplicate 0x3F answers in the -debug log)."
   ],
 
   "serial_port": "/dev/serial0",
@@ -37,6 +38,9 @@
 
   "time_sync_interval": "1h",
 
+  "csma_ca": false,
+  "answer_time_requests": true,
+
   "devices": [
     {
       "_comment": "Radiator thermostat. aes without aes_channels enforces AES on all channels 1..6.",
@@ -47,10 +51,12 @@
       "aes": true
     },
     {
+      "_comment": "A device that was not re-keyed after the last key change still uses the previous key: key_index selects it.",
       "name": "Wohnzimmer Heizung Fenster",
       "model": "HM-CC-RT-DN",
       "address": "38F5A1",
-      "aes": false
+      "aes": true,
+      "key_index": 1
     },
     {
       "_comment": "Wall thermostat; AES only on the thermal control channel.",
@@ -82,9 +88,11 @@
         "Setpoint/mode commands are sent to all thermostats of the group: wall thermostats first, then radiator thermostats.",
         "Current temperature/humidity come from the wall thermostat if present, else from the first radiator thermostat.",
         "The window state comes from the contact(s): open if any contact is open or tilted.",
-        "Direct peerings between the devices (thermostat team, window contact) are left untouched and keep working without hmbridge."
+        "Direct peerings between the devices (thermostat team, window contact) are left untouched and keep working without hmbridge.",
+        "via_wall_thermostat: send group commands only to the wall thermostat, which forwards them over its direct links (half the radio airtime). Default false."
       ],
       "name": "Wohnzimmer",
+      "via_wall_thermostat": false,
       "members": ["Wohnzimmer Wandthermostat", "Wohnzimmer Heizung", "38F5A1", "Wohnzimmer Fenster"]
     }
   ]

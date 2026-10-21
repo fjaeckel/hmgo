@@ -33,6 +33,11 @@ If you set a "system security key" in OpenCCU, put that passphrase into
 `security.passphrase`. Its index is 1 if you set the key once, and goes up by
 one every time it was changed. If you never set one, leave `security` out.
 
+If the key was changed but some devices were never switched to the new key
+(e.g. they were out of reach), put the old passphrase into
+`security.previous` and give those devices `"key_index"` with the old index.
+hmbridge logs a hint when a device's messages fail AES authentication.
+
 ## 2. Configuration
 
 Copy `internal/config/example.json` to `/etc/hmbridge/config.json` and fill
@@ -73,6 +78,10 @@ On a Raspberry Pi OS Lite installation:
 
 Keep the default `"serial_port": "/dev/serial0"` and `"reset": "gpio"` (the
 module's reset line is GPIO 18).
+
+The status page and `/metrics` listen on all interfaces (`:8013`) so that
+Prometheus can scrape them. They contain no secrets, but they do show device
+names and addresses; set `"http_listen": "127.0.0.1:8013"` to keep them local.
 
 ## 4. Home Assistant
 

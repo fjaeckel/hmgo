@@ -21,7 +21,8 @@ func Configure(fd uintptr) error {
 	termios.Lflag = 0
 	termios.Ispeed = syscall.B115200
 	termios.Ospeed = syscall.B115200
-	termios.Cflag = syscall.B115200 | syscall.CS8 | syscall.CREAD
+	// CLOCAL: ignore modem control lines (no DCD on the module UART).
+	termios.Cflag = syscall.B115200 | syscall.CS8 | syscall.CREAD | syscall.CLOCAL
 
 	// Block on a zero read (instead of returning EOF)
 	termios.Cc[syscall.VMIN] = 1

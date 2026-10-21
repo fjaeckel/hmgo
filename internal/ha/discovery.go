@@ -133,6 +133,11 @@ func entities() []entity {
 			with(diagnostic, map[string]any{"icon": "mdi:rocket-launch"}))},
 		{"sensor", "boost_state", tcOnly, numSensor("Boost state", "boost_state", "", "",
 			with(diagnostic, map[string]any{"icon": "mdi:rocket-launch"}))},
+		{"sensor", "last_command", thermostats, with(diagnostic, map[string]any{
+			"name":           "Last command",
+			"icon":           "mdi:send-check-outline",
+			"value_template": textTemplate("last_command", "None"),
+		})},
 		{"sensor", "fault", rtOnly, with(diagnostic, map[string]any{
 			"name":           "Fault",
 			"icon":           "mdi:alert-circle-outline",
@@ -227,8 +232,10 @@ func entityTopic(cfg TopicConfig, component, id, key string) string {
 // common sets keys shared by all entities of a node.
 func common(cfg TopicConfig, n node, component, uid string, m map[string]any) {
 	m["unique_id"] = uid
-	m["default_entity_id"] = component + "." + uid // HA >= 2025.10
-	m["object_id"] = uid                           // HA < 2025.10; ignored since 2026.4
+	// default_entity_id is honoured since HA 2025.10. object_id is not
+	// sent: it raises a deprecation repair on 2025.10 – 2026.3 and is
+	// ignored since 2026.4; older releases just pick their own entity ID.
+	m["default_entity_id"] = component + "." + uid
 	m["device"] = n.device
 	m["origin"] = map[string]any{
 		"name":        "hmbridge",

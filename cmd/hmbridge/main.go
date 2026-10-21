@@ -104,6 +104,7 @@ func run(ctx context.Context, cfg *config.Config, uart io.ReadWriteCloser) error
 		HMID:     cfg.CentralAddr(),
 		Current:  current,
 		Previous: previous,
+		CSMACA:   cfg.CSMACA,
 		Debug:    *debugFrames,
 	})
 	if err != nil {
@@ -154,7 +155,7 @@ func run(ctx context.Context, cfg *config.Config, uart io.ReadWriteCloser) error
 		// the devices keep being acknowledged) while the broker is down.
 		go func() {
 			defer close(mqttDone)
-			client, err := ha.Connect(mqttCtx, ha.Options{
+			client, err := connectMQTT(mqttCtx, ha.Options{
 				Broker:    broker,
 				Username:  cfg.MQTT.Username,
 				Password:  cfg.MQTT.Password,
@@ -163,10 +164,7 @@ func run(ctx context.Context, cfg *config.Config, uart io.ReadWriteCloser) error
 				OnConnect: b.PublishAll,
 			})
 			if err != nil {
-				if !errors.Is(err, context.Canceled) {
-					log.Printf("MQTT: %v (Home Assistant integration disabled until restart)", err)
-				}
-				return
+				return // only on shutdown
 			}
 			log.Printf("MQTT connected to %s", broker)
 			b.SetPublisher(client)
@@ -188,6 +186,33 @@ func run(ctx context.Context, cfg *config.Config, uart io.ReadWriteCloser) error
 	}
 
 	return b.Run(ctx)
+}
+
+// mqttAuthRetry is the delay between attempts after the broker refused
+// the credentials. The Mosquitto add-on of Home Assistant refuses logins
+// while Home Assistant itself is still starting (e.g. after a power
+// outage, when the Pi is up first), so this is not treated as fatal.
+const mqttAuthRetry = time.Minute
+
+// connectMQTT connects to the broker, retrying until it succeeds or ctx
+// is done. ha.Connect itself retries network errors; rejected
+// credentials are retried here with a longer delay.
+func connectMQTT(ctx context.Context, opts ha.Options) (*ha.Client, error) {
+	for {
+		client, err := ha.Connect(ctx, opts)
+		if err == nil {
+			return client, nil
+		}
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		log.Printf("MQTT: %v; retrying in %v (check mqtt.username/password if this persists)", err, mqttAuthRetry)
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(mqttAuthRetry):
+		}
+	}
 }
 
 // openUART opens and configures the serial port and resets the module

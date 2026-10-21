@@ -28,9 +28,12 @@ heating groups.
     remaining boost time.
   * **Windows and faults:** window state, sabotage, fault codes.
   * **Radio:** signal strength, last seen, message count, AES result.
+  * **Commands:** outcome of the last command (e.g. "failed: boost (no
+    response from device)").
 * **Heating groups**, like the CCU's: one climate entity per group that
-  controls all its thermostats, with temperature from the wall thermostat and
-  window state from the contacts.
+  controls all its thermostats (or only the wall thermostat, which forwards to
+  its valves, with `via_wall_thermostat`), with temperature from the wall
+  thermostat and window state from the contacts.
 * **Prometheus metrics** at `/metrics`, covering:
   * Per-device state.
   * The radio module (frames, acks, retries, duty cycle, errors).

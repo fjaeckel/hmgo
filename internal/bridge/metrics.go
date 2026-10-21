@@ -69,6 +69,10 @@ var (
 		Namespace: "hmbridge", Subsystem: "device", Name: "messages_by_auth_total",
 		Help: "Messages received per device by AES verification result.",
 	}, []string{"address", "name", "auth"})
+	metricForeignDest = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "hmbridge", Subsystem: "device", Name: "messages_to_other_address_total",
+		Help: "Messages from the device addressed to neither the central nor broadcast (direct links, or a wrong central_address).",
+	}, []string{"address", "name"})
 	metricDecodeErrors = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: "hmbridge", Subsystem: "device", Name: "decode_errors_total",
 		Help: "Messages from the device that could not be decoded.",
@@ -98,7 +102,7 @@ func init() {
 		metricBatteryVolts, metricBatteryPercent, metricLowBattery,
 		metricWindowOpen, metricCurrentTemp, metricTargetTemp,
 		metricValve, metricHumidity, metricSabotage, metricFault,
-		metricAuth, metricDecodeErrors,
+		metricAuth, metricDecodeErrors, metricForeignDest,
 		metricFrames, metricUnknownSenders, metricCommands, metricQueueLength,
 	)
 }

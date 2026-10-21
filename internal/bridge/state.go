@@ -16,6 +16,9 @@ import (
 // update.
 func stateFromEvent(d *device, ev any) ha.State {
 	var s ha.State
+	if isNilEvent(ev) {
+		return s
+	}
 	switch e := ev.(type) {
 
 	// HM-CC-RT-DN

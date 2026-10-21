@@ -96,6 +96,11 @@ type Options struct {
 	// The default replies with a device ACK (ack status 0x03) if the
 	// BiDi flag (0x20) is set, otherwise with ack status 0x01.
 	OnSend func(msg []byte) (ackStatus byte, response []byte)
+
+	// OnOS, if non-nil, is called for every request on DstOS before the
+	// built-in handling. If it returns handled, the module acks the
+	// request with ackStatus (no payload; NoAck swallows it) instead.
+	OnOS func(cmd byte, payload []byte) (ackStatus byte, handled bool)
 }
 
 // Peer is the module’s state for a peer.
@@ -129,17 +134,21 @@ type Module struct {
 
 	wmu sync.Mutex // serializes writes
 
-	mu        sync.Mutex
-	inApp     bool
-	hmid      [3]byte
-	hmidSet   bool
-	keys      map[byte][]byte // slot → 17 byte payload
-	peers     map[[3]byte]*Peer
-	sent      [][]byte
-	frames    []Frame
-	timeSet   []byte
-	readErr   error
-	announced int
+	mu      sync.Mutex
+	inApp   bool
+	hmid    [3]byte
+	hmidSet bool
+	keys    map[byte][]byte // slot → 17 byte payload
+	peers   map[[3]byte]*Peer
+	sent    [][]byte
+	frames  []Frame
+	timeSet []byte
+	readErr error
+
+	normalMode bool // OS 0x06 received
+	csmaCA     bool // last OS 0x0A setting
+	csmaCASet  bool // OS 0x0A received
+	announced  int
 
 	done chan struct{}
 	wg   sync.WaitGroup
@@ -258,6 +267,14 @@ func (m *Module) handle(f Frame) error {
 	m.mu.Unlock()
 
 	if f.Dst == DstOS {
+		if m.opts.OnOS != nil {
+			if status, handled := m.opts.OnOS(f.Cmd, f.Payload); handled {
+				if status == NoAck {
+					return nil
+				}
+				return m.ack(f, status)
+			}
+		}
 		switch f.Cmd {
 		case 0x00: // get app
 			name := "Co_CPU_BL"
@@ -282,9 +299,26 @@ func (m *Module) handle(f Frame) error {
 				return m.announce("Co_CPU_App")
 			}
 			return m.announce("Co_CPU_BL")
+		case 0x06: // normal mode (leave update mode)
+			if len(f.Payload) != 0 {
+				return m.ack(f, AckNACK)
+			}
+			m.mu.Lock()
+			m.normalMode = true
+			m.mu.Unlock()
+			return m.ack(f, AckOK)
 		case 0x08: // get credits
 			return m.ack(f, AckInfo, m.opts.Credits)
-		case 0x09, 0x0a: // enable credits, enable CSMA/CA
+		case 0x09: // enable credits
+			return m.ack(f, AckOK)
+		case 0x0a: // enable/disable CSMA/CA
+			if len(f.Payload) != 1 || f.Payload[0] > 1 {
+				return m.ack(f, AckNACK)
+			}
+			m.mu.Lock()
+			m.csmaCA = f.Payload[0] == 1
+			m.csmaCASet = true
+			m.mu.Unlock()
 			return m.ack(f, AckOK)
 		case 0x0b: // get serial
 			return m.ack(f, append([]byte{AckInfo}, m.opts.Serial...)...)
@@ -440,6 +474,9 @@ func (m *Module) Reset() error {
 	m.mu.Lock()
 	m.inApp = false
 	m.hmidSet = false
+	m.normalMode = false
+	m.csmaCA = false
+	m.csmaCASet = false
 	m.keys = make(map[byte][]byte)
 	m.peers = make(map[[3]byte]*Peer)
 	m.mu.Unlock()
@@ -512,6 +549,22 @@ func (m *Module) TimePayload() []byte {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return append([]byte(nil), m.timeSet...)
+}
+
+// NormalMode reports whether the host switched the module to normal
+// mode (OS 0x06) since the last reset.
+func (m *Module) NormalMode() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.normalMode
+}
+
+// CSMACA returns the CSMA/CA setting last received (OS 0x0A) and
+// whether one was received since the last reset.
+func (m *Module) CSMACA() (enabled, set bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.csmaCA, m.csmaCASet
 }
 
 // Err returns the last frame decoding error (e.g. bad CRC from the

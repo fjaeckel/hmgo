@@ -44,20 +44,18 @@ import (
 const epoch2000 = 946684800
 
 // TimestampResponse returns the answer to a time request (cmd 0x3F)
-// from dst. reqMsgcnt is the message counter of the request.
-//
-// Note: bidcos.Packet.Encode substitutes its own counter when Msgcnt is
-// 0, so a request with message counter 0 is answered with a different
-// counter (the device then likely ignores the answer and asks again).
+// from dst. reqMsgcnt is the message counter of the request; the
+// response always echoes it, including 0.
 func TimestampResponse(reqMsgcnt byte, central, dst [3]byte, now time.Time) *bidcos.Packet {
 	_, off := now.Zone()
 	secs := uint32(now.Unix() - epoch2000)
 	return &bidcos.Packet{
-		Msgcnt: reqMsgcnt,
-		Flags:  bidcos.RepeatEnable,
-		Cmd:    bidcos.Timestamp,
-		Source: central,
-		Dest:   dst,
+		Msgcnt:      reqMsgcnt,
+		FixedMsgcnt: true,
+		Flags:       bidcos.RepeatEnable,
+		Cmd:         bidcos.Timestamp,
+		Source:      central,
+		Dest:        dst,
 		Payload: []byte{
 			0x02,
 			byte(int8(off / 1800)),

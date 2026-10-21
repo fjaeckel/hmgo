@@ -59,7 +59,7 @@ func dstName(dst byte) string {
 // constants is entirely correct. For example, we send osGetSerial while
 // the device is in the App state, which doesn’t make sense to me. FHEM
 // does the same though: all of HMUARTLGW_OS_{SET_TIME,GET_FIRMWARE,
-// GET_SERIAL,ENABLE_CSMACA,ENABLE_CREDITS,GET_CREDITS} are sent with
+// NORMAL_MODE,GET_SERIAL,ENABLE_CSMACA,ENABLE_CREDITS,GET_CREDITS} are sent with
 // HMUARTLGW_DST_OS while the application is running, and the module
 // acks them on dstOS.
 const (
@@ -228,8 +228,23 @@ type Config struct {
 	// for the duty cycle metric (default 60s, negative disables).
 	CreditsInterval time.Duration
 
+	// CSMACA enables CSMA/CA (carrier sense multiple access with
+	// collision avoidance, “listen before talk”) in the module
+	// (HMUARTLGW_OS_ENABLE_CSMACA). Default false, like FHEM's csmaCa
+	// attribute (default 0) and Homegear, which both send 0A 00. With
+	// CSMA/CA enabled, transmissions on a busy channel are acked with
+	// status 0x06 and retried.
+	CSMACA bool
+
 	// Debug enables logging of every frame (key material is redacted).
 	Debug bool
+}
+
+func csmaCAByte(enabled bool) byte {
+	if enabled {
+		return 0x01
+	}
+	return 0x00
 }
 
 // Peer describes a BidCoS device the module should talk to on our
@@ -302,6 +317,12 @@ type Conn struct {
 // like FHEM does, and if the application is already running, reboots
 // the module into the bootloader first so that we start from a clean
 // state (no stale peers or keys).
+//
+// After entering the application, Open (in FHEM's order) reads the
+// firmware version, switches the module to normal mode (OS 0x06),
+// reads the serial number, configures CSMA/CA (Config.CSMACA), sets
+// the time, the AES keys and the HMID, then enables duty cycle
+// credits.
 //
 // If Open fails and rw implements io.Closer, rw is closed (so that the
 // reader goroutine terminates).
@@ -748,13 +769,20 @@ func (c *Conn) init(cfg Config) error {
 		fn   func(ctx context.Context) error
 	}{
 		{"getting firmware version", c.getFirmwareVersion},
-		{"enabling CSMA/CA", func(ctx context.Context) error {
-			// on the wire: FD000400020A003D10 (counter 2 in old hmgo)
-			// ack:         FD0004000204011916
-			_, err := c.simple(ctx, dstOS, osEnableCSMACA, []byte{0x01})
+		{"setting normal mode", func(ctx context.Context) error {
+			// FHEM (HMUARTLGW_STATE_SET_NORMAL_MODE) and Homegear
+			// (“Disable update mode”) leave update mode right after
+			// reading the firmware version.
+			_, err := c.simple(ctx, dstOS, osNormalMode, nil)
 			return err
 		}},
 		{"getting serial number", c.getSerialNumber},
+		{"configuring CSMA/CA", func(ctx context.Context) error {
+			// on the wire: FD000400020A003D10 (disabled; counter 2 in old hmgo)
+			// ack:         FD0004000204011916
+			_, err := c.simple(ctx, dstOS, osEnableCSMACA, []byte{csmaCAByte(cfg.CSMACA)})
+			return err
+		}},
 		{"setting time", func(ctx context.Context) error { return c.setTime(ctx, now()) }},
 		{"setting current key", func(ctx context.Context) error {
 			// on the wire: FD001401050300112233445566778899AABBCCDDEEFF024C6D

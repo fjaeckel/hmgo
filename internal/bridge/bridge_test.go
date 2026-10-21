@@ -473,3 +473,122 @@ func init() {
 	log.SetFlags(0)
 	_ = fmt.Sprint
 }
+
+// Review findings (regression tests).
+
+func TestMalformedFramesDoNotCrash(t *testing.T) {
+	e := newEnv(t, testConfig, fakemod.Options{})
+	// Too short INFO_LEVEL, THERMALCONTROL with the wrong length, too
+	// short ACK_STATUS: decoders fail and must not take down the bridge.
+	e.inject(0x01, msg(0x05, 0xa6, 0x10, rtdn, central, 0x0a, 0x24, 0xc8))
+	e.inject(0x01, msg(0x06, 0x86, 0x5a, tc, central, 200, 215))
+	e.inject(0x01, msg(0x07, 0x80, 0x02, rtdn, central, 0x01, 0x04, 0x2a))
+	// A valid frame afterwards is still processed.
+	e.inject(0x01, msg(0x08, 0xa6, 0x10, rtdn2, central, 0x0a, 0xb0, 0xe2, 0x08, 0x00, 0x00))
+	e.waitFor("valid frame after malformed ones", func() bool {
+		st := e.state("hmbridge/38f5a1/state")
+		return st != nil && st["current_temperature"] == 22.6
+	})
+	select {
+	case err := <-e.run:
+		t.Fatalf("Run stopped: %v", err)
+	default:
+	}
+}
+
+func TestTimeRequestCounterZero(t *testing.T) {
+	e := newEnv(t, testConfig, fakemod.Options{})
+	e.inject(0x01, msg(0x00, 0xa6, 0x3f, tc, central))
+	e.waitFor("time response", func() bool {
+		for _, m := range e.mod.Sent() {
+			if m[2] == 0x3f && bytes.Equal(m[6:9], tc[:]) {
+				if m[0] != 0x00 {
+					t.Errorf("response counter = %02x, want 00 (echo of the request)", m[0])
+				}
+				return true
+			}
+		}
+		return false
+	})
+}
+
+func TestTimeRequestsCanBeDisabled(t *testing.T) {
+	cfg := strings.Replace(testConfig, `"reset": "none",`, `"reset": "none", "answer_time_requests": false,`, 1)
+	e := newEnv(t, cfg, fakemod.Options{})
+	e.inject(0x01, msg(0x42, 0xa6, 0x3f, tc, central))
+	// Process a later frame, then check that no answer was sent.
+	e.inject(0x01, msg(0x43, 0xa6, 0x10, rtdn2, central, 0x0a, 0xb0, 0xe2, 0x08, 0x00, 0x00))
+	e.waitFor("later frame", func() bool { return e.state("hmbridge/38f5a1/state")["current_temperature"] != nil })
+	time.Sleep(50 * time.Millisecond)
+	for _, m := range e.mod.Sent() {
+		if m[2] == 0x3f {
+			t.Fatalf("time request answered although disabled: %x", m)
+		}
+	}
+}
+
+func TestPerDeviceKeyIndex(t *testing.T) {
+	cfg := strings.Replace(testConfig,
+		`"security": {"passphrase": "secret", "index": 1},`,
+		`"security": {"passphrase": "new", "index": 2, "previous": {"passphrase": "secret", "index": 1}},`, 1)
+	cfg = strings.Replace(cfg,
+		`{"name": "Wohnzimmer Heizung 2", "model": "HM-CC-RT-DN", "address": "38F5A1"}`,
+		`{"name": "Wohnzimmer Heizung 2", "model": "HM-CC-RT-DN", "address": "38F5A1", "aes": true, "key_index": 1}`, 1)
+	e := newEnv(t, cfg, fakemod.Options{})
+	peers := e.mod.Peers()
+	if got := peers[rtdn].KeyIndex; got != 2 {
+		t.Errorf("default device key index = %d, want 2 (current)", got)
+	}
+	if got := peers[rtdn2].KeyIndex; got != 1 {
+		t.Errorf("overridden device key index = %d, want 1 (previous)", got)
+	}
+}
+
+func TestRetryDoesNotOverrideNewerCommand(t *testing.T) {
+	q := newJobQueue()
+	old := job{key: "climate:x:temperature", temp: 18}
+	old.seq = q.push(old)
+	if _, ok := q.pop(); !ok {
+		t.Fatal("pop failed")
+	}
+	newer := job{key: "climate:x:temperature", temp: 22}
+	q.push(newer)
+	if q.retry(old) {
+		t.Error("retry of a superseded job was accepted")
+	}
+	j, _ := q.pop()
+	if j.temp != 22 {
+		t.Errorf("queued temp = %v, want 22", j.temp)
+	}
+}
+
+func TestGroupViaWallThermostat(t *testing.T) {
+	cfg := strings.Replace(testConfig, `{"name": "Wohnzimmer", "members":`, `{"name": "Wohnzimmer", "via_wall_thermostat": true, "members":`, 1)
+	e := newEnv(t, cfg, fakemod.Options{})
+	e.b.Commands() <- ha.Command{Group: "wohnzimmer", Kind: ha.SetTemperature, Temperature: 20}
+	e.waitFor("command to wall thermostat", func() bool { return len(e.sentClimate(tc)) == 1 })
+	time.Sleep(100 * time.Millisecond)
+	if n := len(e.sentClimate(rtdn)) + len(e.sentClimate(rtdn2)); n != 0 {
+		t.Errorf("%d commands sent to radiator thermostats, want 0", n)
+	}
+}
+
+func TestLastCommandReported(t *testing.T) {
+	e := newEnv(t, testConfig, fakemod.Options{
+		OnSend: func(m []byte) (byte, []byte) {
+			if len(m) > 9 && m[2] == 0x11 && m[9] == 0x83 { // boost: device never answers
+				return fakemod.AckEUnknown, nil
+			}
+			return fakemod.DefaultOnSend(m)
+		},
+	})
+	e.b.Commands() <- ha.Command{Addr: "38f59c", Kind: ha.SetTemperature, Temperature: 19}
+	e.waitFor("ok", func() bool {
+		return e.state("hmbridge/38f59c/state")["last_command"] == "ok: set_temperature 19.0"
+	})
+	e.b.Commands() <- ha.Command{Addr: "38f59c", Kind: ha.SetPreset, Preset: ha.PresetBoost}
+	e.waitFor("failure after retries", func() bool {
+		lc, _ := e.state("hmbridge/38f59c/state")["last_command"].(string)
+		return strings.HasPrefix(lc, "failed: boost")
+	})
+}

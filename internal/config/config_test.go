@@ -198,6 +198,8 @@ func TestValidationErrors(t *testing.T) {
 		{"dup address", wrap(``, dev+`,{"name":"b","model":"HM-CC-RT-DN","address":"0x38f59c"}`), "duplicate address"},
 		{"bad serial", wrap(``, `{"name":"a","model":"HM-CC-RT-DN","address":"38F59C","serial":"MEQ"}`), "serial"},
 		{"bad aes channel", wrap(``, `{"name":"a","model":"HM-Sec-SCo","address":"38F59C","aes_channels":[2]}`), "out of range"},
+		{"aes channel 0", wrap(``, `{"name":"a","model":"HM-CC-RT-DN","address":"38F59C","aes_channels":[0,4]}`), "maintenance channel"},
+		{"unknown key index", wrap(`,"security":{"passphrase":"x","index":2}`, `{"name":"a","model":"HM-CC-RT-DN","address":"38F59C","key_index":1}`), "key_index 1 is not the index of a configured key; must be 2 (current)"},
 		{"key and passphrase", wrap(`,"security":{"key":"`+secretKey+`","passphrase":"topsecret"}`, dev), "not both"},
 		{"empty passphrase", wrap(`,"security":{"passphrase":""}`, dev), "must not be empty"},
 		{"empty security", wrap(`,"security":{}`, dev), "key or passphrase is required"},
@@ -259,5 +261,34 @@ func TestLoadError(t *testing.T) {
 	}
 	if _, err := Load(filepath.Join(t.TempDir(), "missing.json")); err == nil {
 		t.Fatal("want error for missing file")
+	}
+}
+
+func TestKeyIndexAndOptions(t *testing.T) {
+	c, err := Parse([]byte(`{"central_address":"1A2B3C",
+	  "security":{"passphrase":"new","index":3,"previous":{"passphrase":"old","index":2}},
+	  "devices":[
+	    {"name":"a","model":"HM-CC-RT-DN","address":"38F59C"},
+	    {"name":"b","model":"HM-CC-RT-DN","address":"38F59D","key_index":2},
+	    {"name":"w","model":"HM-TC-IT-WM-W-EU","address":"38F59E"}],
+	  "groups":[{"name":"g","via_wall_thermostat":true,"members":["a","b","w"]}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := c.Devices[0].KeyIndex(); got != 3 {
+		t.Errorf("default key index = %d, want 3", got)
+	}
+	if got := c.Devices[1].KeyIndex(); got != 2 {
+		t.Errorf("key_index = %d, want 2", got)
+	}
+	if !c.AnswersTimeRequests() || c.CSMACA {
+		t.Errorf("defaults: answer_time_requests=%v csma_ca=%v, want true/false", c.AnswersTimeRequests(), c.CSMACA)
+	}
+	rg := c.ResolvedGroups()[0]
+	if len(rg.CommandTargets) != 1 || rg.CommandTargets[0].Name != "w" {
+		t.Errorf("command targets = %v, want only the wall thermostat", rg.CommandTargets)
+	}
+	if len(rg.Thermostats) != 3 {
+		t.Errorf("thermostats = %d, want 3", len(rg.Thermostats))
 	}
 }

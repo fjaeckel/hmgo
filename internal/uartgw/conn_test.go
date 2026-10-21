@@ -104,9 +104,61 @@ func TestOpen(t *testing.T) {
 	for _, f := range mod.Frames() {
 		cmds = append(cmds, fmt.Sprintf("%d/%02x", f.Dst, f.Cmd))
 	}
-	want := "0/03 0/02 0/0a 0/0b 0/0e 1/03 1/0f 1/0b 1/00"
+	want := "0/03 0/02 0/06 0/0b 0/0a 0/0e 1/03 1/0f 1/0b 1/00"
 	if got := strings.Join(cmds, " "); !strings.HasPrefix(got, want) {
 		t.Errorf("handshake = %s, want prefix %s", got, want)
+	}
+	if !mod.NormalMode() {
+		t.Errorf("module not switched to normal mode")
+	}
+	for _, f := range mod.Frames() {
+		if f.Dst == 0 && f.Cmd == 0x06 && len(f.Payload) != 0 {
+			t.Errorf("normal mode payload = %x, want empty", f.Payload)
+		}
+	}
+	// CSMA/CA is disabled by default (FHEM csmaCa=0, Homegear 0A 00).
+	if enabled, set := mod.CSMACA(); !set || enabled {
+		t.Errorf("CSMA/CA = %v (set: %v), want disabled", enabled, set)
+	}
+}
+
+func TestOpenCSMACA(t *testing.T) {
+	for _, enable := range []bool{false, true} {
+		t.Run(fmt.Sprintf("CSMACA=%v", enable), func(t *testing.T) {
+			_, mod := open(t, fakemod.Options{}, Config{CSMACA: enable})
+			var payloads []string
+			for _, f := range mod.Frames() {
+				if f.Dst == 0 && f.Cmd == 0x0a {
+					payloads = append(payloads, fmt.Sprintf("%x", f.Payload))
+				}
+			}
+			want := "00"
+			if enable {
+				want = "01"
+			}
+			if got := strings.Join(payloads, " "); got != want {
+				t.Errorf("CSMA/CA payloads = %q, want %q", got, want)
+			}
+			if enabled, set := mod.CSMACA(); !set || enabled != enable {
+				t.Errorf("module CSMA/CA = %v (set: %v), want %v", enabled, set, enable)
+			}
+		})
+	}
+}
+
+func TestOpenNormalModeNACK(t *testing.T) {
+	mod, rw := fakemod.New(fakemod.Options{
+		OnOS: func(cmd byte, payload []byte) (byte, bool) {
+			if cmd == 0x06 {
+				return fakemod.AckNACK, true
+			}
+			return 0, false
+		},
+	})
+	defer mod.Close()
+	_, err := Open(rw, Config{HMID: testHMID, Timeout: time.Second, AnnounceWait: 200 * time.Millisecond})
+	if !errors.Is(err, ErrNACK) || !strings.Contains(err.Error(), "normal mode") {
+		t.Fatalf("Open = %v, want normal mode NACK", err)
 	}
 }
 

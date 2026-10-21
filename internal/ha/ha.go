@@ -38,10 +38,9 @@
 // read the same state topic through value templates. Templates tolerate
 // missing JSON fields: a missing number renders as "" (HA ignores the
 // update), a missing mode/fault renders as "None" (HA shows unknown).
-// unique_id is "hmbridge_<addr>[_<key>]"; both default_entity_id (HA
-// ≥ 2025.10, "<domain>.hmbridge_<addr>[_<key>]") and the deprecated
-// object_id (HA < 2025.10; ignored by ≥ 2026.4) are sent so entity IDs are
-// stable and address-based on all versions.
+// unique_id is "hmbridge_<addr>[_<key>]" and default_entity_id (HA
+// ≥ 2025.10) is "<domain>.hmbridge_<addr>[_<key>]", so entity IDs are
+// stable and address-based. The deprecated object_id is not sent.
 //
 // # Modes
 //
@@ -236,6 +235,10 @@ type State struct {
 	// WindowState is the raw contact state: "closed", "tilted" (RHS
 	// only) or "open". Set WindowOpen too (open = tilted or open).
 	WindowState string
+	// LastCommand describes the outcome of the last command sent to the
+	// device, e.g. "ok: set_temperature 21.5" or "failed: boost (no
+	// response from device)", so failures are visible in Home Assistant.
+	LastCommand string
 	// Sabotage is the tamper contact of a window contact (all supported
 	// models report it, per eQ-3's rftypes XML).
 	Sabotage *bool
@@ -327,6 +330,9 @@ func (s *State) Merge(u State) {
 	if u.AuthStatus != "" {
 		s.AuthStatus = u.AuthStatus
 	}
+	if u.LastCommand != "" {
+		s.LastCommand = u.LastCommand
+	}
 	if u.MessagesReceived != nil {
 		s.MessagesReceived = ptr(*u.MessagesReceived)
 	}
@@ -364,6 +370,7 @@ type stateJSON struct {
 	MessagesReceived   *uint64  `json:"messages_received,omitempty"`
 	WindowState        string   `json:"window_state,omitempty"`
 	Sabotage           *bool    `json:"sabotage,omitempty"`
+	LastCommand        string   `json:"last_command,omitempty"`
 }
 
 // MarshalJSON encodes the state with snake_case field names, omitting
@@ -390,6 +397,7 @@ func (s State) MarshalJSON() ([]byte, error) {
 		MessagesReceived:   s.MessagesReceived,
 		WindowState:        s.WindowState,
 		Sabotage:           s.Sabotage,
+		LastCommand:        s.LastCommand,
 	}
 	if !s.LastSeen.IsZero() {
 		j.LastSeen = s.LastSeen.UTC().Format(time.RFC3339)
@@ -433,6 +441,7 @@ func (s *State) UnmarshalJSON(b []byte) error {
 		MessagesReceived:   j.MessagesReceived,
 		WindowState:        j.WindowState,
 		Sabotage:           j.Sabotage,
+		LastCommand:        j.LastCommand,
 	}
 	if j.LastSeen != "" {
 		t, err := time.Parse(time.RFC3339, j.LastSeen)
