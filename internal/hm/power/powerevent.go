@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"html/template"
 
+	"github.com/fjaeckel/hmgo/internal/hm"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/stapelberg/hmgo/internal/hm"
 )
 
 const prometheusNamespace = "hmpower"

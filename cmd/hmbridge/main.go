@@ -25,12 +25,12 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"golang.org/x/sys/unix"
 
-	"github.com/stapelberg/hmgo/internal/bridge"
-	"github.com/stapelberg/hmgo/internal/config"
-	"github.com/stapelberg/hmgo/internal/gpio"
-	"github.com/stapelberg/hmgo/internal/ha"
-	"github.com/stapelberg/hmgo/internal/serial"
-	"github.com/stapelberg/hmgo/internal/uartgw"
+	"github.com/fjaeckel/hmgo/internal/bridge"
+	"github.com/fjaeckel/hmgo/internal/config"
+	"github.com/fjaeckel/hmgo/internal/gpio"
+	"github.com/fjaeckel/hmgo/internal/ha"
+	"github.com/fjaeckel/hmgo/internal/serial"
+	"github.com/fjaeckel/hmgo/internal/uartgw"
 )
 
 var (

@@ -18,8 +18,8 @@ import (
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 
-	"github.com/stapelberg/hmgo/internal/config"
-	"github.com/stapelberg/hmgo/internal/uartgw/fakemod"
+	"github.com/fjaeckel/hmgo/internal/config"
+	"github.com/fjaeckel/hmgo/internal/uartgw/fakemod"
 )
 
 // TestEndToEnd runs hmbridge's main wiring against an emulated radio

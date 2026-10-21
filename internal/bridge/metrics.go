@@ -3,7 +3,7 @@ package bridge
 import (
 	"github.com/prometheus/client_golang/prometheus"
 
-	"github.com/stapelberg/hmgo/internal/ha"
+	"github.com/fjaeckel/hmgo/internal/ha"
 )
 
 // Bridge-level metrics. Device-specific metrics (temperatures, valve,

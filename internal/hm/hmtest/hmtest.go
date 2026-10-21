@@ -6,7 +6,7 @@ import (
 	"context"
 	"sync"
 
-	"github.com/stapelberg/hmgo/internal/bidcos"
+	"github.com/fjaeckel/hmgo/internal/bidcos"
 )
 
 // Frame builds a received frame in the format accepted by bidcos.Decode.

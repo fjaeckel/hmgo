@@ -5,9 +5,9 @@ import (
 	"fmt"
 	"html/template"
 
+	"github.com/fjaeckel/hmgo/internal/bidcos"
+	"github.com/fjaeckel/hmgo/internal/hm"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/stapelberg/hmgo/internal/bidcos"
-	"github.com/stapelberg/hmgo/internal/hm"
 )
 
 const prometheusNamespace = "hmheating"

@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"html/template"
 
-	"github.com/stapelberg/hmgo/internal/hm"
+	"github.com/fjaeckel/hmgo/internal/hm"
 )
 
 // CmdClimateTeam is BidCoS command 0x59, which an RT-DN sends to its

@@ -26,7 +26,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/stapelberg/hmgo/internal/hmkey"
+	"github.com/fjaeckel/hmgo/internal/hmkey"
 )
 
 // Destinations (first byte of each packet).

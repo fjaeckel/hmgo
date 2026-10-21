@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/stapelberg/hmgo/internal/hmkey"
+	"github.com/fjaeckel/hmgo/internal/hmkey"
 )
 
 const minimal = `{"central_address":"1A2B3C","devices":[{"name":"a","model":"HM-CC-RT-DN","address":"38F59C"}]}`

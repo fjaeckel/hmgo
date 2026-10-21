@@ -3,8 +3,8 @@ package heating_test
 import (
 	"testing"
 
-	"github.com/stapelberg/hmgo/internal/hm"
-	"github.com/stapelberg/hmgo/internal/hm/heating"
+	"github.com/fjaeckel/hmgo/internal/hm"
+	"github.com/fjaeckel/hmgo/internal/hm/heating"
 )
 
 func TestDecodeInfoEvent(t *testing.T) {

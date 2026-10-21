@@ -3,7 +3,7 @@ package hm
 import (
 	"time"
 
-	"github.com/stapelberg/hmgo/internal/bidcos"
+	"github.com/fjaeckel/hmgo/internal/bidcos"
 )
 
 // Time requests (BidCoS cmd 0x3F).

@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"math"
 
+	"github.com/fjaeckel/hmgo/internal/bidcos"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/stapelberg/hmgo/internal/bidcos"
 )
 
 // Climate control commands for HM-CC-RT-DN (control channel 4) and

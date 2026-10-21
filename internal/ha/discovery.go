@@ -232,7 +232,7 @@ func common(cfg TopicConfig, n node, component, uid string, m map[string]any) {
 	m["device"] = n.device
 	m["origin"] = map[string]any{
 		"name":        "hmbridge",
-		"support_url": "https://github.com/stapelberg/hmgo",
+		"support_url": "https://github.com/fjaeckel/hmgo",
 	}
 	m["availability_topic"] = cfg.AvailabilityTopic()
 	m["payload_available"] = PayloadOnline

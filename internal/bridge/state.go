@@ -4,11 +4,11 @@ import (
 	"fmt"
 	"math"
 
-	"github.com/stapelberg/hmgo/internal/ha"
-	"github.com/stapelberg/hmgo/internal/hm"
-	"github.com/stapelberg/hmgo/internal/hm/contact"
-	"github.com/stapelberg/hmgo/internal/hm/heating"
-	"github.com/stapelberg/hmgo/internal/hm/thermal"
+	"github.com/fjaeckel/hmgo/internal/ha"
+	"github.com/fjaeckel/hmgo/internal/hm"
+	"github.com/fjaeckel/hmgo/internal/hm/contact"
+	"github.com/fjaeckel/hmgo/internal/hm/heating"
+	"github.com/fjaeckel/hmgo/internal/hm/thermal"
 )
 
 // stateFromEvent converts a decoded device event into a (partial) Home

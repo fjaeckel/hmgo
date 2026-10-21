@@ -3,8 +3,8 @@ package power_test
 import (
 	"testing"
 
-	"github.com/stapelberg/hmgo/internal/hm"
-	"github.com/stapelberg/hmgo/internal/hm/power"
+	"github.com/fjaeckel/hmgo/internal/hm"
+	"github.com/fjaeckel/hmgo/internal/hm/power"
 )
 
 func TestDecodePowerEvent(t *testing.T) {

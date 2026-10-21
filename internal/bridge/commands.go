@@ -7,11 +7,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/stapelberg/hmgo/internal/ha"
-	"github.com/stapelberg/hmgo/internal/hm"
-	"github.com/stapelberg/hmgo/internal/hm/heating"
-	"github.com/stapelberg/hmgo/internal/hm/thermal"
-	"github.com/stapelberg/hmgo/internal/uartgw"
+	"github.com/fjaeckel/hmgo/internal/ha"
+	"github.com/fjaeckel/hmgo/internal/hm"
+	"github.com/fjaeckel/hmgo/internal/hm/heating"
+	"github.com/fjaeckel/hmgo/internal/hm/thermal"
+	"github.com/fjaeckel/hmgo/internal/uartgw"
 )
 
 // DefaultComfortTemperature is used when switching a device to heat

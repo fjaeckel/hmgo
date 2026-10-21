@@ -12,10 +12,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/fjaeckel/hmgo/internal/bidcos"
+	"github.com/fjaeckel/hmgo/internal/hmkey"
+	"github.com/fjaeckel/hmgo/internal/uartgw/fakemod"
 	"github.com/prometheus/client_golang/prometheus/testutil"
-	"github.com/stapelberg/hmgo/internal/bidcos"
-	"github.com/stapelberg/hmgo/internal/hmkey"
-	"github.com/stapelberg/hmgo/internal/uartgw/fakemod"
 )
 
 func unixUTC(sec int64) time.Time { return time.Unix(sec, 0).UTC() }

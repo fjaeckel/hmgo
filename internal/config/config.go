@@ -18,7 +18,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/stapelberg/hmgo/internal/hmkey"
+	"github.com/fjaeckel/hmgo/internal/hmkey"
 )
 
 // Supported device models.

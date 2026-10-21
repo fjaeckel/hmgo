@@ -39,9 +39,9 @@ import (
 	"html/template"
 	"sync"
 
+	"github.com/fjaeckel/hmgo/internal/bidcos"
+	"github.com/fjaeckel/hmgo/internal/hm"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/stapelberg/hmgo/internal/bidcos"
-	"github.com/stapelberg/hmgo/internal/hm"
 )
 
 // Supported models.

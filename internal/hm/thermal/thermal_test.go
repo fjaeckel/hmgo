@@ -3,8 +3,8 @@ package thermal_test
 import (
 	"testing"
 
-	"github.com/stapelberg/hmgo/internal/hm"
-	"github.com/stapelberg/hmgo/internal/hm/thermal"
+	"github.com/fjaeckel/hmgo/internal/hm"
+	"github.com/fjaeckel/hmgo/internal/hm/thermal"
 )
 
 func TestDecodeWeatherEvent(t *testing.T) {

@@ -7,9 +7,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/stapelberg/hmgo/internal/bidcos"
-	"github.com/stapelberg/hmgo/internal/hm"
-	"github.com/stapelberg/hmgo/internal/hm/hmtest"
+	"github.com/fjaeckel/hmgo/internal/bidcos"
+	"github.com/fjaeckel/hmgo/internal/hm"
+	"github.com/fjaeckel/hmgo/internal/hm/hmtest"
 )
 
 var (

@@ -7,7 +7,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/stapelberg/hmgo/internal/ha"
+	"github.com/fjaeckel/hmgo/internal/ha"
 )
 
 // Info is additional information shown on the status page (e.g. radio

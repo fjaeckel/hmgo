@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"html/template"
 
-	"github.com/stapelberg/hmgo/internal/hm"
+	"github.com/fjaeckel/hmgo/internal/hm"
 )
 
 // CmdSwitchEvent is BidCoS command 0x41 (SWITCH_EVENT on channel 7).

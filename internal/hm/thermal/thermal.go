@@ -5,8 +5,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/stapelberg/hmgo/internal/bidcos"
-	"github.com/stapelberg/hmgo/internal/hm"
+	"github.com/fjaeckel/hmgo/internal/bidcos"
+	"github.com/fjaeckel/hmgo/internal/hm"
 )
 
 // Model is the eQ-3 model name.

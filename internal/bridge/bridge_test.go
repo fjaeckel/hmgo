@@ -13,10 +13,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/stapelberg/hmgo/internal/config"
-	"github.com/stapelberg/hmgo/internal/ha"
-	"github.com/stapelberg/hmgo/internal/uartgw"
-	"github.com/stapelberg/hmgo/internal/uartgw/fakemod"
+	"github.com/fjaeckel/hmgo/internal/config"
+	"github.com/fjaeckel/hmgo/internal/ha"
+	"github.com/fjaeckel/hmgo/internal/uartgw"
+	"github.com/fjaeckel/hmgo/internal/uartgw/fakemod"
 )
 
 var (

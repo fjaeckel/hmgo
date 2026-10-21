@@ -17,7 +17,7 @@ import (
 	"fmt"
 	"html/template"
 
-	"github.com/stapelberg/hmgo/internal/bidcos"
+	"github.com/fjaeckel/hmgo/internal/bidcos"
 )
 
 const (

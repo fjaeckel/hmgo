@@ -3,9 +3,9 @@ package contact_test
 import (
 	"testing"
 
-	"github.com/stapelberg/hmgo/internal/hm"
-	"github.com/stapelberg/hmgo/internal/hm/contact"
-	"github.com/stapelberg/hmgo/internal/hm/hmtest"
+	"github.com/fjaeckel/hmgo/internal/hm"
+	"github.com/fjaeckel/hmgo/internal/hm/contact"
+	"github.com/fjaeckel/hmgo/internal/hm/hmtest"
 )
 
 var (
