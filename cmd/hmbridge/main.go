@@ -1,5 +1,232 @@
-// Command hmbridge bridges classic HomeMatic (BidCoS-RF) thermostats to
-// Home Assistant via MQTT.
+// Command hmbridge bridges classic HomeMatic (BidCoS-RF) thermostats and
+// window contacts to Home Assistant via MQTT, using an HM-MOD-RPI-PCB
+// radio module on a Raspberry Pi instead of a CCU.
+//
+// See docs/DEPLOY.md for setup and internal/config/example.json for the
+// configuration format.
 package main
 
-func main() {}
+import (
+	"context"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"os"
+	"os/signal"
+	"runtime"
+	"runtime/debug"
+	"syscall"
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"golang.org/x/sys/unix"
+
+	"github.com/stapelberg/hmgo/internal/bridge"
+	"github.com/stapelberg/hmgo/internal/config"
+	"github.com/stapelberg/hmgo/internal/gpio"
+	"github.com/stapelberg/hmgo/internal/ha"
+	"github.com/stapelberg/hmgo/internal/serial"
+	"github.com/stapelberg/hmgo/internal/uartgw"
+)
+
+var (
+	configPath  = flag.String("config", "/etc/hmbridge/config.json", "path to the JSON configuration")
+	checkConfig = flag.Bool("check_config", false, "validate the configuration and exit")
+	debugFrames = flag.Bool("debug", false, "log every frame exchanged with the radio module (keys are redacted)")
+	showVersion = flag.Bool("version", false, "print the version and exit")
+)
+
+func version() string {
+	v := "devel"
+	if bi, ok := debug.ReadBuildInfo(); ok {
+		if bi.Main.Version != "" && bi.Main.Version != "(devel)" {
+			v = bi.Main.Version
+		}
+		for _, s := range bi.Settings {
+			if s.Key == "vcs.revision" && len(s.Value) >= 12 {
+				v += "+" + s.Value[:12]
+			}
+		}
+	}
+	return v
+}
+
+var buildInfo = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+	Namespace: "hmbridge", Name: "build_info",
+	Help: "Build information (always 1).",
+}, []string{"version", "goversion"})
+
+func init() { prometheus.MustRegister(buildInfo) }
+
+func main() {
+	flag.Parse()
+	if *showVersion {
+		fmt.Println("hmbridge", version(), runtime.Version())
+		return
+	}
+	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+
+	cfg, err := config.Load(*configPath)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if *checkConfig {
+		fmt.Printf("%s: OK (%d devices, %d groups)\n", *configPath, len(cfg.Devices), len(cfg.Groups))
+		return
+	}
+	log.Printf("hmbridge %s (%s) starting, %d devices, %d groups", version(), runtime.Version(), len(cfg.Devices), len(cfg.Groups))
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	uart, err := openUART(cfg)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if err := run(ctx, cfg, uart); err != nil && !errors.Is(err, context.Canceled) {
+		// Exit non-zero so that systemd restarts us; the module is
+		// re-initialised on the next start.
+		log.Fatal(err)
+	}
+	log.Printf("shut down")
+}
+
+// run runs hmbridge on an opened radio module connection until ctx is
+// done or the radio fails. uart is closed on return.
+func run(ctx context.Context, cfg *config.Config, uart io.ReadWriteCloser) error {
+	buildInfo.WithLabelValues(version(), runtime.Version()).Set(1)
+	current, previous := cfg.Keys()
+	conn, err := uartgw.Open(uart, uartgw.Config{
+		HMID:     cfg.CentralAddr(),
+		Current:  current,
+		Previous: previous,
+		Debug:    *debugFrames,
+	})
+	if err != nil {
+		uart.Close()
+		if errors.Is(err, uartgw.ErrDualCoProFirmware) {
+			return fmt.Errorf("%w\n\nThe radio module runs eQ-3's dual-coprocessor (Homematic IP) firmware. hmbridge needs the classic HM-MOD-RPI-PCB firmware 1.4.x; see docs/DEPLOY.md, section \"Module firmware\"", err)
+		}
+		return fmt.Errorf("initialising the radio module on %s: %w", cfg.SerialPort, err)
+	}
+	defer conn.Close()
+	log.Printf("radio module ready: firmware %s, serial %s, central address %x", conn.FirmwareVersion(), conn.SerialNumber(), cfg.CentralAddr())
+
+	b, err := bridge.New(bridge.Options{Config: cfg, Radio: conn})
+	if err != nil {
+		return err
+	}
+	if err := b.Setup(ctx); err != nil {
+		return err
+	}
+
+	if addr := cfg.HTTPListenAddr(); addr != "" {
+		mux := http.NewServeMux()
+		mux.Handle("/metrics", promhttp.Handler())
+		mux.Handle("/", b.StatusHandler(bridge.Info{
+			"version":  version(),
+			"firmware": conn.FirmwareVersion(),
+			"serial":   conn.SerialNumber(),
+		}))
+		srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+		go func() {
+			if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				log.Printf("HTTP server: %v", err)
+			}
+		}()
+		defer srv.Close()
+		log.Printf("status page and metrics on %s", addr)
+	}
+
+	if broker := cfg.MQTT.BrokerURL(); broker != "" {
+		mqttCtx, cancelMQTT := context.WithCancel(ctx)
+		mqttDone := make(chan struct{})
+		// On shutdown, wait for the client to publish “offline”.
+		defer func() {
+			cancelMQTT()
+			<-mqttDone
+		}()
+		// Connect in the background: the radio side keeps working (and
+		// the devices keep being acknowledged) while the broker is down.
+		go func() {
+			defer close(mqttDone)
+			client, err := ha.Connect(mqttCtx, ha.Options{
+				Broker:    broker,
+				Username:  cfg.MQTT.Username,
+				Password:  cfg.MQTT.Password,
+				ClientID:  cfg.MQTT.ClientID,
+				Topics:    ha.TopicConfig{Base: cfg.MQTT.BaseTopic, DiscoveryPrefix: cfg.MQTT.DiscoveryPrefix},
+				OnConnect: b.PublishAll,
+			})
+			if err != nil {
+				if !errors.Is(err, context.Canceled) {
+					log.Printf("MQTT: %v (Home Assistant integration disabled until restart)", err)
+				}
+				return
+			}
+			log.Printf("MQTT connected to %s", broker)
+			b.SetPublisher(client)
+			go func() {
+				for cmd := range client.Commands() {
+					select {
+					case b.Commands() <- cmd:
+					case <-mqttCtx.Done():
+						return
+					}
+				}
+			}()
+			<-mqttCtx.Done()
+			b.SetPublisher(nil)
+			client.Close()
+		}()
+	} else {
+		log.Printf("MQTT disabled (empty mqtt.broker)")
+	}
+
+	return b.Run(ctx)
+}
+
+// openUART opens and configures the serial port and resets the module
+// if configured.
+func openUART(cfg *config.Config) (*os.File, error) {
+	log.Printf("opening serial port %s", cfg.SerialPort)
+	uart, err := os.OpenFile(cfg.SerialPort, os.O_RDWR|unix.O_NOCTTY|unix.O_NONBLOCK, 0600)
+	if err != nil {
+		return nil, err
+	}
+	// Use SyscallConn instead of Fd: Fd would switch the file to
+	// blocking mode, after which Close could not interrupt a pending read.
+	rc, err := uart.SyscallConn()
+	if err != nil {
+		uart.Close()
+		return nil, err
+	}
+	var ctlErr error
+	if err := rc.Control(func(fd uintptr) {
+		if serial.IsTerminal(fd) {
+			if err := serial.Configure(fd); err != nil {
+				ctlErr = fmt.Errorf("configuring %s: %w", cfg.SerialPort, err)
+				return
+			}
+		} else {
+			log.Printf("%s is not a tty (e.g. OpenCCU's raw-uart), skipping line configuration", cfg.SerialPort)
+		}
+		if cfg.Reset == "gpio" {
+			log.Printf("resetting HM-MOD-RPI-PCB via GPIO %d", cfg.ResetGPIO)
+			if err := gpio.ResetUARTGW(fd, cfg.ResetGPIO); err != nil {
+				ctlErr = fmt.Errorf("resetting the radio module via GPIO %d: %w (set \"reset\": \"none\" if the module's reset line is not connected)", cfg.ResetGPIO, err)
+			}
+		}
+	}); err != nil {
+		ctlErr = err
+	}
+	if ctlErr != nil {
+		uart.Close()
+		return nil, ctlErr
+	}
+	return uart, nil
+}
