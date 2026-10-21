@@ -3,8 +3,8 @@
 package bidcos
 
 import (
+	"context"
 	"fmt"
-	"io"
 	"sync"
 )
 
@@ -125,13 +125,87 @@ func (p *Packet) Encode() []byte {
 	return res
 }
 
+// Receive status values as reported by the HM-MOD-RPI-PCB in the
+// first byte of a received frame (c.f. HMUARTLGW_RECV_* in FHEM).
+const (
+	recvResp          = 0x01
+	recvRespWithAESOK = 0x02
+	recvRespWithAESKO = 0x03
+	recvTrig          = 0x11
+	recvTrigWithAESOK = 0x12
+)
+
+// The gateway reports device responses to our own packets inside an
+// AppAck frame, whose first byte uses a different numbering (e.g. 0x03
+// means “ACK with response”, not “AES failed”). Transports must rewrite
+// that byte to the receive status values above before handing the
+// frame to Decode; see uartgw.Conn.Send.
+
+// Auth describes whether the gateway verified the packet with AES.
+type Auth uint8
+
+const (
+	// Unauthenticated means the packet was not AES-signed (the channel
+	// is not configured for AES, or the frame type is never signed).
+	Unauthenticated Auth = iota
+	// AuthOK means the gateway completed an AES challenge successfully.
+	AuthOK
+	// AuthFailed means the gateway issued an AES challenge and the
+	// device answered it incorrectly (or not at all). Such packets must
+	// not be trusted.
+	AuthFailed
+)
+
+func (a Auth) String() string {
+	switch a {
+	case Unauthenticated:
+		return "unauthenticated"
+	case AuthOK:
+		return "aes-ok"
+	case AuthFailed:
+		return "aes-failed"
+	default:
+		return fmt.Sprintf("auth(%d)", uint8(a))
+	}
+}
+
+// Auth reports the AES verification result for a packet received from
+// the gateway (either as an AppRecv frame or as the response part of
+// an AppAck frame).
+func (p *Packet) Auth() Auth {
+	switch p.status {
+	case recvRespWithAESOK, recvTrigWithAESOK:
+		return AuthOK
+	case recvRespWithAESKO:
+		return AuthFailed
+	}
+	return Unauthenticated
+}
+
+// RSSI returns the received signal strength in dBm (negative), or 0 if
+// unknown.
+func (p *Packet) RSSI() int {
+	if p.rssi <= 1 {
+		return 0
+	}
+	return -int(p.rssi)
+}
+
+// Decode parses a frame as delivered by the gateway:
+//
+//	uint8   status (see Auth)
+//	uint8   info
+//	uint8   rssi
+//	uint8   message counter
+//	uint8   flags
+//	uint8   command
+//	[3]byte source
+//	[3]byte destination
+//	[]byte  payload
 func Decode(b []byte) (*Packet, error) {
 	if got, want := len(b), 12; got < want {
 		return nil, fmt.Errorf("too short for a bidcos packet: got %d, want >= %d", got, want)
 	}
-
-	// TODO(later): decode RSSI, see Homegear-HomeMaticBidCoS/src/BidCoSPacket.cpp
-
 	return &Packet{
 		status:  b[0],
 		info:    b[1],
@@ -145,45 +219,38 @@ func Decode(b []byte) (*Packet, error) {
 	}, nil
 }
 
-type Gateway interface {
-	io.ReadWriter
-	Confirm() error
+// Transport sends encoded BidCoS packets. It is implemented by
+// uartgw.Conn.
+type Transport interface {
+	// Send transmits pkt (as produced by Packet.Encode) and waits until
+	// the gateway confirmed the transmission. If the packet requested a
+	// response (BiDi flag), the device's response frame is returned in
+	// the format accepted by Decode. Otherwise, the returned frame is
+	// nil.
+	Send(ctx context.Context, encoded []byte) ([]byte, error)
 }
 
-// Sender is a convenience wrapper around a Gateway which fills in the
-// BidCoS source address for outgoing packets, automatically confirms
-// outgoing packets and decodes incoming packets.
+// Sender is a convenience wrapper around a Transport which fills in the
+// BidCoS source address for outgoing packets and decodes responses.
 type Sender struct {
-	Gateway Gateway
-	Addr    [3]byte
+	Transport Transport
+	Addr      [3]byte
 }
 
-func NewSender(gw Gateway, addr [3]byte) (*Sender, error) {
-	if got, want := len(addr), 3; got != want {
-		return nil, fmt.Errorf("unexpected address length: got %d, want %d", got, want)
-	}
-	return &Sender{
-		Gateway: gw,
-		Addr:    addr,
-	}, nil
+func NewSender(t Transport, addr [3]byte) *Sender {
+	return &Sender{Transport: t, Addr: addr}
 }
 
-func (s *Sender) ReadPacket() (*Packet, error) {
-	// 17 byte BidCoS maximum observed payload + 12 bytes fixed BidCoS overhead
-	var buf [17 + 12]byte
-	n, err := s.Gateway.Read(buf[:])
+// Send transmits pkt and returns the decoded device response, or nil if
+// no response was requested or received.
+func (s *Sender) Send(ctx context.Context, pkt *Packet) (*Packet, error) {
+	pkt.Source = s.Addr
+	resp, err := s.Transport.Send(ctx, pkt.Encode())
 	if err != nil {
 		return nil, err
 	}
-	return Decode(buf[:n])
-}
-
-func (s *Sender) WritePacket(pkt *Packet) error {
-	pkt.Source = s.Addr
-	//log.Printf("writing bidcos packet %+v", pkt)
-	_, err := s.Gateway.Write(pkt.Encode())
-	if err != nil {
-		return err
+	if len(resp) == 0 {
+		return nil, nil
 	}
-	return s.Gateway.Confirm()
+	return Decode(resp)
 }
