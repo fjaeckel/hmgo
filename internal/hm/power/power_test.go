@@ -1,36 +1,14 @@
 package power_test
 
 import (
-	"fmt"
 	"testing"
 
-	"github.com/stapelberg/hmgo/internal/bidcos"
 	"github.com/stapelberg/hmgo/internal/hm"
 	"github.com/stapelberg/hmgo/internal/hm/power"
 )
 
-type testGateway struct {
-}
-
-func (t *testGateway) Read(p []byte) (n int, err error) {
-	return 0, fmt.Errorf("reading not supported")
-}
-
-func (t *testGateway) Write(p []byte) (n int, err error) {
-	return 0, fmt.Errorf("writing not supported")
-}
-
-func (t *testGateway) Confirm() error {
-	return nil
-}
-
 func TestDecodePowerEvent(t *testing.T) {
-	gw := testGateway{}
-	bcs, err := bidcos.NewSender(&gw, [3]byte{0xfd, 0xee, 0xdd})
-	if err != nil {
-		t.Fatal(err)
-	}
-	ps := power.NewPowerSwitch(hm.StandardDevice{BCS: bcs, Addr: [3]byte{0xaa, 0xbb, 0xcc}})
+	ps := power.NewPowerSwitch(hm.NewStandardDevice(nil, [3]byte{0xaa, 0xbb, 0xcc}, "test"))
 
 	// payload captured measuring a Raspberry Pi 3 :)
 	pe, err := ps.DecodePowerEvent([]byte{128, 3, 138, 0, 0, 187, 0, 16, 9, 8, 255})

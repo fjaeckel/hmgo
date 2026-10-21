@@ -1,36 +1,14 @@
 package thermal_test
 
 import (
-	"fmt"
 	"testing"
 
-	"github.com/stapelberg/hmgo/internal/bidcos"
 	"github.com/stapelberg/hmgo/internal/hm"
 	"github.com/stapelberg/hmgo/internal/hm/thermal"
 )
 
-type testGateway struct {
-}
-
-func (t *testGateway) Read(p []byte) (n int, err error) {
-	return 0, fmt.Errorf("reading not supported")
-}
-
-func (t *testGateway) Write(p []byte) (n int, err error) {
-	return 0, fmt.Errorf("writing not supported")
-}
-
-func (t *testGateway) Confirm() error {
-	return nil
-}
-
 func TestDecodeWeatherEvent(t *testing.T) {
-	gw := testGateway{}
-	bcs, err := bidcos.NewSender(&gw, [3]byte{0xfd, 0xee, 0xdd})
-	if err != nil {
-		t.Fatal(err)
-	}
-	tc := thermal.NewThermalControl(hm.StandardDevice{BCS: bcs, Addr: [3]byte{0xaa, 0xbb, 0xcc}})
+	tc := thermal.NewThermalControl(hm.NewStandardDevice(nil, [3]byte{0xaa, 0xbb, 0xcc}, "test"))
 	we, err := tc.DecodeWeatherEvent([]byte{0, 253, 57})
 	if err != nil {
 		t.Fatal(err)
@@ -44,12 +22,7 @@ func TestDecodeWeatherEvent(t *testing.T) {
 }
 
 func TestDecodeThermalControlEvent(t *testing.T) {
-	gw := testGateway{}
-	bcs, err := bidcos.NewSender(&gw, [3]byte{0xfd, 0xee, 0xdd})
-	if err != nil {
-		t.Fatal(err)
-	}
-	tc := thermal.NewThermalControl(hm.StandardDevice{BCS: bcs, Addr: [3]byte{0xaa, 0xbb, 0xcc}})
+	tc := thermal.NewThermalControl(hm.NewStandardDevice(nil, [3]byte{0xaa, 0xbb, 0xcc}, "test"))
 	tce, err := tc.DecodeThermalControlEvent([]byte{200, 215, 65})
 	if err != nil {
 		t.Fatal(err)
@@ -66,12 +39,7 @@ func TestDecodeThermalControlEvent(t *testing.T) {
 }
 
 func TestDecodeInfoEvent(t *testing.T) {
-	gw := testGateway{}
-	bcs, err := bidcos.NewSender(&gw, [3]byte{0xfd, 0xee, 0xdd})
-	if err != nil {
-		t.Fatal(err)
-	}
-	tc := thermal.NewThermalControl(hm.StandardDevice{BCS: bcs, Addr: [3]byte{0xaa, 0xbb, 0xcc}})
+	tc := thermal.NewThermalControl(hm.NewStandardDevice(nil, [3]byte{0xaa, 0xbb, 0xcc}, "test"))
 	ie, err := tc.DecodeInfoEvent([]byte{0x0b, 0xb0, 0xdf, 0x0e, 0x00})
 	if err != nil {
 		t.Fatal(err)
@@ -94,12 +62,7 @@ func TestDecodeInfoEvent(t *testing.T) {
 // left-shift by 8. The previous decoder OR-ed them at bit 0 instead,
 // silently wrapping every reading >=25.6 °C to 0..3.2 °C.
 func TestDecodeThermalControlEventHighTemperature(t *testing.T) {
-	gw := testGateway{}
-	bcs, err := bidcos.NewSender(&gw, [3]byte{0xfd, 0xee, 0xdd})
-	if err != nil {
-		t.Fatal(err)
-	}
-	tc := thermal.NewThermalControl(hm.StandardDevice{BCS: bcs, Addr: [3]byte{0xaa, 0xbb, 0xcc}})
+	tc := thermal.NewThermalControl(hm.NewStandardDevice(nil, [3]byte{0xaa, 0xbb, 0xcc}, "test"))
 	// payload[0] = 0b10110001: SetTemperature bits = 0b101100 = 44 -> 22.0 °C,
 	// high 2 bits of ActualTemperature = 0b01 (carries 256).
 	// payload[1] = 0x0b = 11. Combined: (1<<8)|11 = 267 -> 26.7 °C.
@@ -122,12 +85,7 @@ func TestDecodeThermalControlEventHighTemperature(t *testing.T) {
 // TestDecodeThermalControlEventHighTemperature — same 10-bit decode bug,
 // different frame.
 func TestDecodeInfoEventHighTemperature(t *testing.T) {
-	gw := testGateway{}
-	bcs, err := bidcos.NewSender(&gw, [3]byte{0xfd, 0xee, 0xdd})
-	if err != nil {
-		t.Fatal(err)
-	}
-	tc := thermal.NewThermalControl(hm.StandardDevice{BCS: bcs, Addr: [3]byte{0xaa, 0xbb, 0xcc}})
+	tc := thermal.NewThermalControl(hm.NewStandardDevice(nil, [3]byte{0xaa, 0xbb, 0xcc}, "test"))
 	// payload[1] = 0b10110001 -> SetTemperature 22.0 °C, high temp bits 0b01.
 	// payload[2] = 0x09 -> low byte 9. Combined: (1<<8)|9 = 265 -> 26.5 °C.
 	ie, err := tc.DecodeInfoEvent([]byte{0x0b, 0xb1, 0x09, 0x0e, 0x00})

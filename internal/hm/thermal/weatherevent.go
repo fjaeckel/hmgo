@@ -51,12 +51,17 @@ func (we *WeatherEvent) HTML() template.HTML {
 }
 
 func (tc *ThermalControl) DecodeWeatherEvent(payload []byte) (*WeatherEvent, error) {
-	// c.f. <frame id="WEATHER_EVENT"> in rftypes/tc.xml
+	// c.f. <frame id="WEATHER_EVENT"> in rftypes/tc.xml: TEMPERATURE is
+	// a 15 bit signed value (×0.1 °C) in [0]&0x7f,[1]; HUMIDITY = [2] (%).
 	if got, want := len(payload), 3; got != want {
 		return nil, fmt.Errorf("unexpected payload size: got %d, want %d", got, want)
 	}
+	t := int(payload[0]&0x7f)<<8 | int(payload[1])
+	if t&0x4000 != 0 {
+		t -= 0x8000
+	}
 	we := &WeatherEvent{
-		Temperature: float64((int16(payload[0])<<8|int16(payload[1]))&0x3FFF) / 10,
+		Temperature: float64(t) / 10,
 		Humidity:    uint64(payload[2]),
 	}
 

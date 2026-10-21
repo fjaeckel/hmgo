@@ -1,0 +1,91 @@
+{
+  "_comment": [
+    "hmbridge example configuration. Every object accepts an optional _comment field.",
+    "Only central_address and devices are required; all other fields show their defaults or typical values.",
+    "http_listen serves the status page and Prometheus /metrics (\"\" disables it). time_sync_interval: how often the radio module clock is set."
+  ],
+
+  "serial_port": "/dev/serial0",
+  "reset": "gpio",
+  "reset_gpio": 18,
+
+  "central_address": "1A2B3C",
+
+  "security": {
+    "_comment": [
+      "The CCU's system security key. Give either passphrase (key = MD5(passphrase), as the CCU does) or key (32 hex chars).",
+      "index is the key index shown by the CCU (1 after the first key change, incremented on every change). Default 1.",
+      "previous is optional: the key before the last change, needed while not all devices have been switched to the new key.",
+      "Omit the whole security block if you never set a key on your CCU (eQ-3 default key, index 0)."
+    ],
+    "passphrase": "change-me",
+    "index": 2,
+    "previous": { "passphrase": "old-passphrase", "index": 1 }
+  },
+
+  "mqtt": {
+    "_comment": "Set broker to \"\" to disable MQTT.",
+    "broker": "tcp://homeassistant.local:1883",
+    "username": "hmbridge",
+    "password": "secret",
+    "client_id": "hmbridge",
+    "base_topic": "hmbridge",
+    "discovery_prefix": "homeassistant"
+  },
+
+  "http_listen": ":8013",
+
+  "time_sync_interval": "1h",
+
+  "devices": [
+    {
+      "_comment": "Radiator thermostat. aes without aes_channels enforces AES on all channels 1..6.",
+      "name": "Wohnzimmer Heizung",
+      "model": "HM-CC-RT-DN",
+      "address": "38F59C",
+      "serial": "MEQ0123456",
+      "aes": true
+    },
+    {
+      "name": "Wohnzimmer Heizung Fenster",
+      "model": "HM-CC-RT-DN",
+      "address": "38F5A1",
+      "aes": false
+    },
+    {
+      "_comment": "Wall thermostat; AES only on the thermal control channel.",
+      "name": "Wohnzimmer Wandthermostat",
+      "model": "HM-TC-IT-WM-W-EU",
+      "address": "2A1B3C",
+      "aes": true,
+      "aes_channels": [2]
+    },
+    {
+      "_comment": "Optical window contact. Models: HM-Sec-SCo, HM-Sec-SC-2, HM-Sec-SC, HM-Sec-RHS (rotary handle).",
+      "name": "Wohnzimmer Fenster",
+      "model": "HM-Sec-SCo",
+      "address": "4C5D6E",
+      "aes": true
+    },
+    {
+      "name": "Bad Heizung",
+      "model": "HM-CC-RT-DN",
+      "address": "38F5B2"
+    }
+  ],
+
+  "groups": [
+    {
+      "_comment": [
+        "A group mirrors a CCU heating group and becomes ONE climate entity in Home Assistant.",
+        "Members are device names or addresses; a device can be in at most one group; a group needs at least one thermostat.",
+        "Setpoint/mode commands are sent to all thermostats of the group: wall thermostats first, then radiator thermostats.",
+        "Current temperature/humidity come from the wall thermostat if present, else from the first radiator thermostat.",
+        "The window state comes from the contact(s): open if any contact is open or tilted.",
+        "Direct peerings between the devices (thermostat team, window contact) are left untouched and keep working without hmbridge."
+      ],
+      "name": "Wohnzimmer",
+      "members": ["Wohnzimmer Wandthermostat", "Wohnzimmer Heizung", "38F5A1", "Wohnzimmer Fenster"]
+    }
+  ]
+}

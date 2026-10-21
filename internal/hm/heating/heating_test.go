@@ -1,36 +1,14 @@
 package heating_test
 
 import (
-	"fmt"
 	"testing"
 
-	"github.com/stapelberg/hmgo/internal/bidcos"
 	"github.com/stapelberg/hmgo/internal/hm"
 	"github.com/stapelberg/hmgo/internal/hm/heating"
 )
 
-type testGateway struct {
-}
-
-func (t *testGateway) Read(p []byte) (n int, err error) {
-	return 0, fmt.Errorf("reading not supported")
-}
-
-func (t *testGateway) Write(p []byte) (n int, err error) {
-	return 0, fmt.Errorf("writing not supported")
-}
-
-func (t *testGateway) Confirm() error {
-	return nil
-}
-
 func TestDecodeInfoEvent(t *testing.T) {
-	gw := testGateway{}
-	bcs, err := bidcos.NewSender(&gw, [3]byte{0xfd, 0xee, 0xdd})
-	if err != nil {
-		t.Fatal(err)
-	}
-	ts := heating.NewThermostat(hm.StandardDevice{BCS: bcs, Addr: [3]byte{0xaa, 0xbb, 0xcc}})
+	ts := heating.NewThermostat(hm.NewStandardDevice(nil, [3]byte{0xaa, 0xbb, 0xcc}, "test"))
 	ie, err := ts.DecodeInfoEvent([]byte{0x0a, 0xb0, 0xe2, 0x08, 0x00, 0x00})
 	if err != nil {
 		t.Fatal(err)
@@ -53,12 +31,7 @@ func TestDecodeInfoEvent(t *testing.T) {
 // left-shift by 8. A previous decoder OR-ed them at bit 0 instead, which
 // silently worked below 25.6 °C and wrapped to 0..3.2 °C above it.
 func TestDecodeInfoEventHighTemperature(t *testing.T) {
-	gw := testGateway{}
-	bcs, err := bidcos.NewSender(&gw, [3]byte{0xfd, 0xee, 0xdd})
-	if err != nil {
-		t.Fatal(err)
-	}
-	ts := heating.NewThermostat(hm.StandardDevice{BCS: bcs, Addr: [3]byte{0xaa, 0xbb, 0xcc}})
+	ts := heating.NewThermostat(hm.NewStandardDevice(nil, [3]byte{0xaa, 0xbb, 0xcc}, "test"))
 	// payload[1] = 0b10110001: SetTemperature bits = 0b101100 = 44 -> 22.0 °C,
 	// high 2 bits of ActualTemperature = 0b01 (carries 256).
 	// payload[2] = 0x09 = 9. Combined: (1<<8)|9 = 265 -> 26.5 °C.

@@ -1,17 +1,28 @@
 package thermal
 
 import (
+	"context"
 	"sync"
 	"time"
 
+	"github.com/stapelberg/hmgo/internal/bidcos"
 	"github.com/stapelberg/hmgo/internal/hm"
 )
+
+// Model is the eQ-3 model name.
+const Model = "HM-TC-IT-WM-W-EU"
 
 const prometheusNamespace = "hmthermal"
 
 // channels
 const (
+	WeatherTransmit = 0x01
+	// ThermalControlTransmit is the control channel: commands are sent
+	// to it and INFO_LEVEL/THERMALCONTROL_EVENT report it.
 	ThermalControlTransmit = 0x02
+	WindowSwitchReceiver   = 0x03
+	RemoteControlReceiver  = 0x06
+	SwitchTransmit         = 0x07
 )
 
 const (
@@ -52,9 +63,103 @@ type ThermalControl struct {
 
 func (tc *ThermalControl) HomeMaticType() string { return "thermal" }
 
+// NewThermalControl returns a ThermalControl. sd.BCS may be nil for
+// decoding-only use.
 func NewThermalControl(sd hm.StandardDevice) *ThermalControl {
 	sd.NumChannels = 7
+	sd.ModelName = Model
 	return &ThermalControl{StandardDevice: sd}
+}
+
+// Decode decodes a packet received from the wall thermostat:
+//
+//	0x10 0x0B  INFO_LEVEL           → *InfoEvent
+//	0x02 0x01  ACK_STATUS           → *AckStatusEvent
+//	0x5A       THERMALCONTROL_EVENT → *ThermalControlEvent (to its RT-DN team, ~every 2-3 min)
+//	0x70       WEATHER_EVENT        → *WeatherEvent
+//	0x41       SWITCH_EVENT (ch 7)  → *SwitchEvent (to peers; not normally sent to the central)
+//	0x3F       time request         → *hm.TimeRequest
+//	0x00       DEVICE_INFO          → *hm.DeviceInfo
+//
+// It returns nil, nil for other frames. The TC sends neither
+// INFO_ACTUATOR_STATUS (0x10 0x06) nor CLIMATE_EVENT (0x58) (eQ-3
+// rftypes rf_tc_it_wm-w-eu.xml).
+func (tc *ThermalControl) Decode(pkt *bidcos.Packet) (any, error) {
+	if err := tc.CheckIncoming(pkt); err != nil {
+		return nil, err
+	}
+	switch {
+	case pkt.Cmd == bidcos.Info && len(pkt.Payload) > 0 && pkt.Payload[0] == InfoLevelSubtype:
+		return tc.DecodeInfoEvent(pkt.Payload)
+	case hm.IsAckStatus(pkt):
+		return tc.DecodeAckStatus(pkt.Payload)
+	case pkt.Cmd == bidcos.ThermalControl:
+		return tc.DecodeThermalControlEvent(pkt.Payload)
+	case pkt.Cmd == bidcos.WeatherEvent:
+		return tc.DecodeWeatherEvent(pkt.Payload)
+	case pkt.Cmd == CmdSwitchEvent:
+		return DecodeSwitchEvent(pkt.Payload)
+	}
+	return hm.DecodeCommon(pkt)
+}
+
+// SetTemperaturePacket returns the packet setting the target
+// temperature (4.5 = off … 30.5 = on, rounded to 0.5) without changing
+// the mode.
+func SetTemperaturePacket(dst [3]byte, temp float64) (*bidcos.Packet, error) {
+	return hm.ClimateCommandPacket(dst, ThermalControlTransmit, hm.CmdSetTemperature, temp)
+}
+
+// AutoModePacket returns the packet switching to auto (week program) mode.
+func AutoModePacket(dst [3]byte) *bidcos.Packet {
+	p, _ := hm.ClimateCommandPacket(dst, ThermalControlTransmit, hm.CmdAuto, 0)
+	return p
+}
+
+// ManualModePacket returns the packet switching to manual mode at temp.
+func ManualModePacket(dst [3]byte, temp float64) (*bidcos.Packet, error) {
+	return hm.ClimateCommandPacket(dst, ThermalControlTransmit, hm.CmdManual, temp)
+}
+
+// BoostPacket returns the packet starting boost mode.
+func BoostPacket(dst [3]byte) *bidcos.Packet {
+	p, _ := hm.ClimateCommandPacket(dst, ThermalControlTransmit, hm.CmdBoost, 0)
+	return p
+}
+
+func (tc *ThermalControl) command(ctx context.Context, cmd hm.ClimateCommand, temp float64) (*AckStatusEvent, error) {
+	resp, err := tc.SendClimateCommand(ctx, ThermalControlTransmit, cmd, temp)
+	if err != nil {
+		return nil, err
+	}
+	if !hm.IsAckStatus(resp) {
+		return nil, nil
+	}
+	st, _ := tc.DecodeAckStatus(resp.Payload)
+	return st, nil
+}
+
+// SetTemperature sets the target temperature (4.5 = off … 30.5 = on,
+// rounded to 0.5 °C). The TC forwards it to its RT-DN team. It returns
+// the device's ACK_STATUS, or nil if the device answered with a plain
+// ACK.
+func (tc *ThermalControl) SetTemperature(ctx context.Context, temp float64) (*AckStatusEvent, error) {
+	return tc.command(ctx, hm.CmdSetTemperature, temp)
+}
+
+// SetAutoMode switches to auto mode (week program).
+func (tc *ThermalControl) SetAutoMode(ctx context.Context) (*AckStatusEvent, error) {
+	return tc.command(ctx, hm.CmdAuto, 0)
+}
+
+// SetManualMode switches to manual mode with target temperature temp.
+func (tc *ThermalControl) SetManualMode(ctx context.Context, temp float64) (*AckStatusEvent, error) {
+	return tc.command(ctx, hm.CmdManual, temp)
+}
+
+// SetBoost starts boost mode.
+func (tc *ThermalControl) SetBoost(ctx context.Context) (*AckStatusEvent, error) {
+	return tc.command(ctx, hm.CmdBoost, 0)
 }
 
 func (tc *ThermalControl) MostRecentEvents() []hm.Event {

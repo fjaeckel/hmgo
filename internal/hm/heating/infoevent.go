@@ -6,6 +6,7 @@ import (
 	"html/template"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/stapelberg/hmgo/internal/bidcos"
 	"github.com/stapelberg/hmgo/internal/hm"
 )
 
@@ -79,6 +80,7 @@ func init() {
 	prometheus.MustRegister(infoEventBoostState)
 }
 
+// ControlMode is the thermostat's operating mode.
 type ControlMode uint
 
 const (
@@ -88,6 +90,22 @@ const (
 	BoostMode
 )
 
+func (cm ControlMode) String() string {
+	switch cm {
+	case AutoMode:
+		return "auto"
+	case ManuMode:
+		return "manual"
+	case PartyMode:
+		return "party"
+	case BoostMode:
+		return "boost"
+	default:
+		return fmt.Sprintf("unknown mode (%d)", uint(cm))
+	}
+}
+
+// FaultReporting is the RT-DN's FAULT_REPORTING value.
 type FaultReporting uint
 
 const (
@@ -122,16 +140,32 @@ func (fr FaultReporting) String() string {
 	}
 }
 
+// InfoEvent is the RT-DN's INFO_LEVEL frame (cmd 0x10, subtype 0x0A),
+// reporting channel 4. Payload layout (byte offsets in the payload,
+// i.e. rftypes index - 9):
+//
+//	[0]    0x0A
+//	[1..2] SET_TEMPERATURE = [1]>>2 (×0.5 °C),
+//	       ACTUAL_TEMPERATURE = ([1]&3)<<8 | [2] (×0.1 °C)
+//	[3]    FAULT_REPORTING = [3]>>5, BATTERY_STATE = ([3]&0x1f)/10+1.5 V
+//	[4]    VALVE_STATE = [4]&0x7f (%)
+//	[5]    CONTROL_MODE = [5]>>6, BOOST_STATE = [5]&0x3f (minutes, in boost mode)
+//	[6..]  party mode start/stop/temperature (only in party mode; ignored)
 type InfoEvent struct {
-	SetTemperature    float64 // in degC
+	SetTemperature    float64 // in degC; 4.5 = off, 30.5 = on
 	ActualTemperature float64 // in degC
 	Fault             FaultReporting
 	BatteryState      float64 // in V
 	ValveState        uint64  // in percentage points
 	Control           ControlMode
-	BoostState        uint64 // in minutes
+	BoostState        uint64 // remaining boost time in minutes (only meaningful in BoostMode)
 	// Not using party mode, so ignoring the remaining fields.
 }
+
+// LowBattery reports whether the device reports a low battery. The
+// RT-DN signals this through FAULT_REPORTING (6 = lowbat) only. Note
+// that a different fault hides the low battery state.
+func (ie *InfoEvent) LowBattery() bool { return ie.Fault == Lowbat }
 
 var ieTmpl = template.Must(template.New("infoevent").Parse(`
 <strong>Info:</strong><br>
@@ -153,9 +187,13 @@ func (ie *InfoEvent) HTML() template.HTML {
 }
 
 func (t *Thermostat) DecodeInfoEvent(payload []byte) (*InfoEvent, error) {
-	// c.f. <frame id="INFO_LEVEL"> in rftypes/cc.xml
-	if got, want := len(payload), 6; got != want {
-		return nil, fmt.Errorf("unexpected payload size: got %d, want %d", got, want)
+	// c.f. <frame id="INFO_LEVEL"> in rftypes/rf_cc_rt_dn.xml. Frames in
+	// party mode carry 6 more bytes, which we ignore.
+	if got, want := len(payload), 6; got < want {
+		return nil, fmt.Errorf("unexpected payload size: got %d, want >= %d", got, want)
+	}
+	if payload[0] != bidcos.InfoTemp {
+		return nil, fmt.Errorf("not an INFO_LEVEL frame: subtype 0x%02x", payload[0])
 	}
 	ie := &InfoEvent{
 		SetTemperature:    float64((uint64(payload[1])>>2)&hm.Mask6Bit) / 2,

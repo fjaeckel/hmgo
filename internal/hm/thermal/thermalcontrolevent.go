@@ -63,13 +63,15 @@ func (tce *ThermalControlEvent) HTML() template.HTML {
 }
 
 func (tc *ThermalControl) DecodeThermalControlEvent(payload []byte) (*ThermalControlEvent, error) {
-	// c.f. <frame id="THERMALCONTROL_EVENT"> in rftypes/tc.xml
+	// c.f. <frame id="THERMALCONTROL_EVENT"> in rftypes/tc.xml:
+	// SET_TEMPERATURE = [0]>>2 (×0.5 °C), ACTUAL_TEMPERATURE = 10 bit
+	// signed ([0]&3)<<8|[1] (×0.1 °C), ACTUAL_HUMIDITY = [2] (%).
 	if got, want := len(payload), 3; got != want {
 		return nil, fmt.Errorf("unexpected payload size: got %d, want %d", got, want)
 	}
 	tce := &ThermalControlEvent{
 		SetTemperature:    float64((uint64(payload[0])>>2)&hm.Mask6Bit) / 2,
-		ActualTemperature: float64(((int64(payload[0])&hm.Mask2Bit)<<8)|int64(payload[1])) / 10,
+		ActualTemperature: signed10(payload[0], payload[1]),
 		ActualHumidity:    float64(payload[2]),
 	}
 
@@ -81,4 +83,14 @@ func (tc *ThermalControl) DecodeThermalControlEvent(payload []byte) (*ThermalCon
 	defer tc.latestMu.Unlock()
 	tc.latestThermalControlEvent = tce
 	return tce, nil
+}
+
+// signed10 decodes the 10 bit signed temperature (×0.1 °C) in the low 2
+// bits of hi and all of lo (rftypes: signed="true" size="1.2").
+func signed10(hi, lo byte) float64 {
+	v := int(hi&hm.Mask2Bit)<<8 | int(lo)
+	if v&0x200 != 0 {
+		v -= 0x400
+	}
+	return float64(v) / 10
 }
