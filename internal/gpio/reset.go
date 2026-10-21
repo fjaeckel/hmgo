@@ -30,10 +30,11 @@ type gpiohandledata struct {
 	Values [64]uint8
 }
 
-// ResetUARTGW resets the UARTGW whose reset pin is connected to pin
-// by holding the pin low for 150ms, flushing the pending UART data,
-// then setting the pin high again.
-func ResetUARTGW(uartfd uintptr) error {
+// ResetUARTGW resets the UARTGW whose reset pin is connected to GPIO
+// line pin of /dev/gpiochip0 (18 on the HM-MOD-RPI-PCB) by holding the
+// pin low for 150ms, flushing the pending UART data, then setting the
+// pin high again.
+func ResetUARTGW(uartfd uintptr, pin int) error {
 	f, err := os.Open("/dev/gpiochip0")
 	if err != nil {
 		return err
@@ -41,7 +42,7 @@ func ResetUARTGW(uartfd uintptr) error {
 	defer f.Close()
 
 	handlereq := gpiohandlerequest{
-		Lineoffsets:   [64]uint32{18},
+		Lineoffsets:   [64]uint32{uint32(pin)},
 		Flags:         GPIOHANDLE_REQUEST_OUTPUT,
 		DefaultValues: [64]uint8{1},
 		ConsumerLabel: [32]byte{'h', 'm', 'g', 'o'},
@@ -50,6 +51,8 @@ func ResetUARTGW(uartfd uintptr) error {
 	if _, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(f.Fd()), GPIO_GET_LINEHANDLE_IOCTL, uintptr(unsafe.Pointer(&handlereq))); errno != 0 {
 		return fmt.Errorf("GPIO_GET_LINEHANDLE_IOCTL: %v", errno)
 	}
+	// The line handle is intentionally kept open for the lifetime of
+	// the process: releasing it could let the reset line float.
 
 	// Turn off device
 	if _, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(handlereq.Fd), GPIOHANDLE_SET_LINE_VALUES_IOCTL, uintptr(unsafe.Pointer(&gpiohandledata{

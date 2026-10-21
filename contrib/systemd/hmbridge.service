@@ -1,0 +1,22 @@
+[Unit]
+Description=hmbridge: HomeMatic BidCoS thermostats to Home Assistant (MQTT)
+After=network-online.target time-sync.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/hmbridge -config /etc/hmbridge/config.json
+Restart=always
+RestartSec=5
+# hmbridge exits when the radio module resets or the serial link fails;
+# systemd restarts it, which re-initialises the module.
+User=hmbridge
+Group=hmbridge
+SupplementaryGroups=dialout gpio
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadOnlyPaths=/etc/hmbridge
+
+[Install]
+WantedBy=multi-user.target

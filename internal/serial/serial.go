@@ -33,3 +33,12 @@ func Configure(fd uintptr) error {
 
 	return nil
 }
+
+// IsTerminal reports whether fd refers to a terminal (tty). The
+// raw-uart character device that OpenCCU provides for the radio module
+// is not a tty and needs no line configuration.
+func IsTerminal(fd uintptr) bool {
+	var termios syscall.Termios
+	_, _, err := syscall.Syscall(syscall.SYS_IOCTL, fd, uintptr(syscall.TCGETS), uintptr(unsafe.Pointer(&termios)))
+	return err == 0
+}
