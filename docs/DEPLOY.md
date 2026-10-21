@@ -41,8 +41,10 @@ one entry per device. Start with one device and add the rest once it works.
 
 ## 3a. Running on OpenCCU's Pi without reinstalling (experimental)
 
-Copy the `linux/arm` (Pi 2/3/Zero 2 on 32-bit OpenCCU) or `linux/arm64` binary
-to the Pi, then stop the services that own the radio module. Service names
+Build the binaries with `make dist` (or take them from the CI artifacts)
+and copy the matching one to the Pi: `linux-armv7` for a 32-bit OS on a
+Pi 2/3/4, `linux-arm64` for a 64-bit OS, `linux-armv6` for a Pi 1/Zero. Check
+the configuration with `hmbridge -config … -check_config`, then stop the services that own the radio module. Service names
 differ between OpenCCU releases, so look them up first:
 
 ```sh

@@ -1,0 +1,73 @@
+groups:
+  - name: hmbridge
+    rules:
+      - alert: HomematicDeviceSilent
+        # Thermostats report every few minutes, window contacts at least
+        # hourly. Raise the threshold if a contact triggers this.
+        expr: time() - hmbridge_device_last_seen_timestamp_seconds > 2 * 3600
+        for: 15m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.name }} ({{ $labels.model }}) has not been heard for {{ $value | humanizeDuration }}"
+          description: "Battery empty, out of range, or the radio module is not receiving."
+
+      - alert: HomematicBatteryLow
+        expr: hmbridge_device_low_battery == 1
+        for: 1h
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.name }} reports a low battery"
+
+      - alert: HomematicBatteryVoltageLow
+        expr: hmbridge_device_battery_volts < 2.4
+        for: 4h
+        labels: { severity: info }
+        annotations:
+          summary: "{{ $labels.name }} battery at {{ $value }} V"
+
+      - alert: HomematicSabotage
+        expr: hmbridge_device_sabotage == 1
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.name }} reports sabotage (cover opened)"
+
+      - alert: HomematicAESFailures
+        expr: increase(hmbridge_device_messages_by_auth_total{auth="aes-failed"}[1h]) > 0
+        labels: { severity: warning }
+        annotations:
+          summary: "Messages from {{ $labels.name }} failed AES authentication"
+          description: "Wrong key or key index in the configuration, or someone is sending forged messages."
+
+      - alert: HomematicValveFault
+        expr: hmbridge_device_fault{model="HM-CC-RT-DN",fault!~"none|low battery"} == 1
+        for: 30m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.name }}: {{ $labels.fault }}"
+
+      - alert: HomematicRadioDown
+        expr: hmbridge_uartgw_up == 0 or absent(hmbridge_uartgw_up)
+        for: 5m
+        labels: { severity: critical }
+        annotations:
+          summary: "hmbridge has no connection to the radio module"
+
+      - alert: HomematicDutyCycleHigh
+        expr: hmbridge_uartgw_duty_cycle_percent > 80
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "Radio duty cycle at {{ $value }} % — commands may be refused"
+
+      - alert: HomematicMQTTDisconnected
+        expr: hmbridge_mqtt_connected == 0
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "hmbridge is not connected to the MQTT broker"
+
+      - alert: HomematicCommandsFailing
+        expr: increase(hmbridge_commands_total{result="error"}[1h]) > 3
+        labels: { severity: warning }
+        annotations:
+          summary: "Commands from Home Assistant are failing ({{ $value }} in the last hour)"

@@ -3,7 +3,8 @@
 hmbridge turns a Raspberry Pi with an HM-MOD-RPI-PCB radio module into a
 small, single-purpose replacement for a HomeMatic CCU: it speaks classic
 HomeMatic (BidCoS-RF) to thermostats and exposes them to Home Assistant via
-MQTT discovery. It is a fork of github.com/stapelberg/hmgo.
+MQTT discovery. It is a fork of github.com/stapelberg/hmgo (module path
+github.com/fjaeckel/hmgo).
 
 ## Goals (prototype)
 
@@ -188,6 +189,26 @@ RT-DN, humidity for TC, fault for RT-DN, window open for TC, RSSI).
 `security` may give `key` (32 hex chars) instead of `passphrase`; omitted
 means the eQ-3 default key (index 0). `previous` holds an optional older
 key in the same format.
+
+## Bridge concurrency
+
+`bridge.Run` owns all device state on one event loop: it decodes
+received frames, applies results of executed commands and translates
+Home Assistant commands into radio jobs. Two helper goroutines keep the
+loop responsive:
+
+* the **worker** executes radio jobs one at a time (a burst command can
+  take seconds). Jobs are coalesced per device and kind (temperature vs.
+  mode), so only the latest queued value is sent; unanswered commands are
+  retried twice after 20 s unless superseded by a newer command.
+* the **publisher** sends MQTT messages from an outbox that keeps only
+  the latest message per topic. State snapshots are enqueued under the
+  bridge mutex, so an older snapshot (e.g. from a reconnect) can never
+  overwrite a newer one, and a slow broker never blocks the radio side.
+
+Time requests (cmd 0x3F) from the devices are answered with Homegear's
+format (UTC offset + seconds since 2000), and the module's clock is set
+every `time_sync_interval`.
 
 ## Running alongside OpenCCU
 
