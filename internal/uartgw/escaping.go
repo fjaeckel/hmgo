@@ -1,75 +1,39 @@
 package uartgw
 
-import "io"
+// The HM-MOD-RPI-PCB escapes two bytes within a frame (i.e. after the
+// leading 0xfd frame delimiter):
+//
+//	0xfc 0x7d represents 0xfd
+//	0xfc 0x7c represents 0xfc
+//
+// 0xfd (frame delimiter) must be escaped within a frame. 0xfc
+// introduces an escaped byte, so bytes which happen to be 0xfc need to
+// be escaped as well. As a result, 0xfd always means “start of a
+// frame”, which means we can re-synchronize on 0xfd after reading
+// invalid data.
+//
+// c.f. HMUARTLGW_send_frame and HMUARTLGW_Read in FHEM’s 00_HMUARTLGW.pm
+const (
+	frameDelimiter = 0xfd
+	escapeByte     = 0xfc
+)
 
-// escapingWriter escapes 0xfd for the UARTGW
-type escapingWriter struct {
-	w io.Writer
-}
-
-func (ew *escapingWriter) Write(p []byte) (n int, err error) {
-	if len(p) == 0 {
-		return 0, nil
+// escape returns raw (a complete, unescaped frame including the leading
+// frame delimiter and trailing CRC) with every byte after the frame
+// delimiter escaped.
+func escape(raw []byte) []byte {
+	if len(raw) == 0 {
+		return nil
 	}
-
-	// Twice as long: in the worst case, every byte needs to be escaped.
-	escaped := make([]byte, 0, len(p)*2)
-	for _, b := range p {
-		// 0xfd (frame delimiter) must be escaped within a frame.
-		// 0xfc introduces an escaped byte, so bytes which happen to
-		// be 0xfc need to be escaped as well.
-		if b == 0xfd || b == 0xfc {
-			escaped = append(escaped, 0xfc, b&0x7f)
+	// In the worst case, every byte needs to be escaped.
+	escaped := make([]byte, 1, len(raw)*2)
+	escaped[0] = raw[0]
+	for _, b := range raw[1:] {
+		if b == frameDelimiter || b == escapeByte {
+			escaped = append(escaped, escapeByte, b&0x7f)
 		} else {
 			escaped = append(escaped, b)
 		}
 	}
-	n, err = ew.w.Write(escaped)
-	if err != nil {
-		return n, err
-	}
-	return len(p), nil
-}
-
-type unescapingReader struct {
-	r io.Reader
-}
-
-func (uer *unescapingReader) Read(p []byte) (n int, err error) {
-	if len(p) == 0 {
-		return 0, nil
-	}
-
-	raw := make([]byte, len(p))
-	n, err = uer.r.Read(raw)
-	if err != nil {
-		return n, err
-	}
-	var escapeByte bool
-	idx := 0
-	for _, b := range raw[:n] {
-		if b == 0xfc {
-			escapeByte = true
-			continue
-		}
-		if escapeByte {
-			b |= 0x80
-			escapeByte = false
-		}
-		p[idx] = b
-		idx++
-	}
-
-	// We cannot end on an escaped byte because the escape state would
-	// not be carried over into the next read call. Force a read.
-	if escapeByte {
-		last := make([]byte, 1)
-		n, err = uer.r.Read(last)
-		if err != nil {
-			return idx, err
-		}
-		p[idx] = last[0] | 0x80
-		idx++
-	}
-	return idx, nil
+	return escaped
 }
