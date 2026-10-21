@@ -24,8 +24,11 @@ func TestWindowContactDiscovery(t *testing.T) {
 			[]string{"binary_sensor/hmbridge_aabbcc/window_open", "binary_sensor/hmbridge_aabbcc/sabotage", "binary_sensor/hmbridge_aabbcc/low_battery", "sensor/hmbridge_aabbcc/rssi", "sensor/hmbridge_aabbcc/last_seen", "sensor/hmbridge_aabbcc/messages_received"},
 			[]string{"climate/", "window_state", "battery_voltage", "/battery/", "temperature", "valve"}},
 		{"HM-Sec-RHS",
-			[]string{"binary_sensor/hmbridge_aabbcc/window_open", "sensor/hmbridge_aabbcc/window_state", "binary_sensor/hmbridge_aabbcc/low_battery"},
-			[]string{"climate/", "sabotage", "battery_voltage", "/battery/"}},
+			[]string{"binary_sensor/hmbridge_aabbcc/window_open", "sensor/hmbridge_aabbcc/window_state", "binary_sensor/hmbridge_aabbcc/low_battery", "binary_sensor/hmbridge_aabbcc/sabotage"},
+			[]string{"climate/", "battery_voltage", "/battery/"}},
+		{"HM-Sec-SCo",
+			[]string{"binary_sensor/hmbridge_aabbcc/window_open", "binary_sensor/hmbridge_aabbcc/sabotage", "binary_sensor/hmbridge_aabbcc/low_battery"},
+			[]string{"climate/", "window_state", "battery_voltage", "/battery/"}},
 	} {
 		kind, ok := KindForModel(tc.model)
 		if !ok || kind != WindowContact {

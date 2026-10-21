@@ -236,7 +236,8 @@ type State struct {
 	// WindowState is the raw contact state: "closed", "tilted" (RHS
 	// only) or "open". Set WindowOpen too (open = tilted or open).
 	WindowState string
-	// Sabotage is the tamper contact of an HM-Sec-SC-2.
+	// Sabotage is the tamper contact of a window contact (all supported
+	// models report it, per eQ-3's rftypes XML).
 	Sabotage *bool
 }
 

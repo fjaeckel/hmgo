@@ -51,7 +51,7 @@ var (
 	tcOnly      = kinds(WallThermostat)
 	windowKinds = kinds(WallThermostat, WindowContact)
 	rhsOnly     = func(d DeviceDesc) bool { return d.Kind == WindowContact && IsThreeState(d.Model) }
-	sc2Only     = func(d DeviceDesc) bool { return d.Kind == WindowContact && !IsThreeState(d.Model) }
+	contactOnly = func(d DeviceDesc) bool { return d.Kind == WindowContact }
 )
 
 func binarySensor(name, field, deviceClass string, extra map[string]any) map[string]any {
@@ -121,7 +121,7 @@ func entities() []entity {
 			"icon":           "mdi:window-open-variant",
 			"value_template": textTemplate("window_state", "None"),
 		}},
-		{"binary_sensor", "sabotage", sc2Only, binarySensor("Sabotage", "sabotage", "tamper", diagnostic)},
+		{"binary_sensor", "sabotage", contactOnly, binarySensor("Sabotage", "sabotage", "tamper", diagnostic)},
 		{"sensor", "control_mode", thermostats, with(diagnostic, map[string]any{
 			"name":           "Control mode",
 			"device_class":   "enum",
