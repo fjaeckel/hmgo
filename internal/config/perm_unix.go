@@ -56,3 +56,27 @@ func checkPermissions(path string, perm fs.FileMode, uid, gid, euid int, groups 
 	}
 	return w
 }
+
+// keyFilePermissionWarnings checks that a key file (security.key_file)
+// is private to its owner: no permissions for its group or other users
+// (hmbridge init creates it with mode 0600, owned by the hmbridge
+// user), and owned by root or by hmbridge's user.
+func keyFilePermissionWarnings(path string, fi fs.FileInfo) []string {
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return nil
+	}
+	return checkKeyFilePermissions(path, fi.Mode().Perm(), int(st.Uid), os.Geteuid())
+}
+
+func checkKeyFilePermissions(path string, perm fs.FileMode, uid, euid int) []string {
+	const fix = "it holds the AES system key; fix with: chmod 0600 and chown hmbridge (the user hmbridge runs as)"
+	var w []string
+	if perm&0o077 != 0 {
+		w = append(w, fmt.Sprintf("%s is accessible by its group or other users (mode %04o); %s", path, perm, fix))
+	}
+	if euid != 0 && uid != 0 && uid != euid {
+		w = append(w, fmt.Sprintf("%s is owned by another user (uid %d), who can read and change it; %s", path, uid, fix))
+	}
+	return w
+}

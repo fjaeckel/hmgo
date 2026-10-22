@@ -242,3 +242,118 @@ func TestEndToEndPairingTimeout(t *testing.T) {
 		return ha.pairing()["active"] == false && strings.Contains(ha.lastResult(), "no device announced itself")
 	})
 }
+
+// TestEndToEndRepairAESDevice: an AES device that was unpaired keeps
+// the system key (unpairing only clears its central address). Pairing
+// it again must not leave it without AES: the key exchange from the
+// eQ-3 default key fails (the device challenges it with the system
+// key's index), so hmbridge retries with the system key as the old
+// key.
+func TestEndToEndRepairAESDevice(t *testing.T) {
+	broker := startBroker(t)
+	fastBridge(t)
+	cfg := pairingE2EConfig(t, broker, 0, t.TempDir())
+	ha := newFakeHA(t, broker, "fake-ha-repair-dual")
+	key := hmkey.FromPassphrase("geheim", 2)
+	dev := fakemod.NewDevice(e2eNewSCo, 0x00c7, "NEQ0000002")
+	mod, rw := fakemod.New(fakemod.Options{DualCoPro: true, OnLLMACSend: dev.Handle})
+	defer mod.Close()
+	runCtx(t, cfg, rw)
+
+	ha.startPairing(t)
+	mod.InjectLLMACRecv(0x40, dev.DeviceInfo(0x02, [3]byte{}))
+	waitFor(t, "paired", func() bool { return strings.HasPrefix(ha.lastResult(), "paired HM-Sec-SCo NEQ0000002") })
+	if k := dev.Key(); k != key {
+		t.Fatalf("device key index %d after the first pairing", k.Index)
+	}
+
+	// Unpair: the contact listens after its config button.
+	ha.publish("hmbridge/4c5d70/set/unpair", "PRESS")
+	waitFor(t, "removed", func() bool { return strings.Contains(ha.lastResult(), "press its config button") })
+	mod.InjectLLMACRecv(0x40, dev.DeviceInfo(0x03, [3]byte(e2eCentral)))
+	waitFor(t, "unpaired", func() bool { return strings.HasPrefix(ha.lastResult(), "unpaired HM-Sec-SCo NEQ0000002") })
+	if c := dev.Central(); c != ([3]byte{}) {
+		t.Fatalf("device still paired to %X", c)
+	}
+	if k := dev.Key(); k != key {
+		t.Fatalf("unpairing changed the device key (index %d)", k.Index)
+	}
+
+	// Pair it again: it announces itself unpaired, but holds the
+	// system key.
+	ha.startPairing(t)
+	mod.InjectLLMACRecv(0x40, dev.DeviceInfo(0x04, [3]byte{}))
+	waitFor(t, "paired again", func() bool {
+		r := ha.lastResult()
+		return strings.HasPrefix(r, "paired HM-Sec-SCo NEQ0000002") && !strings.Contains(r, "unpaired")
+	})
+	res := ha.lastResult()
+	if !strings.Contains(res, "AES on channels [1] with key index 2") {
+		t.Errorf("result %q", res)
+	}
+	if k := dev.Key(); k != key {
+		t.Errorf("device key index %d, not the system key", k.Index)
+	}
+	if v, _ := dev.Reg(1, 1, 0x08); v != 1 || dev.Central() != [3]byte(e2eCentral) {
+		t.Errorf("AES_ACTIVE %d, central %X", v, dev.Central())
+	}
+	// Events are authenticated with the system key (the peer is
+	// registered with key index 2 again).
+	mod.InjectLLMACRecv(0x40, dev.Message(0x21, 0xa0, 0x41, [3]byte(e2eCentral), 0x01, 0x06, 0xc8))
+	waitFor(t, "authenticated event", func() bool {
+		st := ha.json("hmbridge/4c5d70/state")
+		return st["window_open"] == true && st["auth_status"] == "ok"
+	})
+}
+
+// TestEndToEndRepairAESDevicePreviousKey: a device unpaired before a
+// key change holds the previous system key. Re-pairing tries the
+// default key, then the current key, then the previous key as its old
+// key, and switches it to the current key.
+func TestEndToEndRepairAESDevicePreviousKey(t *testing.T) {
+	broker := startBroker(t)
+	fastBridge(t)
+	stateDir := t.TempDir()
+	oldCfg := pairingE2EConfig(t, broker, 0, stateDir)
+	ha := newFakeHA(t, broker, "fake-ha-repair-prev")
+	dev := fakemod.NewDevice(e2eNewSCo, 0x00c7, "NEQ0000002")
+	mod, rw := fakemod.New(fakemod.Options{DualCoPro: true, OnLLMACSend: dev.Handle})
+	defer mod.Close()
+	stop := runCtx(t, oldCfg, rw)
+	ha.startPairing(t)
+	mod.InjectLLMACRecv(0x40, dev.DeviceInfo(0x02, [3]byte{}))
+	waitFor(t, "paired", func() bool { return strings.HasPrefix(ha.lastResult(), "paired HM-Sec-SCo NEQ0000002") })
+	ha.publish("hmbridge/4c5d70/set/unpair", "PRESS")
+	waitFor(t, "removed", func() bool { return strings.Contains(ha.lastResult(), "press its config button") })
+	mod.InjectLLMACRecv(0x40, dev.DeviceInfo(0x03, [3]byte(e2eCentral)))
+	waitFor(t, "unpaired", func() bool { return strings.HasPrefix(ha.lastResult(), "unpaired HM-Sec-SCo NEQ0000002") })
+	stop()
+
+	// The system key is changed (index 3; index 2 is the previous key).
+	cfg, err := config.Parse([]byte(fmt.Sprintf(`{
+	  "central_address": "458086",
+	  "reset": "none",
+	  "state_dir": %q,
+	  "require_synced_clock": false,
+	  "security": {"passphrase": "neu", "index": 3, "previous": {"passphrase": "geheim", "index": 2}},
+	  "mqtt": {"broker": %q},
+	  "http_listen": ""
+	}`, stateDir, broker)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ha.forget("homeassistant/button/hmbridge_bridge/pair/config")
+	ha.forget("hmbridge/bridge/pairing")
+	mod2, rw2 := fakemod.New(fakemod.Options{DualCoPro: true, OnLLMACSend: dev.Handle})
+	defer mod2.Close()
+	runCtx(t, cfg, rw2)
+	ha.startPairing(t)
+	mod2.InjectLLMACRecv(0x40, dev.DeviceInfo(0x04, [3]byte{}))
+	waitFor(t, "paired again", func() bool { return strings.HasPrefix(ha.lastResult(), "paired HM-Sec-SCo NEQ0000002") })
+	if res := ha.lastResult(); !strings.Contains(res, "AES on channels [1] with key index 3") {
+		t.Errorf("result %q", res)
+	}
+	if k := dev.Key(); k != hmkey.FromPassphrase("neu", 3) {
+		t.Errorf("device key index %d, not the new system key", k.Index)
+	}
+}

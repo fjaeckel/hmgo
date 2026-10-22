@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -424,4 +425,49 @@ func syncDir(dir string) {
 		d.Sync()
 		d.Close()
 	}
+}
+
+// WriteFileNew creates path with data (mode 0600) only if nothing
+// exists at path yet; otherwise it fails with an error matching
+// fs.ErrExist and leaves the existing file alone. Like WriteFileAtomic,
+// the content is written to a temporary file in the same directory and
+// fsynced first, so that path never exists with partial content; the
+// temporary file is then hard-linked to path, which fails atomically if
+// path exists (also as a symbolic link). The directory is created (mode
+// 0700) if missing.
+func WriteFileNew(path string, data []byte) error {
+	if _, err := os.Lstat(path); err == nil {
+		return &os.PathError{Op: "create", Path: path, Err: fs.ErrExist}
+	}
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, DirMode); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name())
+	err = tmp.Chmod(FileMode)
+	if err == nil {
+		_, err = tmp.Write(data)
+	}
+	if err == nil {
+		err = tmp.Sync()
+	}
+	if cerr := tmp.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		return err
+	}
+	if err := os.Link(tmp.Name(), path); err != nil {
+		var le *os.LinkError
+		if errors.As(err, &le) && errors.Is(le.Err, fs.ErrExist) {
+			return &os.PathError{Op: "create", Path: path, Err: fs.ErrExist}
+		}
+		return err
+	}
+	syncDir(dir)
+	return nil
 }

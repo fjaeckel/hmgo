@@ -1,0 +1,68 @@
+// Copyright (c) 2026 Frederic Jung
+// SPDX-License-Identifier: BSD-3-Clause
+//
+// Optional device tree overlay for an RPI-RF-MOD on Raspberry Pi OS
+// (without OpenCCU): the module's RTC (Epson RX8130 on the header's
+// I2C bus, address 0x32; Linux driver rtc-ds1307) and its three status
+// LEDs (GPIO 16 red, 20 green, 21 blue) as /sys/class/leds/rpi_rf_mod:*.
+// The pin and address assignments are those of OpenCCU's rpi-rf-mod.dts.
+// hmbridge needs neither: it uses the UART (/dev/serial0) and the reset
+// line (GPIO 19), which this overlay leaves alone. The RTC keeps the
+// time across power cuts without network; hmbridge also recognizes the
+// RPI-RF-MOD by it when choosing the reset line.
+//
+// Install (see docs/DEPLOY.md, Fresh installation):
+//
+//	sudo apt install device-tree-compiler
+//	sudo dtc -@ -I dts -O dtb -o /boot/firmware/overlays/hmbridge-rpi-rf-mod.dtbo hmbridge-rpi-rf-mod.dts
+//	echo 'dtoverlay=hmbridge-rpi-rf-mod' | sudo tee -a /boot/firmware/config.txt
+//
+// Not verified on hardware yet.
+
+/dts-v1/;
+/plugin/;
+
+/ {
+	compatible = "brcm,bcm2835";
+
+	fragment@0 {
+		target = <&i2c_arm>;
+		__overlay__ {
+			#address-cells = <1>;
+			#size-cells = <0>;
+			status = "okay";
+
+			rpi_rf_mod_rtc: rtc@32 {
+				compatible = "epson,rx8130";
+				reg = <0x32>;
+				// The module's backup capacitor is charged by the RTC.
+				aux-voltage-chargeable = <1>;
+				status = "okay";
+			};
+		};
+	};
+
+	fragment@1 {
+		target = <&leds>;
+		__overlay__ {
+			rpi_rf_mod_red {
+				label = "rpi_rf_mod:red";
+				gpios = <&gpio 16 0>;
+				default-state = "keep";
+				linux,default-trigger = "none";
+			};
+			rpi_rf_mod_green {
+				label = "rpi_rf_mod:green";
+				gpios = <&gpio 20 0>;
+				default-state = "keep";
+				linux,default-trigger = "none";
+			};
+			rpi_rf_mod_blue {
+				label = "rpi_rf_mod:blue";
+				gpios = <&gpio 21 0>;
+				default-state = "keep";
+				linux,default-trigger = "none";
+			};
+		};
+	};
+};

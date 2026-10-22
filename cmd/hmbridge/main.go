@@ -26,16 +26,13 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"golang.org/x/sys/unix"
 
 	bidcosaes "github.com/fjaeckel/hmgo/internal/bidcos/aes"
 	"github.com/fjaeckel/hmgo/internal/bridge"
 	"github.com/fjaeckel/hmgo/internal/buildinfo"
 	"github.com/fjaeckel/hmgo/internal/config"
-	"github.com/fjaeckel/hmgo/internal/gpio"
 	"github.com/fjaeckel/hmgo/internal/ha"
 	"github.com/fjaeckel/hmgo/internal/hmkey"
-	"github.com/fjaeckel/hmgo/internal/serial"
 	"github.com/fjaeckel/hmgo/internal/store"
 	"github.com/fjaeckel/hmgo/internal/uartgw"
 	"github.com/fjaeckel/hmgo/licenses"
@@ -47,7 +44,19 @@ var (
 	debugFrames = flag.Bool("debug", false, "log every frame exchanged with the radio module (keys are redacted) and every message hmbridge does not use")
 	showVersion = flag.Bool("version", false, "print the version and exit")
 	showLicense = flag.Bool("license", false, "print the licenses and exit")
+	probe       = flag.Bool("probe", false, "reset and identify the radio module, print its kind, firmware and serial number, and exit (see hmbridge probe -h)")
 )
+
+func usage() {
+	out := flag.CommandLine.Output()
+	fmt.Fprintf(out, `usage: hmbridge [flags]          run the bridge
+       hmbridge init [flags]     create a configuration and AES system key for a fresh installation
+       hmbridge probe [flags]    reset and identify the radio module, then exit
+
+flags:
+`)
+	flag.PrintDefaults()
+}
 
 func version() string { return buildinfo.Version() }
 
@@ -64,7 +73,29 @@ var configInsecure = prometheus.NewGauge(prometheus.GaugeOpts{
 func init() { prometheus.MustRegister(buildInfo, configInsecure) }
 
 func main() {
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "init":
+			os.Exit(runInit(os.Args[2:], defaultInitEnv()))
+		case "probe":
+			log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+			os.Exit(runProbe(os.Args[2:], os.Stdout, os.Stderr))
+		}
+	}
+	flag.Usage = usage
 	flag.Parse()
+	if *probe {
+		// -probe: the same as “hmbridge probe -config <config>”.
+		log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+		args := []string{}
+		flag.Visit(func(f *flag.Flag) {
+			switch f.Name {
+			case "config", "debug":
+				args = append(args, "-"+f.Name+"="+f.Value.String())
+			}
+		})
+		os.Exit(runProbe(args, os.Stdout, os.Stderr))
+	}
 	if *showLicense {
 		fmt.Print(licenses.Text())
 		return
@@ -87,6 +118,10 @@ func main() {
 		for _, m := range cfg.PermissionWarnings() {
 			fmt.Printf("WARNING: %s\n", m)
 		}
+		if s := cfg.Security; s != nil && s.KeyFile != "" {
+			cur, _ := cfg.Keys()
+			fmt.Printf("AES system key: read from %s (index %d)\n", s.KeyFile, cur.Index)
+		}
 		if d := cfg.StateDirPath(); d != "" {
 			fmt.Printf("state directory: %s\n", d)
 		}
@@ -100,7 +135,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	uart, err := openUART(cfg)
+	uart, _, err := openUART(cfg, log.Printf)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -322,57 +357,6 @@ func connectMQTT(ctx context.Context, opts ha.Options) (*ha.Client, error) {
 		case <-time.After(mqttAuthRetry):
 		}
 	}
-}
-
-// openUART opens and configures the serial port and resets the module
-// if configured.
-func openUART(cfg *config.Config) (*os.File, error) {
-	log.Printf("opening serial port %s", cfg.SerialPort)
-	uart, err := os.OpenFile(cfg.SerialPort, os.O_RDWR|unix.O_NOCTTY|unix.O_NONBLOCK, 0600)
-	if err != nil {
-		return nil, err
-	}
-	// Use SyscallConn instead of Fd: Fd would switch the file to
-	// blocking mode, after which Close could not interrupt a pending read.
-	rc, err := uart.SyscallConn()
-	if err != nil {
-		uart.Close()
-		return nil, err
-	}
-	var ctlErr error
-	if err := rc.Control(func(fd uintptr) {
-		if serial.IsTerminal(fd) {
-			if err := serial.Configure(fd); err != nil {
-				ctlErr = fmt.Errorf("configuring %s: %w", cfg.SerialPort, err)
-				return
-			}
-		} else {
-			log.Printf("%s is not a tty (e.g. OpenCCU's raw-uart), skipping line configuration", cfg.SerialPort)
-		}
-		switch cfg.Reset {
-		case "gpio":
-			log.Printf("resetting HM-MOD-RPI-PCB via GPIO %d", cfg.ResetGPIO)
-			if err := gpio.ResetUARTGW(fd, cfg.ResetGPIO); err != nil {
-				ctlErr = fmt.Errorf("resetting the radio module via GPIO %d: %w (set \"reset\": \"none\" if the module's reset line is not connected)", cfg.ResetGPIO, err)
-			}
-		case "raw-uart":
-			log.Printf("resetting the radio module via the raw-uart driver")
-			if err := serial.ResetRawUART(fd); err != nil {
-				hint := ""
-				if errors.Is(err, syscall.EBUSY) {
-					hint = " (another program uses the radio module; on OpenCCU stop multimacd first, see docs/DEPLOY.md)"
-				}
-				ctlErr = fmt.Errorf("resetting the radio module via %s: %w%s", cfg.SerialPort, err, hint)
-			}
-		}
-	}); err != nil {
-		ctlErr = err
-	}
-	if ctlErr != nil {
-		uart.Close()
-		return nil, ctlErr
-	}
-	return uart, nil
 }
 
 func boolGauge(v bool) float64 {

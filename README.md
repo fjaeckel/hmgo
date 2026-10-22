@@ -93,11 +93,42 @@ together with `press_long_release` when the button is let go.
     ([docs/SNIFFING.md](docs/SNIFFING.md)).
 * An MQTT broker reachable from the Pi (e.g. the Mosquitto add-on of Home
   Assistant).
+* Raspberry Pi OS (a fresh installation needs no CCU: `hmbridge init`
+  creates the configuration and a new system key), or an existing OpenCCU
+  installation to take over.
 
 ## Quick start
 
+**New system without a CCU** (Raspberry Pi OS Lite, see
+[docs/DEPLOY.md](docs/DEPLOY.md#fresh-installation-no-openccu)):
+
 ```sh
-# Build for the Pi (pick the architecture of your Pi's OS).
+# /boot/firmware/config.txt: enable_uart=1 and dtoverlay=disable-bt;
+# remove console=serial0,115200 from cmdline.txt; reboot.
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin --groups dialout,gpio hmbridge
+
+# Binary from a release (verify it, see DEPLOY.md).
+gh release download nightly -R fjaeckel/hmgo -p 'hmbridge-*-linux-arm64' -p 'SHA256SUMS-*'
+sha256sum --ignore-missing -c SHA256SUMS-* && gh attestation verify hmbridge-*-linux-arm64 -R fjaeckel/hmgo
+sudo install -m 0755 hmbridge-*-linux-arm64 /usr/local/bin/hmbridge
+
+sudo hmbridge probe     # resets and identifies the radio module
+sudo hmbridge init      # writes /etc/hmbridge/config.json and a new AES system key
+sudo -u hmbridge hmbridge -check_config
+
+# contrib/systemd/hmbridge.service → /etc/systemd/system/, then:
+sudo systemctl enable --now hmbridge
+```
+
+Then pair the devices one by one from Home Assistant (button "Pair new
+device" on the device hmbridge).
+
+**Taking over an OpenCCU installation** (same radio address and key, no
+re-pairing; see [docs/DEPLOY.md](docs/DEPLOY.md#migrating-from-openccu)):
+
+```sh
+# Build for the Pi (pick the architecture of your Pi's OS), or take the
+# binaries from a release.
 GOOS=linux GOARCH=arm64 go build -o hmbridge ./cmd/hmbridge          # 64-bit OS
 GOOS=linux GOARCH=arm GOARM=7 go build -o hmbridge ./cmd/hmbridge    # 32-bit OS, Pi 2/3/4
 GOOS=linux GOARCH=arm GOARM=6 go build -o hmbridge ./cmd/hmbridge    # Pi 1 / Zero
@@ -115,8 +146,8 @@ GOOS=linux GOARCH=arm GOARM=6 go build -o hmbridge ./cmd/hmbridge    # Pi 1 / Ze
 
 `make dist` builds all of these into `dist/`.
 
-See [docs/DEPLOY.md](docs/DEPLOY.md) for collecting the settings from OpenCCU,
-switching between OpenCCU and hmbridge, and a systemd setup.
+See [docs/DEPLOY.md](docs/DEPLOY.md) for both paths in detail, switching
+between OpenCCU and hmbridge, and the systemd setup.
 
 ## Configuration
 
@@ -139,6 +170,10 @@ A minimal configuration:
 
 [internal/config/example.json](internal/config/example.json) documents every
 option. Omit `security` if you never set a system security key on your CCU.
+On a new installation, `hmbridge init` writes the configuration and keeps a
+newly generated key in a separate file (`"security": {"key_file":
+"/var/lib/hmbridge/system.key", "index": 1}`, mode 0600) instead of
+`passphrase`/`key`.
 
 `cmd/hmgenconfig` generates the whole configuration (devices, names, AES
 settings, heating groups) from a running OpenCCU; it reads nothing secret and

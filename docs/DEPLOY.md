@@ -2,6 +2,305 @@
 
 # Deploying hmbridge
 
+There are two ways to set up hmbridge:
+
+* **[Fresh installation (no OpenCCU)](#fresh-installation-no-openccu):** a
+  new system on plain Raspberry Pi OS. hmbridge generates its own radio
+  address and AES system key, and you pair your devices with it one by one.
+  OpenCCU is never installed.
+* **[Migrating from OpenCCU](#migrating-from-openccu):** hmbridge takes over
+  an existing OpenCCU installation's radio address, key and devices, so
+  nothing has to be paired again.
+
+Sections 4 (Home Assistant) and 5 (Adding devices) apply to both.
+
+## Fresh installation (no OpenCCU)
+
+What you need: a Raspberry Pi 3 or 4 (a Pi 5 should work, see step 2), an
+SD card, and one of eQ-3's radio boards on the Pi's GPIO header: an
+**RPI-RF-MOD** (experimental support, see the README) or an
+**HM-MOD-RPI-PCB**. Both sit on the first pins of the header (pin 1 at the
+SD card end) and talk to the Pi's UART at 115200 baud, 8N1, without flow
+control. Their reset lines are GPIO 18 (HM-MOD-RPI-PCB) and GPIO 19
+(RPI-RF-MOD), both active low; hmbridge picks the right one (taken from
+OpenCCU's device tree overlay).
+
+What has been tested how:
+
+| part | status |
+|---|---|
+| serial port setup (115200 8N1, raw, no flow control, non-blocking reads) | tested on a pseudo terminal with the emulated module (unit tests) |
+| module detection after a reset, bootloader → application, firmware/serial query, `hmbridge probe` | tested with the emulated module (both kinds) |
+| choosing the reset line (RTC present / module answers IDENTIFY) | tested on a pseudo terminal and with a fake sysfs |
+| `hmbridge init`, key file, permissions, refusal to overwrite | tested |
+| pulsing GPIO 19 on a real RPI-RF-MOD, GPIO chip lookup on a Pi 5 | **needs a hardware test** (GPIO 18 on the HM-MOD-RPI-PCB worked before) |
+| RTC/LED overlay `contrib/raspberrypi/hmbridge-rpi-rf-mod.dts` | compiles; **needs a hardware test** |
+| factory-reset procedures below | from eQ-3's manuals where marked; others **unverified** |
+
+### Step 1: Raspberry Pi OS Lite
+
+Write **Raspberry Pi OS Lite (64-bit)**, Bookworm or Trixie, to the SD card
+with Raspberry Pi Imager. In its OS customisation set the host name (e.g.
+`hmbridge`), a user, SSH, your time zone and, if needed, Wi-Fi. Boot the Pi,
+log in with SSH and update it:
+
+```sh
+sudo apt update && sudo apt full-upgrade -y
+```
+
+### Step 2: UART for the radio module
+
+The radio module needs the Pi's full UART (PL011, `/dev/ttyAMA0`) on GPIO
+14/15, which Bluetooth uses by default on a Pi 3/4/Zero 2, and no serial
+console on it.
+
+1. Add to the end of `/boot/firmware/config.txt` (in the `[all]` section):
+
+   ```ini
+   enable_uart=1
+   # Bluetooth off; the module gets the PL011 UART:
+   dtoverlay=disable-bt
+   # or, to keep (slow) Bluetooth on the mini UART instead:
+   #dtoverlay=miniuart-bt
+   ```
+
+   With `disable-bt` also run `sudo systemctl disable --now hciuart`.
+2. Remove the serial console: delete `console=serial0,115200` from
+   `/boot/firmware/cmdline.txt` (the file is one single line; leave the rest
+   unchanged). `sudo raspi-config` → Interface Options → Serial Port →
+   "login shell: No", "serial port hardware: Yes" does steps 1 (without the
+   Bluetooth overlay) and 2 as well.
+3. `sudo reboot`, then check: `ls -l /dev/serial0` must point to `ttyAMA0`
+   (not `ttyS0`, the mini UART), and nothing may use it
+   (`sudo fuser /dev/ttyAMA0` prints nothing).
+
+hmbridge uses `/dev/serial0` by default. **Pi 5 (unverified):** there
+`serial0` is the debug connector; add `dtparam=uart0=on` instead of the
+Bluetooth overlay (the Pi 5's Bluetooth has its own UART) and use
+`"serial_port": "/dev/ttyAMA0"` (`hmbridge init -serial_port /dev/ttyAMA0`).
+
+### Step 3 (RPI-RF-MOD, optional): RTC and status LEDs
+
+The RPI-RF-MOD carries a real-time clock (Epson RX8130 at I²C address 0x32)
+and an RGB status LED. hmbridge needs neither, but the RTC keeps the time
+over a power cut without network, and with it hmbridge recognizes the
+RPI-RF-MOD without asking it. Raspberry Pi's `i2c-rtc` overlay has no RX8130
+option, so hmbridge brings its own overlay (**not verified on hardware
+yet**):
+
+```sh
+sudo apt install device-tree-compiler
+curl -LO https://raw.githubusercontent.com/fjaeckel/hmgo/master/contrib/raspberrypi/hmbridge-rpi-rf-mod.dts
+sudo dtc -@ -I dts -O dtb -o /boot/firmware/overlays/hmbridge-rpi-rf-mod.dtbo hmbridge-rpi-rf-mod.dts
+printf 'dtparam=i2c_arm=on\ndtoverlay=hmbridge-rpi-rf-mod\n' | sudo tee -a /boot/firmware/config.txt
+sudo reboot
+```
+
+Then `cat /sys/bus/i2c/devices/1-0032/name` shows `rx8130`, `/dev/rtc0`
+exists and `sudo hwclock -r` (package `util-linux-extra`) reads the clock.
+To have the clock set from the RTC at boot instead of from the last
+shutdown, `sudo apt purge fake-hwclock`. The LEDs appear as
+`/sys/class/leds/rpi_rf_mod:{red,green,blue}`. hmbridge still hands out the
+time to the devices only once NTP has synchronised the clock
+(`require_synced_clock`).
+
+### Step 4: User
+
+```sh
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin --groups dialout,gpio hmbridge
+```
+
+`dialout` gives access to the serial port, `gpio` to the reset line
+(`/dev/gpiochip*`).
+
+### Step 5: Install hmbridge
+
+Take the binary from a [release](https://github.com/fjaeckel/hmgo/releases):
+a tagged release `v…`, or `nightly`, the latest build of the `master`
+branch (not a stable release). Each release has the binaries for all architectures
+(`hmbridge-<version>-linux-arm64` for 64-bit Raspberry Pi OS) and a checksum
+file `SHA256SUMS-<version>`; the binaries carry a signed build provenance
+attestation from GitHub Actions.
+
+With the [GitHub CLI](https://cli.github.com/) (`gh`, logged in with
+`gh auth login`; you can also do this on your desktop and copy the file):
+
+```sh
+TAG=v0.1.0   # or: nightly
+gh release download "$TAG" -R fjaeckel/hmgo -p 'hmbridge-*-linux-arm64' -p 'SHA256SUMS-*'
+sha256sum --ignore-missing -c SHA256SUMS-*      # must print "OK"
+gh attestation verify hmbridge-*-linux-arm64 -R fjaeckel/hmgo
+sudo install -m 0755 hmbridge-*-linux-arm64 /usr/local/bin/hmbridge
+hmbridge -version
+```
+
+Without `gh`, download the same two files from the release page (or with
+`curl -LO https://github.com/fjaeckel/hmgo/releases/download/<tag>/<file>`)
+and check them with `sha256sum`. The checksum only protects against a
+damaged download; the attestation proves that the binary was built by this
+repository's workflow.
+
+### Step 6: Check the radio module
+
+```sh
+sudo hmbridge probe
+```
+
+opens `/dev/serial0`, resets the module, identifies it and prints e.g.
+
+```text
+serial port:    /dev/serial0 -> /dev/ttyAMA0
+reset:          GPIO 19 on /dev/gpiochip0 (RPI-RF-MOD reset line: the module answered IDENTIFY)
+module:         RPI-RF-MOD
+application:    DualCoPro_App
+firmware:       4.4.22
+serial number:  …
+SGTIN:          …
+OK: the radio module works. Next: hmbridge init (see docs/DEPLOY.md).
+```
+
+It needs no configuration (flags `-serial_port`, `-radio`, `-reset`,
+`-reset_gpio`, `-debug`; `hmbridge -probe` does the same with the settings
+of an existing configuration). Run it again as the service user to check the
+permissions: `sudo -u hmbridge hmbridge probe`. If it fails, it prints a hint;
+the usual causes are a serial console or Bluetooth still on the UART
+(step 2), or a module not seated on the right pins. `-debug` shows every
+frame.
+
+### Step 7: Configuration and system key
+
+```sh
+sudo hmbridge init
+```
+
+asks for the MQTT broker (e.g. `tcp://homeassistant.local:1883`), the MQTT
+user and password (not echoed), the serial port and the central address, and
+creates:
+
+| file | content | owner, mode |
+|---|---|---|
+| `/etc/hmbridge/config.json` | configuration: radio `auto`, `reset` `gpio`, a random `central_address`, `security` with `key_file` and `index` 1, MQTT, `state_dir`, no devices | `root:hmbridge`, 0640 (it holds the MQTT password) |
+| `/var/lib/hmbridge/` | `state_dir` | `hmbridge`, 0700 |
+| `/var/lib/hmbridge/system.key` | a new random 128-bit AES system key (32 hex digits) | `hmbridge`, 0600 |
+
+The key is never printed and never written into `config.json`. **Back up
+`system.key`** (and later `devices.json`) somewhere safe: without it, every
+device that got the key while pairing must be factory-reset and paired
+again. hmbridge warns (log, status page, `-check_config`) if the key file is
+accessible by its group or other users. `hmbridge init` never overwrites an
+existing configuration or key file.
+
+For scripts: `hmbridge init -non_interactive -mqtt_broker tcp://ha.lan:1883
+-mqtt_username hmbridge -mqtt_password_file /root/mqtt-pw` (`-` reads the
+password from stdin; `hmbridge init -h` lists all flags, e.g. `-config`,
+`-state_dir`, `-serial_port`, `-central_address`).
+
+The **central address** is hmbridge's radio address (24 bits). A new
+installation needs one no device knows yet; `init` picks a random one
+between `100000` and `EFFFFF`. `000000` (no central / unpaired) and `FFFFFF`
+are reserved, and as a precaution the ranges below `100000` and above
+`EFFFFF` are avoided too (other software around the CCU uses low and high
+addresses for broadcasts and virtual devices; this is a convention, not an
+eQ-3 rule). A clash with a device's factory address is very unlikely, and
+pairing refuses a device that has the central's address.
+
+Check it as the service user:
+
+```sh
+sudo -u hmbridge hmbridge -check_config
+```
+
+### Step 8: systemd
+
+```sh
+curl -LO https://raw.githubusercontent.com/fjaeckel/hmgo/master/contrib/systemd/hmbridge.service
+sudo install -m 0644 hmbridge.service /etc/systemd/system/hmbridge.service
+sudo systemctl daemon-reload
+sudo systemctl enable systemd-time-wait-sync   # start only with a synchronised clock
+sudo systemctl enable --now hmbridge
+journalctl -u hmbridge -f
+```
+
+The unit runs hmbridge as `hmbridge` in a sandbox with access only to the
+serial port, the GPIO chips, `/etc/hmbridge` (read-only) and
+`/var/lib/hmbridge`. The log shows `radio module ready: …` and `MQTT
+connected to …`. The status page is on port 8013 (see
+[3b](#3b-running-on-raspberry-pi-os-final-setup) for who can reach it).
+
+### Step 9: MQTT in Home Assistant
+
+1. Install the **Mosquitto broker** add-on (Settings → Add-ons), or use your
+   own broker.
+2. Create a Home Assistant user for hmbridge (Settings → People → Users,
+   e.g. `hmbridge`); the Mosquitto add-on accepts Home Assistant users as
+   MQTT logins. Use these credentials in `hmbridge init`.
+3. Add the **MQTT** integration (Settings → Devices & services) if Home
+   Assistant did not offer it already.
+
+The device **hmbridge** appears with the button **Pair new device** and the
+pairing sensors (see [section 4](#4-home-assistant)).
+
+### Step 10: Pair the devices one by one
+
+Pair one device at a time, as described in
+[section 5](#5-adding-devices): press **Pair new device**, put the device into
+pairing mode (its config button, see its manual), wait for "Last pairing
+result", rename the new device in Home Assistant, then go on with the next.
+Read the warning about the **key hand-out** in section 5 first: every AES
+device receives the new system key encrypted with eQ-3's public default key,
+so pair where nobody suspicious is within radio range and check the serial
+number in each result.
+
+Factory-new devices pair right away. A device that was paired to another
+central (a CCU, OpenCCU, FHEM, Homegear) refuses with `… is paired to
+another central`: **factory-reset it first**. A device that was paired with
+hmbridge before and unpaired keeps hmbridge's system key; pairing it again
+needs no reset (hmbridge retries the key exchange with the system key, then
+with the previous key).
+
+**Factory reset of devices with a foreign system key.** eQ-3's manuals warn
+that a device which still has a system key set by its central refuses the
+reset at the device: its LED lights steadily instead of blinking after the
+first long press. Such a device has to be reset by its old central: delete
+it there (OpenCCU/CCU WebUI: Settings → Devices → Delete, with "reset to
+factory settings" ticked) while the central still runs. If that central is
+gone, you need its system key: take over its radio address and key instead
+(the migration path below). Devices that never had a system key set reset
+fine.
+
+Factory reset per model:
+
+| model | factory reset | source |
+|---|---|---|
+| HM-CC-RT-DN (radiator thermostat) | Remove the batteries. Hold the three buttons (Auto/Manu, Boost, Comfort/Eco) while inserting the batteries again, release when `rES` appears. Or: hold Auto/Manu > 3 s, choose `rES` with the wheel, confirm with Boost, turn to `YES`, confirm with Boost. | eQ-3 manual |
+| HM-TC-IT-WM-W-EU (wall thermostat) | Remove the batteries, hold the three buttons while inserting them again, release when `rES` appears; or via the configuration menu (`rES`). | eQ-3 manual |
+| HM-RC-8 (remote) | Hold the teach-in button (back, under the cover) ≥ 5 s until the LED blinks red slowly, then hold it again ≥ 5 s (the LED blinks faster) and release; the remote restarts (LED test). A steady LED instead: still bound to a central with a system key (see above). | eQ-3 manual |
+| HM-LC-Sw1-Pl-DN-R1 (switch plug) | Hold the channel button ≥ 4 s until the LED blinks slowly, then hold it again ≥ 4 s until the LED blinks fast. | eQ-3 manual (first step); second step **unverified** |
+| HM-Sec-SCo (window contact) | Hold the teach-in button (behind the LED, use a paper clip) until the LED blinks red, then hold it again ≥ 5 s (blinks faster); the LED lights red for about 3 s when done. | third-party guide, **unverified** |
+| HM-Sec-SC-2, HM-Sec-SC (window contacts), HM-Sec-RHS (window handle), HM-PB-2-WM55 (wall switch), HM-WDS10-TH-O, HM-WDS30-T-O (outdoor sensors) | Presumably eQ-3's usual procedure for battery devices: hold the teach-in/config button ≥ 4–5 s until the LED blinks red slowly, then hold it again ≥ 4–5 s until it blinks faster, release. Check the device's manual. | **unverified** |
+| HM-LC-Dim1L-Pl-3 (dimmer plug), HM-OU-LED16 (LED display) | Presumably as the switch plug: hold the channel/config button ≥ 4 s until the LED blinks slowly, then again ≥ 4 s until it blinks fast. Check the device's manual. | **unverified** |
+
+### Step 11: Heating groups
+
+A heating group combines thermostats and window contacts of a room into one
+Home Assistant climate entity that sets all members at once. Groups are
+defined in `config.json`, and their members must be configured there too:
+after pairing, copy each member's entry (name, model, address, serial,
+`aes_channels`, `key_index`) from `/var/lib/hmbridge/devices.json` into
+`devices` in `config.json` (see section 5), add the group, and restart:
+
+```json
+"groups": [ { "name": "Bad", "members": ["Bad Heizung", "Bad Fenster"] } ]
+```
+
+Such a group is driven by hmbridge. Direct radio links between the devices
+themselves (a window contact lowering a radiator thermostat, a wall
+thermostat controlling the radiator thermostats of its room) need peering,
+which hmbridge does not set up yet; support is being added, see the section
+*Direct links* once it is available.
+
+## Migrating from OpenCCU
+
 hmbridge needs exclusive access to the radio module (HM-MOD-RPI-PCB or
 RPI-RF-MOD). While
 you are still evaluating it, you keep OpenCCU installed and take turns: stop
@@ -193,8 +492,12 @@ On a Raspberry Pi OS Lite installation:
 5. `sudo systemctl enable --now hmbridge` and watch
    `journalctl -u hmbridge -f`.
 
-Keep the default `"serial_port": "/dev/serial0"` and `"reset": "gpio"` (the
-module's reset line is GPIO 18).
+Keep the default `"serial_port": "/dev/serial0"` and `"reset": "gpio"`:
+hmbridge pulses the module's reset line, GPIO 18 on the HM-MOD-RPI-PCB and
+GPIO 19 on the RPI-RF-MOD (with `"radio": "auto"` it finds out which module
+is attached first; `reset_gpio` overrides the line). The steps of the
+[fresh installation](#fresh-installation-no-openccu) (UART, user, binary,
+`hmbridge probe`, systemd) apply here as well.
 
 The status page and `/metrics` listen on all interfaces (`:8013`) so that
 Prometheus can scrape them. They contain no keys or passwords, but they are
@@ -363,7 +666,7 @@ Messages you may see as the last result:
 | `… has model ID XXXX, which hmbridge does not support` | Not a supported model. |
 | `… is paired to another central (…)` | The device belongs to another CCU. Factory-reset it (see its manual) or delete it in that CCU first. |
 | `pairing … failed: … NACK` | The device refused the configuration; factory-reset it and try again. |
-| `… AES key exchange failed …` | The device was paired but keeps its previous key (normally the eQ-3 default key), without AES. Unpair it, factory-reset it and pair it again. |
+| `… AES key exchange failed …` | The device was paired but keeps its previous key, without AES. hmbridge tried the eQ-3 default key and then, for a device that still has a key from an earlier pairing, the system key and the previous key as its old key. Unpair it, factory-reset it and pair it again. |
 | `… part 2 was not confirmed …` | The device did not acknowledge the second half of the key; it may use the system key or still the default key. Stored without AES and with key index 0; if commands to it fail, unpair, factory-reset and pair it again. |
 | `… paired to this central address already, so it is assumed to use the system key …` | The device was paired to your central before (OpenCCU, or hmbridge before an unpairing it never confirmed) and is not in `config.json`: it was not given the key again. If its messages fail AES authentication, factory-reset and pair it again. |
 | `ignoring DEVICE_INFO from 000000 / ffffff / <central>` | A spoofed announcement (no real device has these addresses); nothing was sent. |

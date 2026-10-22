@@ -173,12 +173,19 @@ func requestOutput(chipfd uintptr, pin int) (resetLine, error) {
 	return resetLine{fd: uintptr(handlereq.Fd), v2: false}, nil
 }
 
-// ResetUARTGW resets the UARTGW whose reset pin is connected to GPIO
-// line pin of /dev/gpiochip0 (18 on the HM-MOD-RPI-PCB) by holding the
-// pin low for 150ms, flushing the pending UART data, then setting the
-// pin high again.
-func ResetUARTGW(uartfd uintptr, pin int) error {
-	f, err := os.Open("/dev/gpiochip0")
+// Reset resets the radio module whose (active low) reset line is
+// connected to BCM GPIO pin of the Raspberry Pi's header (18 on the
+// HM-MOD-RPI-PCB, 19 on the RPI-RF-MOD, see ResetPinHMModRPIPCB and
+// ResetPinRPIRFMod) by holding the pin low for 150ms, flushing the
+// pending UART data, then setting the pin high again. The GPIO chip is
+// found with FindChip; Reset returns its path.
+func Reset(uartfd uintptr, pin int) (chip string, err error) {
+	chip = FindChip(pin)
+	return chip, reset(chip, uartfd, pin)
+}
+
+func reset(chip string, uartfd uintptr, pin int) error {
+	f, err := os.Open(chip)
 	if err != nil {
 		return err
 	}

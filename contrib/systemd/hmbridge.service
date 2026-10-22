@@ -21,7 +21,7 @@ ProtectHome=yes
 PrivateTmp=yes
 ReadOnlyPaths=/etc/hmbridge
 # Sandbox. hmbridge needs no capabilities: the radio module's UART, the
-# GPIO reset line (/dev/gpiochip0, character device ioctls) and OpenCCU's
+# GPIO reset line (/dev/gpiochip*, character device ioctls) and OpenCCU's
 # raw-uart reset ioctl are reached through device permissions (groups
 # dialout, gpio), and it only reads the clock's sync state (adjtimex
 # without changes).
@@ -35,7 +35,10 @@ DeviceAllow=/dev/serial0 rw
 DeviceAllow=/dev/ttyAMA0 rw
 DeviceAllow=/dev/ttyS0 rw
 DeviceAllow=/dev/raw-uart rw
-DeviceAllow=/dev/gpiochip0 rw
+# The reset line: GPIO 18 (HM-MOD-RPI-PCB) or 19 (RPI-RF-MOD) on the
+# chip of the Pi's header (gpiochip0 on a Pi 4; on a Pi 5 the RP1's
+# chip, whose number depends on the kernel).
+DeviceAllow=char-gpiochip rw
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectKernelLogs=yes

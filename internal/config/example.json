@@ -1,6 +1,7 @@
 {
   "_comment": [
     "hmbridge example configuration. Every object accepts an optional _comment field.",
+    "radio: auto (default; detected at startup), hm-mod-rpi-pcb or rpi-rf-mod. reset: gpio (the module's reset line on the Pi's header), raw-uart (OpenCCU's driver, for /dev/raw-uart), none, or auto (default). reset_gpio: BCM GPIO of the reset line, default 18 (HM-MOD-RPI-PCB) or 19 (RPI-RF-MOD), chosen at startup with radio auto.",
     "Only central_address and devices are required; all other fields show their defaults or typical values.",
     "http_listen serves the status page and Prometheus /metrics (\"\" disables it; use 127.0.0.1:8013 to keep it local). Requests must name hmbridge: an IP address, localhost, the machine's host name (or <name>.local), or a name listed in http_allowed_hosts (e.g. [\"hmbridge.example.lan\"]). time_sync_interval: how often the radio module clock is set.",
     "require_synced_clock (default true): only hand out the time while the system clock is NTP-synchronised. state_dir (absolute; \"\" disables persistence and pairing) holds hmbridge's files: state.json, the fallback for restoring device state when the MQTT broker is unreachable at startup, written only after significant changes, at most every state_save_interval, and on shutdown; and devices.json, the paired devices. On OpenCCU use /usr/local/hmbridge/state. state_file and devices_file are deprecated.",
@@ -10,14 +11,14 @@
   ],
 
   "serial_port": "/dev/serial0",
+  "radio": "auto",
   "reset": "gpio",
-  "reset_gpio": 18,
 
   "central_address": "1A2B3C",
 
   "security": {
     "_comment": [
-      "The CCU's system security key. Give either passphrase (key = MD5(passphrase), as the CCU does) or key (32 hex chars).",
+      "The CCU's system security key. Give one of passphrase (key = MD5(passphrase), as the CCU does), key (32 hex chars) or key_file (absolute path of a file holding the 32 hex chars, mode 0600; hmbridge init creates one with a new random key).",
       "index is the key index shown by the CCU (1 after the first key change, incremented on every change). Default 1.",
       "previous is optional: the key before the last change, needed while not all devices have been switched to the new key.",
       "Omit the whole security block if you never set a key on your CCU (eQ-3 default key, index 0)."

@@ -551,7 +551,7 @@ func (b *Bridge) executePair(ctx context.Context, p *pairJob) (any, error) {
 		out.keyHandedOut = true
 		b.logf("pairing: KEY HAND-OUT: giving the system key (index %d) to %s %s (%x, RSSI %d dBm), encrypted with the publicly known eQ-3 default key",
 			cur.Index, p.model.Name, p.info.Serial, p.addr[:], p.rssi)
-		switch part, err := b.keyExchange(ctx, p.addr, hmkey.EQ3Default, *cur); {
+		switch part, err := b.pairKeyExchange(ctx, peer, *cur); {
 		case err == nil:
 			keyOK = true
 			out.keyIndex = cur.Index

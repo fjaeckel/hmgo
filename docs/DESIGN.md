@@ -553,3 +553,75 @@ The module can only be owned by one process. During development the
 CCU services are stopped, hmbridge runs, then the CCU is started again.
 Device pairings are unaffected because hmbridge reuses the CCU's
 address and key.
+
+## Fresh installation without OpenCCU
+
+On plain Raspberry Pi OS there is no raw-uart driver: hmbridge drives the
+Pi's PL011 UART (`/dev/serial0` → `/dev/ttyAMA0`) and the module's reset
+line itself (`cmd/hmbridge/uart.go`).
+
+**Line settings.** `serial.Configure`: 115200 baud, 8N1, `CLOCAL|CREAD`, no
+`CRTSCTS`, no software flow control, raw input/output, `VMIN=1 VTIME=0`. This
+matches what OpenCCU's `pl011_raw_uart` driver programs into the UART (8N1
+with FIFO, no CTS/RTS); the modules have no handshake lines. The port is
+opened `O_NONBLOCK`, so Go's poller handles it: `Close` interrupts a pending
+read, and reads can have deadlines (used by the probe below). A
+`/dev/raw-uart` device is not a tty and is used as is.
+
+**Reset lines.** OpenCCU's overlay `rpi-rf-mod.dts` lists
+`pivccu,reset-gpios = <&gpio 18 0>, <&gpio 19 0>`: GPIO 18 for the
+HM-MOD-RPI-PCB, GPIO 19 for the RPI-RF-MOD. The raw-uart driver
+(`generic_raw_uart.c`) uses the second one when it finds the RPI-RF-MOD's
+RTC (RX8130, I²C 0x32), and pulses the line low (50 ms low, 50 ms high, then
+input). hmbridge (`internal/gpio`) holds it low for 150 ms, flushes the UART
+input, drives it high and keeps the line requested, through the GPIO
+character device (uAPI v2, v1 fallback). The chip is the one labelled
+`pinctrl-bcm2835`/`-bcm2711`/`-bcm2712`/`-rp1` (`GPIO_GET_CHIPINFO_IOCTL`),
+falling back to `/dev/gpiochip0`; on a Pi 5 the header's chip number depends
+on the kernel version.
+
+**Which line.** `reset_gpio` unset means the configured module's line
+(`config.ResetGPIORPIRFMod` = 19, `DefaultResetGPIO` = 18). With `"radio":
+"auto"`, `resetPin` decides before the reset: the RX8130 in sysfs
+(`/sys/bus/i2c/devices/*-0032/name`, only with the RTC overlay) means
+RPI-RF-MOD; otherwise `uartgw.ProbeKind` sends IDENTIFY (dst COMMON, the
+counter `detectCnt`) and reads frames for up to 1 s with a read deadline: an
+IDENTIFY answer or any dual-firmware destination means RPI-RF-MOD, a
+classic ack/announcement means HM-MOD-RPI-PCB, silence falls back to GPIO
+18. A wrong guess only leaves the module un-reset: `OpenModule` detects a
+running application as well (the dual-firmware application is not rebooted
+anyway, the classic `Conn` restarts its module itself). After the reset,
+detection runs as before: the bootloader announcement (`Co_CPU_BL` /
+`HMIP_TRX_Bl`), CHANGE_APP into `DualCoPro_App` for the RPI-RF-MOD. `reset`
+`auto` resolves to `gpio` except for `/dev/raw-uart*` and for an RPI-RF-MOD
+that is not on the Pi's own UART (e.g. a USB adapter).
+
+**`hmbridge probe`** opens the port, resets and initializes the module like
+the bridge (with central address `000001` without a configuration; the
+module keeps it in RAM, nothing is transmitted), prints kind, application,
+firmware, serial number and SGTIN, and closes it again.
+
+**`hmbridge init`** writes a configuration without devices and a new
+128-bit system key (crypto/rand) into `<state_dir>/system.key` as 32 hex
+digits, mode 0600, owned by the service user. The configuration only
+references it (`security.key_file`, `index` 1). Both files are created with
+`store.WriteFileNew`: written and fsynced under a temporary name, then
+hard-linked into place, which fails atomically if the name exists, so an
+existing configuration or key is never overwritten. `config` reads
+`key_file` at parse time (absolute path, regular file, at most 256 bytes,
+the key never in an error message) and warns like for the configuration
+file when the key file has any group/other permission bits or belongs to
+another user. The central address is random in `100000`–`EFFFFF` (rejection
+sampling, no modulo bias), avoiding `000000`, `FFFFFF` and, by convention,
+the low and high ranges other software uses for broadcasts and virtual
+devices.
+
+**Re-pairing an AES device.** Unpairing only clears a device's central
+address; its key stays. Pairing it again therefore cannot exchange the key
+from the eQ-3 default key: the device challenges part 1 with its key index,
+which the module (peer registered with index 0) refuses to answer, or the
+device cannot decrypt the payload. `Bridge.pairKeyExchange` then retries
+once per configured key (current, then previous) as the old key, after
+registering the peer with that key's index. If part 1 of the retry with the
+current key is authenticated, the device holds the system key whether or
+not part 2 arrives.

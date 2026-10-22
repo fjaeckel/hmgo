@@ -122,7 +122,8 @@ const (
 const (
 	DefaultSerialPort       = "/dev/serial0"
 	DefaultReset            = "auto"
-	DefaultResetGPIO        = 18
+	DefaultResetGPIO        = 18 // HM-MOD-RPI-PCB
+	ResetGPIORPIRFMod       = 19
 	DefaultBroker           = "tcp://localhost:1883"
 	DefaultClientID         = "hmbridge"
 	DefaultBaseTopic        = "hmbridge"
@@ -136,15 +137,20 @@ type Config struct {
 	Comment    Comment `json:"_comment,omitempty"`
 	SerialPort string  `json:"serial_port"` // default /dev/serial0
 	// Reset selects how the radio module is reset at startup: "gpio"
-	// (HM-MOD-RPI-PCB reset line on reset_gpio), "raw-uart" (ask
+	// (the module's reset line on reset_gpio), "raw-uart" (ask
 	// OpenCCU's raw-uart kernel driver, which knows the line of either
 	// module), "none", or "auto" (default: "raw-uart" for /dev/raw-uart*,
-	// else "gpio" for an HM-MOD-RPI-PCB and "none" otherwise).
+	// else "gpio", except for an RPI-RF-MOD that is not on the Pi's own
+	// UART, e.g. on a USB adapter: "none").
 	Reset string `json:"reset"`
 	// Radio selects the radio module: "auto" (default, detected at
 	// startup), "hm-mod-rpi-pcb" or "rpi-rf-mod".
-	Radio     string `json:"radio,omitempty"`
-	ResetGPIO int    `json:"reset_gpio"` // BCM GPIO number, default 18 (0 = default)
+	Radio string `json:"radio,omitempty"`
+	// ResetGPIO is the BCM GPIO number of the reset line. 0 or absent
+	// means the module's line: 18 for the HM-MOD-RPI-PCB, 19 for the
+	// RPI-RF-MOD; with "radio": "auto" it is chosen at startup (see
+	// ResetGPIOAuto).
+	ResetGPIO int `json:"reset_gpio"`
 
 	// CentralAddress is the BidCoS address of the CCU to impersonate
 	// (6 hex digits, optional 0x prefix). Required.
@@ -238,9 +244,15 @@ type Config struct {
 	centralAddr [3]byte
 	current     hmkey.Key
 	previous    *hmkey.Key
+	// resetGPIOAuto: reset_gpio was not set and the radio is detected
+	// at startup.
+	resetGPIOAuto bool
 	// permWarnings are problems with the configuration file's
 	// permissions found by Load.
 	permWarnings []string
+	// keyWarnings are problems with the key files' permissions found
+	// while resolving security.key_file.
+	keyWarnings []string
 }
 
 // Pairing configures how hmbridge pairs new devices.
@@ -277,20 +289,26 @@ const (
 const DefaultPairingDuration = 60 * time.Second
 
 // Security configures the AES key used by the devices (the CCU's
-// “system security key”). Exactly one of Key and Passphrase may be set.
+// “system security key”). Exactly one of Key, Passphrase and KeyFile
+// may be set.
 type Security struct {
-	Comment    Comment  `json:"_comment,omitempty"`
-	Key        string   `json:"key,omitempty"`        // 32 hex chars
-	Passphrase *string  `json:"passphrase,omitempty"` // CCU passphrase; key = MD5(passphrase)
-	Index      *int     `json:"index,omitempty"`      // key index, default 1 when key/passphrase is set
-	Previous   *KeySpec `json:"previous,omitempty"`   // optional older key
+	Comment    Comment `json:"_comment,omitempty"`
+	Key        string  `json:"key,omitempty"`        // 32 hex chars
+	Passphrase *string `json:"passphrase,omitempty"` // CCU passphrase; key = MD5(passphrase)
+	// KeyFile is the absolute path of a file holding the key as 32 hex
+	// characters (written by hmbridge init, mode 0600), so that the
+	// configuration file does not contain it.
+	KeyFile  string   `json:"key_file,omitempty"`
+	Index    *int     `json:"index,omitempty"`    // key index, default 1 when a key is set
+	Previous *KeySpec `json:"previous,omitempty"` // optional older key
 }
 
-// KeySpec is a key given either as hex or as passphrase.
+// KeySpec is a key given as hex, as passphrase or as key file.
 type KeySpec struct {
 	Comment    Comment `json:"_comment,omitempty"`
 	Key        string  `json:"key,omitempty"`
 	Passphrase *string `json:"passphrase,omitempty"`
+	KeyFile    string  `json:"key_file,omitempty"`
 	Index      *int    `json:"index,omitempty"`
 }
 
@@ -481,15 +499,19 @@ func Load(path string) (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
-	cfg.permWarnings = permissionWarnings(path, fi)
+	cfg.permWarnings = append(permissionWarnings(path, fi), cfg.keyWarnings...)
 	return cfg, nil
 }
 
 // PermissionWarnings returns the problems with the configuration file's
 // permissions (readable by other users, owned by another user) found by
-// Load. The file holds the AES system key: anyone who can read it can
-// impersonate the central.
+// Load, and those of the key files (security.key_file: readable by its
+// group or other users). The files hold the AES system key: anyone who
+// can read it can impersonate the central.
 func (c *Config) PermissionWarnings() []string {
+	if c.permWarnings == nil {
+		return append([]string(nil), c.keyWarnings...) // Parse without Load
+	}
 	return append([]string(nil), c.permWarnings...)
 }
 
@@ -568,18 +590,32 @@ func placeholderError(what string) error {
 	return fmt.Errorf("%s: still the %s… placeholder from hmgenconfig; fill in the real value", what, Placeholder)
 }
 
-func resolveKey(what, key string, passphrase *string, index *int, defIndex int) (hmkey.Key, error) {
+func (c *Config) resolveKey(what, key string, passphrase *string, keyFile string, index *int, defIndex int) (hmkey.Key, error) {
 	if isPlaceholder(key) {
 		return hmkey.Key{}, placeholderError(what + ".key")
 	}
 	if passphrase != nil && isPlaceholder(*passphrase) {
 		return hmkey.Key{}, placeholderError(what + ".passphrase")
 	}
-	if key != "" && passphrase != nil {
-		return hmkey.Key{}, fmt.Errorf("%s: set either key or passphrase, not both", what)
+	n := 0
+	for _, set := range []bool{key != "", passphrase != nil, keyFile != ""} {
+		if set {
+			n++
+		}
 	}
-	if key == "" && passphrase == nil {
-		return hmkey.Key{}, fmt.Errorf("%s: key or passphrase is required", what)
+	if n > 1 {
+		return hmkey.Key{}, fmt.Errorf("%s: set only one of key, passphrase and key_file", what)
+	}
+	if n == 0 {
+		return hmkey.Key{}, fmt.Errorf("%s: key, passphrase or key_file is required", what)
+	}
+	if keyFile != "" {
+		k, warnings, err := readKeyFile(keyFile)
+		if err != nil {
+			return hmkey.Key{}, fmt.Errorf("%s.key_file: %w", what, err)
+		}
+		c.keyWarnings = append(c.keyWarnings, warnings...)
+		key = k
 	}
 	idx := defIndex
 	if index != nil {
@@ -619,11 +655,10 @@ func (c *Config) resolve() error {
 		switch {
 		case strings.HasPrefix(c.SerialPort, "/dev/raw-uart"):
 			c.Reset = "raw-uart"
-		case c.Radio == RadioRPIRFMod:
-			// The RPI-RF-MOD's reset line differs from the
-			// HM-MOD-RPI-PCB's; without the raw-uart driver, start
-			// without a reset (the module is put into its app via
-			// IDENTIFY/CHANGE_APP).
+		case c.Radio == RadioRPIRFMod && !OnboardUART(c.SerialPort):
+			// Not on the Pi's header (e.g. a USB adapter): its reset
+			// line is not on a GPIO. The module is put into its
+			// application via IDENTIFY/CHANGE_APP without a reset.
 			c.Reset = "none"
 		default:
 			c.Reset = "gpio"
@@ -632,8 +667,17 @@ func (c *Config) resolve() error {
 	default:
 		return fmt.Errorf("reset: %q is not one of \"auto\", \"gpio\", \"raw-uart\", \"none\"", c.Reset)
 	}
+	c.resetGPIOAuto = false
 	if c.ResetGPIO == 0 {
-		c.ResetGPIO = DefaultResetGPIO
+		switch c.Radio {
+		case RadioRPIRFMod:
+			c.ResetGPIO = ResetGPIORPIRFMod
+		case RadioAuto:
+			c.resetGPIOAuto = true
+			c.ResetGPIO = DefaultResetGPIO
+		default:
+			c.ResetGPIO = DefaultResetGPIO
+		}
 	}
 	if c.ResetGPIO < 0 || c.ResetGPIO > 63 {
 		return fmt.Errorf("reset_gpio: %d out of range 0..63", c.ResetGPIO)
@@ -656,8 +700,9 @@ func (c *Config) resolve() error {
 
 	c.current = hmkey.EQ3Default
 	c.previous = nil
+	c.keyWarnings = nil
 	if s := c.Security; s != nil {
-		k, err := resolveKey("security", s.Key, s.Passphrase, s.Index, 1)
+		k, err := c.resolveKey("security", s.Key, s.Passphrase, s.KeyFile, s.Index, 1)
 		if err != nil {
 			return err
 		}
@@ -668,7 +713,7 @@ func (c *Config) resolve() error {
 			if p.Index == nil && k.Index == 0 {
 				return fmt.Errorf("security.previous: index is required when the current index is 0")
 			}
-			pk, err := resolveKey("security.previous", p.Key, p.Passphrase, p.Index, int(k.Index)-1)
+			pk, err := c.resolveKey("security.previous", p.Key, p.Passphrase, p.KeyFile, p.Index, int(k.Index)-1)
 			if err != nil {
 				return err
 			}
@@ -1126,4 +1171,21 @@ func (c *Config) GroupOf(addr [3]byte) string {
 		}
 	}
 	return ""
+}
+
+// ResetGPIOAuto reports whether the reset line is chosen at startup:
+// reset_gpio is not set and the radio module is detected ("radio":
+// "auto"). ResetGPIO then holds the HM-MOD-RPI-PCB's line, the
+// fallback.
+func (c *Config) ResetGPIOAuto() bool { return c.resetGPIOAuto }
+
+// OnboardUART reports whether port is the Raspberry Pi's own UART on
+// the GPIO header (where the radio modules' reset lines are GPIOs).
+func OnboardUART(port string) bool {
+	for _, p := range []string{"/dev/serial0", "/dev/serial1", "/dev/ttyAMA", "/dev/ttyS"} {
+		if strings.HasPrefix(port, p) {
+			return true
+		}
+	}
+	return false
 }

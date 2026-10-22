@@ -8,3 +8,5 @@ package config
 import "io/fs"
 
 func permissionWarnings(string, fs.FileInfo) []string { return nil }
+
+func keyFilePermissionWarnings(string, fs.FileInfo) []string { return nil }
