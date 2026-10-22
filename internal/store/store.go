@@ -10,7 +10,11 @@
 //   - devices.json: the devices paired with hmbridge (written on pair,
 //     unpair and rename);
 //   - settings.json: the device settings (configuration registers) last
-//     read from the devices (written when they change).
+//     read from the devices (written when they change);
+//   - control.json: the heating control state of groups and thermostats
+//     controlled by Home Assistant (whether the fail-safe fallback is
+//     active, Home Assistant's last setpoints; written on fallback
+//     transitions and on shutdown).
 //
 // Further data (e.g. HmIP keys) becomes another file (Store.File).
 //
@@ -72,7 +76,15 @@ type Store struct {
 	state    *File
 	devices  *File
 	settings *File // nil without a state directory
+	control  *File // nil without a state directory
 }
+
+// ControlFileName is the file of the heating control state.
+const ControlFileName = "control.json"
+
+// ControlVersion is the format version of control.json (its content is
+// defined by the bridge).
+const ControlVersion = 1
 
 // Open sets up the store and copies files from their legacy locations
 // (see FileSpec.Legacy). It never fails: problems are logged, and the
@@ -89,6 +101,7 @@ func Open(o Options) *Store {
 	s.state = s.file(FileSpec{Name: StateFileName, Version: StateVersion, Legacy: o.LegacyStatePath}, o.StatePath)
 	s.devices = s.file(FileSpec{Name: DevicesFileName, Version: DevicesVersion, Indent: true, Legacy: o.LegacyDevicesPath}, o.DevicesPath)
 	s.settings = s.File(FileSpec{Name: SettingsFileName, Version: SettingsVersion})
+	s.control = s.File(FileSpec{Name: ControlFileName, Version: ControlVersion})
 	return s
 }
 
@@ -144,6 +157,10 @@ func (s *Store) File(spec FileSpec) *File {
 
 // State returns the device state file (nil = disabled).
 func (s *Store) State() *File { return s.state }
+
+// Control returns the heating control state file (nil = no state
+// directory).
+func (s *Store) Control() *File { return s.control }
 
 // DevicesFile returns the paired devices file (nil = pairing disabled).
 func (s *Store) DevicesFile() *File { return s.devices }

@@ -533,3 +533,91 @@ func TestHTTPAllowedHosts(t *testing.T) {
 		}
 	}
 }
+
+func TestControl(t *testing.T) {
+	cfg, err := Load("example.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if g := cfg.ResolvedGroups()[0]; g.HAControl || g.FallbackAfter != 0 {
+		t.Errorf("example group: HAControl %v, fallback %v", g.HAControl, g.FallbackAfter)
+	}
+	bad := cfg.Device([3]byte{0x38, 0xf5, 0xb2})
+	if !bad.HAControlled() || bad.FallbackTimeout() != time.Hour {
+		t.Errorf("Bad Heizung: HAControlled %v, fallback %v", bad.HAControlled(), bad.FallbackTimeout())
+	}
+	if cfg.DefaultFallbackAfter() != 30*time.Minute || cfg.SetpointDebounce() != 2*time.Second {
+		t.Errorf("defaults %v %v", cfg.DefaultFallbackAfter(), cfg.SetpointDebounce())
+	}
+
+	const base = `{"central_address":"1A2B3C",%s"devices":[
+		{"name":"a","model":"HM-CC-RT-DN","address":"38F59C"%s},
+		{"name":"w","model":"HM-Sec-SCo","address":"4C5D6E"%s},
+		{"name":"b","model":"HM-CC-RT-DN","address":"38F5A1"%s}],
+		"groups":[{"name":"g","members":["a","w"]%s}]}`
+	parse := func(top, a, w, b, g string) (*Config, error) {
+		return Parse([]byte(fmt.Sprintf(base, top, a, w, b, g)))
+	}
+
+	// Defaults: device control.
+	cfg, err = parse("", "", "", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if g := cfg.ResolvedGroups()[0]; g.HAControl || cfg.Devices[2].HAControlled() {
+		t.Error("control defaults to home_assistant")
+	}
+
+	// A group and a thermostat under HA control; defaults and overrides.
+	cfg, err = parse(`"home_assistant_control":{"fallback_after":"10m","setpoint_debounce":"500ms"},`,
+		"", "", `,"control":"home_assistant","fallback_after":"0s"`, `,"control":"home_assistant"`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if g := cfg.ResolvedGroups()[0]; !g.HAControl || g.FallbackAfter != 10*time.Minute {
+		t.Errorf("group: %v %v", g.HAControl, g.FallbackAfter)
+	}
+	if d := cfg.Devices[2]; !d.HAControlled() || d.FallbackTimeout() != 0 {
+		t.Errorf("device: %v %v", d.HAControlled(), d.FallbackTimeout())
+	}
+	if cfg.SetpointDebounce() != 500*time.Millisecond {
+		t.Errorf("debounce %v", cfg.SetpointDebounce())
+	}
+	cfg, err = parse("", "", "", "", `,"control":"home_assistant","fallback_after":"45m"`)
+	if err != nil || cfg.ResolvedGroups()[0].FallbackAfter != 45*time.Minute {
+		t.Errorf("group fallback_after: %v", err)
+	}
+	cfg, err = parse("", "", "", "", `,"control":"device"`)
+	if err != nil || cfg.ResolvedGroups()[0].HAControl {
+		t.Errorf("explicit device control: %v", err)
+	}
+
+	for _, tc := range []struct {
+		top, a, w, b, g, want string
+	}{
+		{g: `,"control":"ha"`, want: `control "ha" is not one of`},
+		{b: `,"control":"auto"`, want: `control "auto" is not one of`},
+		{g: `,"fallback_after":"1h"`, want: "fallback_after needs"},
+		{b: `,"fallback_after":"1h"`, want: "fallback_after needs"},
+		{b: `,"control":"device","fallback_after":"1h"`, want: "fallback_after needs"},
+		{g: `,"control":"home_assistant","fallback_after":"1m"`, want: "too short"},
+		{b: `,"control":"home_assistant","fallback_after":"30s"`, want: "too short"},
+		{top: `"home_assistant_control":{"fallback_after":"2m"},`, want: "home_assistant_control.fallback_after: 2m0s is too short"},
+		{top: `"home_assistant_control":{"setpoint_debounce":"1m"},`, want: "setpoint_debounce: 1m0s out of range"},
+		{top: `"home_assistant_control":{"setpoint_debounce":"-1s"},`, want: "setpoint_debounce: -1s out of range"},
+		{a: `,"control":"home_assistant"`, want: `member "a" sets control or fallback_after; set them on the group`},
+		{a: `,"control":"device"`, want: `member "a" sets control`},
+		{w: `,"control":"home_assistant"`, want: "apply to thermostats"},
+		{top: `"mqtt":{"broker":""},`, b: `,"control":"home_assistant"`, want: "needs MQTT"},
+		{top: `"mqtt":{"broker":""},`, g: `,"control":"home_assistant"`, want: "needs MQTT"},
+	} {
+		_, err := parse(tc.top, tc.a, tc.w, tc.b, tc.g)
+		if err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("%+v: got %v, want %q", tc, err, tc.want)
+		}
+	}
+	// fallback_after "0s" is allowed everywhere (no fallback).
+	if _, err := parse(`"home_assistant_control":{"fallback_after":"0s","setpoint_debounce":"0s"},`, "", "", "", `,"control":"home_assistant"`); err != nil {
+		t.Error(err)
+	}
+}

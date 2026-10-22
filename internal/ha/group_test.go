@@ -77,7 +77,7 @@ func TestWindowContactDiscovery(t *testing.T) {
 func TestGroupDiscovery(t *testing.T) {
 	cfg := TopicConfig{}
 	msgs := GroupDiscoveryMessages(cfg, GroupDesc{Slug: "wohnzimmer", Name: "Wohnzimmer"})
-	if len(msgs) != 2 {
+	if len(msgs) != 3 {
 		t.Fatalf("got %d messages", len(msgs))
 	}
 	c := decode(t, msgs[0])
@@ -103,6 +103,11 @@ func TestGroupDiscovery(t *testing.T) {
 	w := decode(t, msgs[1])
 	if msgs[1].Topic != "homeassistant/binary_sensor/hmbridge_group_wohnzimmer/window_open/config" || w["device_class"] != "window" || w["state_topic"] != "hmbridge/group/wohnzimmer/state" {
 		t.Errorf("window = %s %v", msgs[1].Topic, w)
+	}
+	ctl := decode(t, msgs[2])
+	if msgs[2].Topic != "homeassistant/sensor/hmbridge_group_wohnzimmer/control/config" || ctl["entity_category"] != "diagnostic" ||
+		ctl["unique_id"] != "hmbridge_group_wohnzimmer_control" || ctl["state_topic"] != "hmbridge/group/wohnzimmer/state" {
+		t.Errorf("control = %s %v", msgs[2].Topic, ctl)
 	}
 	rm := topicsOf(GroupRemovalMessages(cfg, "wohnzimmer", nil))
 	for _, m := range msgs {

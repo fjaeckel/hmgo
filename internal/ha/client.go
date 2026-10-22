@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
@@ -61,6 +62,10 @@ type Client struct {
 	mu       sync.Mutex
 	closed   bool
 	commands chan Command
+
+	// haOffline is set while Home Assistant's last message on its
+	// status topic was "offline" (its will, or a clean shutdown).
+	haOffline atomic.Bool
 }
 
 // Connect connects to the broker, retrying until the first connection
@@ -203,9 +208,15 @@ func (c *Client) worker() {
 // handleMessage runs on paho's router goroutine and must not block.
 func (c *Client) handleMessage(_ mqtt.Client, m mqtt.Message) {
 	if m.Topic() == c.cfg.HAStatusTopic() {
-		if string(m.Payload()) == PayloadOnline {
+		switch string(m.Payload()) {
+		case PayloadOnline:
+			c.haOffline.Store(false)
 			metricHABirth.Inc()
 			c.kick()
+		case PayloadOffline:
+			if !c.haOffline.Swap(true) {
+				c.logf("ha: Home Assistant announced %q on %s", PayloadOffline, m.Topic())
+			}
 		}
 		return
 	}
@@ -242,6 +253,13 @@ func (c *Client) Commands() <-chan Command { return c.commands }
 
 // Topics returns the topic configuration.
 func (c *Client) Topics() TopicConfig { return c.cfg }
+
+// HAOnline reports whether Home Assistant is assumed to be running: false
+// only while its last message on <prefix>/status was "offline" (Home
+// Assistant publishes "online" when it connects to the broker and
+// "offline" when it stops or loses the connection). Without any such
+// message it is assumed to be running.
+func (c *Client) HAOnline() bool { return !c.haOffline.Load() }
 
 // Connected reports whether the connection to the broker is currently up.
 func (c *Client) Connected() bool { return c.mc.IsConnectionOpen() }

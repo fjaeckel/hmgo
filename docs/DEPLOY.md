@@ -696,7 +696,7 @@ device appears as a Home Assistant device as soon as hmbridge connects:
 
 | model | entities |
 |---|---|
-| HM-CC-RT-DN | climate (auto/heat/off, preset boost); sensors temperature, target temperature, valve position, battery voltage and estimate; battery low; diagnostic: control mode, boost remaining, fault, last command |
+| HM-CC-RT-DN | climate (auto/heat/off, preset boost; heat/off only under [Home Assistant control](#using-home-assistant-for-heating-control-eg-advanced-heating-control)); sensors temperature, target temperature, valve position, battery voltage and estimate; battery low; diagnostic: control mode, control (`device`, `home_assistant`, `fallback`), boost remaining, fault, last command |
 | HM-TC-IT-WM-W-EU | as the HM-CC-RT-DN, plus humidity and window, without valve and fault |
 | HM-Sec-SCo, HM-Sec-SC-2, HM-Sec-SC | window, battery low, sabotage |
 | HM-Sec-RHS | as above, plus window state (closed/tilted/open) |
@@ -764,6 +764,7 @@ it with `StateDirectory=hmbridge`, mode 0700; on OpenCCU use
 | `state.json` | last known device state, the fallback when the broker is unreachable at startup | after significant changes (mode, target temperature, window, battery, fault, switch/dimmer level, LED colors), at most every `state_save_interval` (15 min), and on shutdown; ordinary temperature reports never cause a write |
 | `devices.json` | devices paired with hmbridge (section 5) | on pair, unpair and rename |
 | `settings.json` | the device settings last read from the devices (section 6); losing it only means reading them again | when the settings read from a device change |
+| `control.json` | groups and thermostats under Home Assistant control: whether the fail-safe is active, Home Assistant's last mode and setpoint ([Using Home Assistant for heating control](#using-home-assistant-for-heating-control-eg-advanced-heating-control)) | when the fail-safe starts or ends, and on shutdown |
 
 To spare the SD card, a file is never rewritten with unchanged content.
 Writes are atomic (a power cut leaves the old or the new version), files are
@@ -992,6 +993,130 @@ day and check them on the device; on a window contact change the event delay
 and press its config button; on a switch plug set the power-on action and
 unplug it briefly. With an RPI-RF-MOD, check that reading a thermostat
 completes (its list 7 is about 26 radio frames). Please report differences.
+
+## Using Home Assistant for heating control (e.g. Advanced Heating Control)
+
+By default the thermostats run their own week program (mode auto) and Home
+Assistant can switch them between auto, heat (manual) and off. If you want
+Home Assistant to decide the target temperatures instead — with an
+automation, a scheduler, or a blueprint such as
+[Advanced Heating Control](https://community.home-assistant.io/t/advanced-heating-control/469873)
+(AHC; a third-party blueprint, so its options are only described generically
+here) — set `"control": "home_assistant"` on the heating group (or on a
+thermostat that is not in a group). hmbridge then is a thin bridge with a
+fail-safe:
+
+```json
+"home_assistant_control": { "fallback_after": "30m", "setpoint_debounce": "2s" },
+"groups": [
+  { "name": "Bad", "control": "home_assistant", "via_wall_thermostat": true,
+    "members": ["Bad Wandthermostat", "Bad Heizung", "Bad Fenster"] }
+],
+"devices": [
+  { "name": "Flur", "model": "HM-CC-RT-DN", "address": "38F5B2", "control": "home_assistant", "fallback_after": "1h" }
+]
+```
+
+| option | where | meaning |
+|---|---|---|
+| `control` | group; thermostat outside groups | `device` (default) or `home_assistant`. Members of a group follow the group (setting it on a member is an error). Needs MQTT. |
+| `fallback_after` | `home_assistant_control`; group or thermostat (overrides) | how long Home Assistant may be unreachable before the fail-safe starts; default `30m`, `"0s"` disables the fail-safe, otherwise at least `5m` |
+| `setpoint_debounce` | `home_assistant_control` | target temperatures that follow each other within this time are merged; default `2s`, `"0s"` sends each at once, at most `30s` |
+
+**What changes in Home Assistant.** The climate entity (of the group, and of
+each member thermostat) offers the modes **heat** and **off** only — no
+auto — with 5 … 30 °C in 0.5 °C steps; off is the devices' off temperature
+(manual 4.5 °C, valve closed); the preset boost stays. Unique IDs and entity
+IDs do not change; after changing `control` in `config.json`, the entities
+are updated when hmbridge restarts. Every thermostat and group gets a
+diagnostic sensor **Control**: `device`, `home_assistant` or `fallback` (also
+`control` in the state JSON, e.g. `hmbridge/group/<group>/state`).
+
+**What hmbridge does under Home Assistant control.**
+
+* **Setpoints.** A target temperature from Home Assistant is sent as manual
+  mode with that temperature (one command per command target: the wall
+  thermostat first, then the radiator thermostats, or only the wall
+  thermostat with `via_wall_thermostat`). Setpoints for the same group or
+  thermostat within `setpoint_debounce` are merged: only the last one goes
+  out, and "Last command" says e.g. `ok: manual 21.0 (latest of 3
+  setpoints)`. Heat sends manual mode with Home Assistant's last setpoint, off
+  manual 4.5 °C; a mode command replaces a setpoint that is still waiting. A
+  new setpoint ends a running boost.
+* **Manual mode is kept.** The week program must not change the temperature
+  behind Home Assistant's back. When a thermostat reports auto (someone
+  pressed the mode button, or the device fell back to its program), hmbridge
+  sends manual mode again, with Home Assistant's last setpoint (off: 4.5 °C),
+  or the device's current target temperature if Home Assistant has not sent
+  one since the last restart. Rules: at most once per device in 10 minutes
+  (battery, airtime; the next attempt happens by itself after that), not while
+  a window of the group is open or a boost runs (afterwards it is checked
+  again), never during the fail-safe; with `via_wall_thermostat` the wall
+  thermostat gets the command and passes it on. One minute after hmbridge
+  starts, thermostats whose mode is not known (nothing restored from the
+  broker or `state.json`) get manual mode once. Mode auto is not offered; an
+  auto command (e.g. from an old automation) is rejected and shown in "Last
+  command".
+* **Fail-safe.** If the MQTT connection is down — or Home Assistant announced
+  `offline` on `homeassistant/status` (its will message, sent when it stops or
+  loses its broker connection) — for longer
+  than `fallback_after`, hmbridge switches every Home Assistant controlled
+  group and thermostat to **auto**, once (one command per command target), so
+  that the rooms are heated by the devices' week programs. It logs
+  `FAIL-SAFE`, the Control sensor shows `fallback`, and the metric
+  `hmbridge_control_fallback_active{kind,name}` is 1 (alert on it). Note that
+  this also applies to rooms Home Assistant had switched off: in summer, give
+  the week program low temperatures or set `"fallback_after": "0s"`.
+* **Hand back.** When Home Assistant has been reachable again for one
+  minute, hmbridge sends Home Assistant's last mode and setpoint (manual
+  mode). If it does not know them (e.g. Home Assistant never sent one since
+  the setup), the week program keeps running until Home Assistant sends a
+  target temperature or mode. Any climate command from Home Assistant for a
+  group in fallback hands it back at once.
+* **Restarts.** The fallback state and Home Assistant's last mode and
+  setpoint are kept in `control.json` in `state_dir` (written when the
+  fail-safe starts or ends and on shutdown), so a restart during an outage
+  neither switches the thermostats back to manual nor forgets the setpoint
+  to return to. If the fail-safe had not started yet, the time until it starts
+  is counted from the restart.
+
+**A fallback week program.** Set it per group with the group settings
+(Step 11, *Group settings*): the week profile days and the comfort/eco
+temperatures are written to every thermostat of the group. Choose a program
+that is acceptable without Home Assistant (e.g. 20 °C during the day, 17 °C at
+night); it is only used during an outage.
+
+**Recommended settings for Advanced Heating Control** (names differ between
+versions of the blueprint; the ideas are what matters):
+
+* **Thermostat:** use the **group's** climate entity
+  (`climate.hmbridge_group_<group>`), one per room, not the members'. The
+  group distributes the setpoint to its thermostats with a single command
+  each.
+* **Window:** use the group's **Window** binary sensor
+  (`binary_sensor.hmbridge_group_<group>_window_open`, open while any contact
+  of the group is open or tilted) as the single window entity. Keep the
+  thermostats' own window handling as well — the direct links window contact
+  → radiator thermostat and the window open temperature and duration (group
+  settings) — so that the valves close within seconds of a window opening,
+  also when Home Assistant is down; the manual mode enforcement waits while a
+  window is open.
+* **Temperature sensor and calibration:** do not use the blueprint's
+  offset/"generic" calibration. It works by writing the temperature offset
+  setting, a configuration write that wakes the thermostat with a burst for
+  several messages (about 4 bursts, roughly 1.5 s of the module's 36 s airtime
+  per hour, and battery), the device only accepts −3.5 … +3.5 K, and in a
+  group with a wall thermostat the wall thermostat already sends the room
+  temperature to its radiator thermostats over their direct link. If the room
+  temperature is off, set the offset once (device setting) instead.
+* **No aggressive mode** (or similar options that change the setpoint often
+  in small steps): every change is a radio command with a burst.
+* **`via_wall_thermostat: true`** for groups with a wall thermostat that is
+  linked to its radiator thermostats (as the CCU sets up for a group): every
+  setpoint is then one radio command instead of one per thermostat, which
+  halves the airtime or better.
+* Presence, schedules, outside temperature and the like are the blueprint's
+  business; hmbridge just forwards the resulting setpoint or off.
 
 ## Module firmware
 

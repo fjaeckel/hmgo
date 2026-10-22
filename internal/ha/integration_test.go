@@ -211,6 +211,18 @@ func TestIntegration(t *testing.T) {
 		t.Errorf("got %+v", cmd)
 	}
 
+	// HA's status: "offline" (its will) is tracked until it is back.
+	if !c.HAOnline() {
+		t.Error("HAOnline false without any status message")
+	}
+	obs.publish(t, "homeassistant/status", "offline", false)
+	for deadline := time.Now().Add(5 * time.Second); c.HAOnline(); {
+		if time.Now().After(deadline) {
+			t.Fatal("HAOnline still true after HA's offline message")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
 	// HA birth message triggers OnConnect again.
 	n := onConnectsDone.Load()
 	obs.publish(t, "homeassistant/status", "online", false)
@@ -222,6 +234,9 @@ func TestIntegration(t *testing.T) {
 	}
 	if testutil.ToFloat64(metricHABirth) != birthBefore+1 {
 		t.Error("ha_birth_messages_total did not move")
+	}
+	if !c.HAOnline() {
+		t.Error("HAOnline false after HA's birth message")
 	}
 
 	// Close publishes offline.

@@ -130,11 +130,16 @@ func groupNode(cfg TopicConfig, g GroupDesc) node {
 		deviceAvail: cfg.GroupAvailabilityTopic(g.Slug),
 		attrTopic:   cfg.GroupMembersTopic(g.Slug),
 		topic:       func(suffix string) string { return cfg.base() + "/group/" + g.Slug + "/" + suffix },
+		haControl:   g.HAControl,
 	}
 }
 
 func groupWindowEntity() entity {
 	return entity{component: "binary_sensor", key: "window_open", config: binarySensor("Window", "window_open", "window", nil)}
+}
+
+func groupControlEntity() entity {
+	return entity{component: "sensor", key: "control", config: controlSensorConfig()}
 }
 
 // memberEntity is an entity on a group's HA device that mirrors a
@@ -237,6 +242,7 @@ func GroupDiscoveryMessages(cfg TopicConfig, g GroupDesc) []Message {
 	msgs := []Message{
 		retained(climateTopic(cfg, n.id), mustJSON(climateConfig(cfg, n))),
 		entityMessage(cfg, n, groupWindowEntity()),
+		entityMessage(cfg, n, groupControlEntity()),
 	}
 	for _, m := range g.Members {
 		for _, e := range memberEntities(cfg, m) {
@@ -262,10 +268,11 @@ func groupMemberRemovalTopics(cfg TopicConfig, slug string, m GroupMember) []str
 // settings and its retained state.
 func GroupRemovalMessages(cfg TopicConfig, slug string, members []GroupMember, settings ...SettingDesc) []Message {
 	id := groupNodeID(slug)
-	e := groupWindowEntity()
+	e, c := groupWindowEntity(), groupControlEntity()
 	msgs := []Message{
 		retained(climateTopic(cfg, id), nil),
 		retained(entityTopic(cfg, e.component, id, e.key), nil),
+		retained(entityTopic(cfg, c.component, id, c.key), nil),
 	}
 	for _, m := range members {
 		for _, t := range groupMemberRemovalTopics(cfg, slug, m) {

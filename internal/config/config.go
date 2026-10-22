@@ -241,6 +241,9 @@ type Config struct {
 	// hmbridge are kept in devices.json in StateDir instead.
 	Devices []Device `json:"devices"`
 	Groups  []Group  `json:"groups,omitempty"`
+	// HomeAssistantControl holds the defaults of heating groups and
+	// thermostats with "control": "home_assistant" (see Group.Control).
+	HomeAssistantControl *HomeAssistantControl `json:"home_assistant_control,omitempty"`
 	// GroupsSuggestArea sends each heating group's name as the Home
 	// Assistant suggested_area of the group's device and of its members'
 	// devices. Default true. Home Assistant applies a suggested area only
@@ -261,6 +264,49 @@ type Config struct {
 	// keyWarnings are problems with the key files' permissions found
 	// while resolving security.key_file.
 	keyWarnings []string
+}
+
+// Heating control modes (Group.Control, Device.Control).
+const (
+	// ControlDevice: the thermostats run their own week program (auto
+	// mode) and Home Assistant can switch between auto, heat and off.
+	// The default.
+	ControlDevice = "device"
+	// ControlHomeAssistant: Home Assistant (e.g. an automation such as
+	// Advanced Heating Control) decides the target temperature; hmbridge
+	// keeps the thermostats in manual mode and switches them to their
+	// week program (auto) as a fail-safe when Home Assistant has been
+	// unreachable for longer than fallback_after.
+	ControlHomeAssistant = "home_assistant"
+)
+
+// Defaults of home_assistant_control.
+const (
+	DefaultFallbackAfter    = 30 * time.Minute
+	DefaultSetpointDebounce = 2 * time.Second
+	// MinFallbackAfter is the shortest fallback_after other than 0: the
+	// MQTT client reconnects within 30 s, and Home Assistant restarts
+	// take a few minutes.
+	MinFallbackAfter = 5 * time.Minute
+	// MaxSetpointDebounce bounds setpoint_debounce.
+	MaxSetpointDebounce = 30 * time.Second
+)
+
+// HomeAssistantControl configures heating control by Home Assistant
+// (groups and thermostats with "control": "home_assistant").
+type HomeAssistantControl struct {
+	Comment Comment `json:"_comment,omitempty"`
+	// FallbackAfter is how long the MQTT connection (or Home Assistant,
+	// as announced on its status topic) may be gone before hmbridge
+	// switches the thermostats to their week program (auto mode). Go
+	// duration, default "30m", "0s" disables the fallback, otherwise at
+	// least 5m. Groups and thermostats can override it.
+	FallbackAfter Duration `json:"fallback_after,omitempty"`
+	// SetpointDebounce is how long hmbridge waits after a target
+	// temperature from Home Assistant for further ones before it sends
+	// only the latest to the thermostats (Go duration, default "2s",
+	// "0s" sends at once, at most 30s).
+	SetpointDebounce Duration `json:"setpoint_debounce,omitempty"`
 }
 
 // Pairing configures how hmbridge pairs new devices.
@@ -366,8 +412,18 @@ type Device struct {
 	// the actuators, and never for remotes (they only send when a button
 	// is pressed).
 	StaleAfter Duration `json:"stale_after,omitempty"`
+	// Control selects who decides the target temperature of a
+	// thermostat that is not a member of a heating group: "device"
+	// (default) or "home_assistant" (see ControlHomeAssistant). For group
+	// members, set it on the group.
+	Control string `json:"control,omitempty"`
+	// FallbackAfter overrides home_assistant_control.fallback_after for
+	// this thermostat (only with "control": "home_assistant").
+	FallbackAfter Duration `json:"fallback_after,omitempty"`
 
 	addr         [3]byte
+	haControl    bool
+	fallback     time.Duration
 	keyIndex     byte
 	staleDefault time.Duration
 	fromStore    bool
@@ -437,9 +493,16 @@ type Group struct {
 	// requires the direct TC↔RT-DN links the CCU sets up for a group.
 	// Default false: every thermostat gets the command.
 	ViaWallThermostat bool `json:"via_wall_thermostat,omitempty"`
+	// Control selects who decides the group's target temperature:
+	// "device" (default) or "home_assistant" (see ControlHomeAssistant).
+	Control string `json:"control,omitempty"`
+	// FallbackAfter overrides home_assistant_control.fallback_after for
+	// this group (only with "control": "home_assistant").
+	FallbackAfter Duration `json:"fallback_after,omitempty"`
 
 	thermostats []int // indexes into Config.Devices, TC first
 	contacts    []int
+	fallback    time.Duration
 }
 
 // ResolvedGroup is a Group with its members resolved to devices.
@@ -458,6 +521,11 @@ type ResolvedGroup struct {
 	// all Thermostats, or only the wall thermostats if the group has
 	// via_wall_thermostat set and contains one.
 	CommandTargets []*Device
+	// HAControl is set for "control": "home_assistant".
+	HAControl bool
+	// FallbackAfter is the resolved fallback_after (0 = no fallback;
+	// only with HAControl).
+	FallbackAfter time.Duration
 }
 
 // Comment is ignored. JSON has no comments, so every object in the
@@ -811,6 +879,14 @@ func (c *Config) resolve() error {
 			return fmt.Errorf("pairing.duration: %v out of range 10s … 10m", d.Duration)
 		}
 	}
+	if h := c.HomeAssistantControl; h != nil {
+		if err := checkFallbackAfter("home_assistant_control.fallback_after", h.FallbackAfter); err != nil {
+			return err
+		}
+		if d := h.SetpointDebounce; d.set && (d.Duration < 0 || d.Duration > MaxSetpointDebounce) {
+			return fmt.Errorf("home_assistant_control.setpoint_debounce: %v out of range 0s … %v", d.Duration, MaxSetpointDebounce)
+		}
+	}
 	byName := make(map[string]int)
 	byAddr := make(map[[3]byte]int)
 	for i := range c.Devices {
@@ -846,6 +922,14 @@ func (c *Config) resolve() error {
 		}
 		groupNames[strings.ToLower(g.Name)] = true
 		g.thermostats, g.contacts = nil, nil
+		ha, fb, err := c.resolveControl(where, g.Control, g.FallbackAfter)
+		if err != nil {
+			return err
+		}
+		g.fallback = 0
+		if ha {
+			g.fallback = fb
+		}
 		var tcs, rts []int
 		for _, m := range g.Members {
 			idx, ok := byName[strings.ToLower(m)]
@@ -861,6 +945,9 @@ func (c *Config) resolve() error {
 				return fmt.Errorf("%s: device %q is already a member of group %q", where, c.Devices[idx].Name, other)
 			}
 			inGroup[idx] = g.Name
+			if dc := &c.Devices[idx]; dc.Control != "" || dc.FallbackAfter.set {
+				return fmt.Errorf("%s: member %q sets control or fallback_after; set them on the group instead", where, dc.Name)
+			}
 			switch md := c.Devices[idx].Model; {
 			case md == ModelTC:
 				tcs = append(tcs, idx)
@@ -938,8 +1025,82 @@ func (c *Config) resolveDevice(d *Device, where string, fromStore bool) error {
 		d.keyIndex = byte(ki)
 	}
 	d.fromStore = fromStore
+	d.haControl, d.fallback = false, 0
+	if d.Control != "" || d.FallbackAfter.set {
+		if !IsThermostat(d.Model) {
+			return fmt.Errorf("%s: control and fallback_after apply to thermostats (%s, %s) only", where, ModelRTDN, ModelTC)
+		}
+		ha, fb, err := c.resolveControl(where, d.Control, d.FallbackAfter)
+		if err != nil {
+			return err
+		}
+		d.haControl = ha
+		if ha {
+			d.fallback = fb
+		}
+	}
 	return nil
 }
+
+// resolveControl validates a control setting and its fallback_after and
+// returns whether Home Assistant controls the target and the resolved
+// fallback_after.
+func (c *Config) resolveControl(where, control string, fallback Duration) (bool, time.Duration, error) {
+	switch control {
+	case "", ControlDevice:
+		if fallback.set {
+			return false, 0, fmt.Errorf("%s: fallback_after needs \"control\": %q", where, ControlHomeAssistant)
+		}
+		return false, 0, nil
+	case ControlHomeAssistant:
+	default:
+		return false, 0, fmt.Errorf("%s: control %q is not one of %q, %q", where, control, ControlDevice, ControlHomeAssistant)
+	}
+	if c.MQTT.BrokerURL() == "" {
+		return false, 0, fmt.Errorf("%s: \"control\": %q needs MQTT (mqtt.broker is \"\")", where, ControlHomeAssistant)
+	}
+	if err := checkFallbackAfter(where+": fallback_after", fallback); err != nil {
+		return false, 0, err
+	}
+	if fallback.set {
+		return true, fallback.Duration, nil
+	}
+	return true, c.DefaultFallbackAfter(), nil
+}
+
+func checkFallbackAfter(what string, d Duration) error {
+	if d.set && d.Duration != 0 && d.Duration < MinFallbackAfter {
+		return fmt.Errorf("%s: %v is too short (minimum %v, or \"0s\" to disable the fallback)", what, d.Duration, MinFallbackAfter)
+	}
+	return nil
+}
+
+// DefaultFallbackAfter returns home_assistant_control.fallback_after
+// (default 30m; 0 = no fallback).
+func (c *Config) DefaultFallbackAfter() time.Duration {
+	if h := c.HomeAssistantControl; h != nil && h.FallbackAfter.set {
+		return h.FallbackAfter.Duration
+	}
+	return DefaultFallbackAfter
+}
+
+// SetpointDebounce returns home_assistant_control.setpoint_debounce
+// (default 2s).
+func (c *Config) SetpointDebounce() time.Duration {
+	if h := c.HomeAssistantControl; h != nil && h.SetpointDebounce.set {
+		return h.SetpointDebounce.Duration
+	}
+	return DefaultSetpointDebounce
+}
+
+// HAControlled reports whether Home Assistant controls this thermostat
+// ("control": "home_assistant" on a thermostat outside a group; members
+// of a group follow the group, see ResolvedGroup.HAControl).
+func (d Device) HAControlled() bool { return d.haControl }
+
+// FallbackTimeout returns the resolved fallback_after of a thermostat
+// with HAControlled (0 = no fallback).
+func (d Device) FallbackTimeout() time.Duration { return d.fallback }
 
 // ResolveStoreDevice validates a device from the devices file (paired
 // with hmbridge) against the configuration and returns it ready for
@@ -1155,7 +1316,7 @@ func (c *Config) Device(addr [3]byte) *Device {
 func (c *Config) ResolvedGroups() []ResolvedGroup {
 	res := make([]ResolvedGroup, 0, len(c.Groups))
 	for _, g := range c.Groups {
-		rg := ResolvedGroup{Name: g.Name}
+		rg := ResolvedGroup{Name: g.Name, HAControl: g.Control == ControlHomeAssistant, FallbackAfter: g.fallback}
 		for _, i := range g.thermostats {
 			rg.Thermostats = append(rg.Thermostats, &c.Devices[i])
 		}

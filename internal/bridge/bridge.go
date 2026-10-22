@@ -101,6 +101,12 @@ type Options struct {
 	// Store is where state and paired devices are persisted (see
 	// package store). Nil: opened from Config (state_dir).
 	Store *store.Store
+	// Heating control by Home Assistant (control.go), for tests: how
+	// often the link is checked (default 10s), how long it must be back
+	// before control is handed back (1m), the least time between two
+	// “keep manual mode” commands to a device (10m), and when after
+	// startup thermostats of unknown mode get manual mode (1m).
+	ControlTick, ReconnectGrace, EnforceInterval, ControlStartupDelay time.Duration
 }
 
 // Bridge is the hmbridge core. Create it with New, then call Setup once
@@ -181,6 +187,22 @@ type Bridge struct {
 	// config-only battery device and the next one a wake-up frame
 	// triggers (settingsWake).
 	wakeRetryGap time.Duration
+
+	// Heating control by Home Assistant (control.go); event loop only
+	// unless noted.
+	ctlTargets      []*controlTarget
+	ctlFile         *store.File // control.json; nil = none
+	debounce        time.Duration
+	debounceC       chan string // keys of debounced setpoints that may be due
+	pending         map[string]*pendingSetpoint
+	ctlTick         time.Duration
+	reconnectGrace  time.Duration
+	enforceInterval time.Duration
+	ctlStartupDelay time.Duration
+	ctlStartupDone  bool
+	// linkUp: Home Assistant reachable (MQTT) since linkSince.
+	linkKnown, linkUp bool
+	linkSince         time.Time
 }
 
 type device struct {
@@ -224,6 +246,9 @@ type device struct {
 	removed bool
 	// settings are the device's settings (nil for models without any).
 	settings *deviceSettings
+	// ctl is the Home Assistant control of the thermostat (its own or
+	// its group's; nil: device control).
+	ctl *controlTarget
 }
 
 type group struct {
@@ -242,6 +267,8 @@ type group struct {
 	// settings are the group settings (groupsettings.go; nil if no
 	// thermostat of the group has settings).
 	settings *groupSettings
+	// ctl is the group's Home Assistant control (nil: device control).
+	ctl *controlTarget
 }
 
 // maxUnknownSenders bounds the list of unconfigured senders.
@@ -378,6 +405,7 @@ func New(opts Options) (*Bridge, error) {
 		b.groups = append(b.groups, g)
 		b.bySlug[slug] = g
 	}
+	b.setupControl(opts)
 	if b.stateFile != nil {
 		if err := b.loadState(b.stateFile); err != nil {
 			b.logf("state file: %v", err)
@@ -600,6 +628,7 @@ func (b *Bridge) Run(ctx context.Context) error {
 	defer func() {
 		cancel()
 		wg.Wait()
+		b.saveControl()
 		if b.stateFile == nil {
 			return
 		}
@@ -634,6 +663,12 @@ func (b *Bridge) Run(ctx context.Context) error {
 	releaseC := rel.C
 	pairTick := time.NewTicker(b.pairTick)
 	defer pairTick.Stop()
+	var ctlC <-chan time.Time
+	if len(b.ctlTargets) > 0 {
+		ctl := time.NewTicker(b.ctlTick)
+		defer ctl.Stop()
+		ctlC = ctl.C
+	}
 	b.lastSave = b.now()
 	b.checkClock()
 	// Set the module's clock now if possible: Open skips it while the
@@ -682,6 +717,12 @@ func (b *Bridge) Run(ctx context.Context) error {
 
 		case <-pairTick.C:
 			b.pairingTick()
+
+		case <-ctlC:
+			b.controlTick()
+
+		case key := <-b.debounceC:
+			b.flushPending(key, false)
 		}
 	}
 }
@@ -890,6 +931,7 @@ func (b *Bridge) handleFrame(frame []byte) {
 
 	b.publishDevice(d)
 	b.publishPresses(d, presses)
+	b.controlAfterFrame(d)
 }
 
 // recordUnknown remembers a sender that is not configured.

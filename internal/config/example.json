@@ -49,6 +49,16 @@
   "state_save_interval": "15m",
   "status_poll_interval": "1h",
 
+  "home_assistant_control": {
+    "_comment": [
+      "Defaults for heating groups and thermostats with \"control\": \"home_assistant\" (Home Assistant, e.g. the Advanced Heating Control blueprint, decides the target temperature; hmbridge keeps the thermostats in manual mode). See docs/DEPLOY.md, \"Using Home Assistant for heating control\".",
+      "fallback_after: fail-safe. When the MQTT connection (or Home Assistant itself) has been gone this long, the thermostats are switched to their own week program (auto mode); when it has been back for a minute, Home Assistant's last setpoint is sent again. Default 30m, \"0s\" disables the fallback, otherwise at least 5m. Groups and thermostats can override it with their own fallback_after.",
+      "setpoint_debounce: target temperatures from Home Assistant that follow each other within this time are merged; only the last one is sent (default 2s, \"0s\" sends each at once, at most 30s)."
+    ],
+    "fallback_after": "30m",
+    "setpoint_debounce": "2s"
+  },
+
   "pairing": {
     "_comment": [
       "Pairing new devices from Home Assistant (button \"Pair new device\" on the hmbridge device; MQTT only, the HTTP API is read-only). Paired devices are kept in devices.json in state_dir, which is only written on pair, unpair and rename; on a conflict, devices below win.",
@@ -92,9 +102,12 @@
       "aes": true
     },
     {
+      "_comment": "A thermostat outside groups can be controlled by Home Assistant too (control: device, the default, or home_assistant; optional fallback_after). Members of a group follow the group's control.",
       "name": "Bad Heizung",
       "model": "HM-CC-RT-DN",
-      "address": "38F5B2"
+      "address": "38F5B2",
+      "control": "home_assistant",
+      "fallback_after": "1h"
     },
     {
       "_comment": "Switch plug: a switch in Home Assistant (set/switch ON|OFF).",
@@ -141,10 +154,12 @@
         "Direct peerings between the devices (thermostat team, window contact) are left untouched and keep working without hmbridge.",
         "via_wall_thermostat: send group commands only to the wall thermostat, which forwards them over its direct links (half the radio airtime). Default false.",
         "In Home Assistant a group is a device \"<name> (group)\" with the climate entity (its attributes list the members), the window state, and per member: valve (radiator thermostats), temperature and humidity (wall thermostats), window (contacts), and a diagnostic availability sensor.",
-        "groups_suggest_area (top level, default true): suggest the group name as Home Assistant area for the group device and its members' devices. Home Assistant only applies it when it first creates a device."
+        "groups_suggest_area (top level, default true): suggest the group name as Home Assistant area for the group device and its members' devices. Home Assistant only applies it when it first creates a device.",
+        "control: \"device\" (default: the thermostats run their week program, Home Assistant can switch auto/heat/off) or \"home_assistant\" (Home Assistant sets the target temperature, the thermostats are kept in manual mode, with the fail-safe of home_assistant_control; fallback_after overrides its default for this group)."
       ],
       "name": "Wohnzimmer",
       "via_wall_thermostat": false,
+      "control": "device",
       "members": ["Wohnzimmer Wandthermostat", "Wohnzimmer Heizung", "38F5A1", "Wohnzimmer Fenster"]
     }
   ],

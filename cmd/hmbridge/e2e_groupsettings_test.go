@@ -105,9 +105,11 @@ func TestEndToEndGroupSettings(t *testing.T) {
 			ha.json("homeassistant/button/hmbridge_group_bad/settings_refresh/config")["command_topic"] == "hmbridge/group/bad/set/settings_refresh" &&
 			ha.json("homeassistant/sensor/hmbridge_group_bad/settings_consistency/config")["state_topic"] == "hmbridge/group/bad/settings"
 	})
-	if _, _, _, cons, _ := ha.groupSettings("bad"); cons != "unknown" {
-		t.Errorf("consistency before reading = %q", cons)
-	}
+	// The settings topic is published after the discovery messages.
+	waitFor(t, "consistency unknown before reading", func() bool {
+		_, _, _, cons, _ := ha.groupSettings("bad")
+		return cons == "unknown"
+	})
 
 	// Refresh both members from the group.
 	ha.publish("hmbridge/group/bad/set/settings_refresh", "PRESS")

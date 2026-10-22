@@ -69,6 +69,9 @@ type job struct {
 	action  climateAction
 	temp    float64
 	attempt int
+	// note is appended to the action in last_command and the log (e.g.
+	// why hmbridge sent it on its own).
+	note string
 
 	reqNo byte // jobTimeResponse: message counter of the request
 
@@ -355,6 +358,9 @@ func (b *Bridge) handleCommand(cmd ha.Command) {
 		b.renameDevice(cmd.Addr, cmd.Name)
 		return
 	}
+	if b.handleHAClimateCommand(cmd) {
+		return // Home Assistant controls the target (control.go)
+	}
 	var targets []*device
 	var what string
 	switch {
@@ -613,6 +619,14 @@ func isRetryable(err error) bool {
 
 // describeAction renders a job for the last_command sensor and the log.
 func describeAction(j job) string {
+	s := describeActionOnly(j)
+	if j.note != "" {
+		s += " (" + j.note + ")"
+	}
+	return s
+}
+
+func describeActionOnly(j job) string {
 	switch j.action {
 	case actionSetTemperature, actionManual:
 		return fmt.Sprintf("%s %.1f", j.action, j.temp)

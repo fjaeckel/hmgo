@@ -515,7 +515,8 @@ the old entry are applied to the new one by address).
 one directory, `state_dir` (default `/var/lib/hmbridge`, absolute, `""`
 disables all files and pairing): `state.json` (device state fallback,
 compact), `devices.json` (paired devices, indented) and `settings.json`
-(device settings cache, compact, see “Device settings”). Further data
+(device settings cache, compact, see “Device settings”) and
+`control.json` (see “Heating control by Home Assistant”). Further data
 (e.g. HmIP keys) becomes another file via `Store.File(FileSpec)`. Shared
 rules for every file:
 
@@ -808,6 +809,81 @@ with today's configuration rules, which require a thermostat per group)
 all settings entities and its settings topic (`StaleGroupMessages` with all settings any
 group can have, `params.GroupCatalog`); a removed group loses all of them
 with its other entities.
+
+## Heating control by Home Assistant
+
+`internal/bridge/control.go`; configuration `control` (group, thermostat
+outside groups: `device` | `home_assistant`), `fallback_after` (default in
+`home_assistant_control`, overridable per group/thermostat; 0 = no
+fail-safe, else ≥ 5m) and `home_assistant_control.setpoint_debounce`
+(global, 0 … 30s). User documentation: DEPLOY.md, “Using Home Assistant for
+heating control”.
+
+A **control target** is an HA-controlled group (members: its thermostats,
+receivers: `g.targets`, i.e. the group command order and
+`via_wall_thermostat`) or thermostat; every member device points to it
+(`device.ctl`). Device-controlled targets are untouched (the old paths).
+
+**Discovery.** `DeviceDesc.HAControl` / `GroupDesc.HAControl`: climate
+`modes` [heat, off], `min_temp`/`max_temp` 5/30 (4.5 and 30.5 are the
+devices' OFF/ON values; off is a mode), step 0.5, preset boost kept, and a
+`mode_state_template` that renders auto as heat (a device on its week
+program during the fail-safe, or until enforcement switched it back). The
+unique IDs are those of device control, so a change of `control` only
+updates the entities (on restart, PublishAll). A diagnostic enum sensor
+`control` (`device`, `home_assistant`, `fallback`) on every thermostat and
+group reads `State.Control`, which `deriveState`/`groupState` fill from the
+target.
+
+**Commands** (`handleHAClimateCommand`, before the device-control path):
+setpoint → manual mode with that temperature (`81 ch t`, also ends a
+boost); heat → manual with HA's last setpoint (else the device's last one
+above off); off → manual 4.5; auto → rejected (`last_command`); boost and
+leaving boost as before, leaving to manual instead of auto. A group command
+records HA's intent (`haMode`, `haSetpoint`); a command to a member's own
+climate entity only commands that member. **Debouncing:** a setpoint is
+kept per target key (`pendingSetpoint`) and sent `setpoint_debounce` after
+the last one (wall clock: `time.AfterFunc` → `debounceC` → event loop; the
+control tick flushes as a backstop), as ordinary climate jobs, so the job
+queue's coalescing and per-target superseding still apply; the job's `note`
+(“latest of n setpoints”) appears in `last_command`. A mode or preset
+command drops a waiting setpoint.
+
+**Keeping manual mode** (`enforceManual`): triggered by a frame that
+reports auto/party for a member and by every control tick (10 s; retries
+what the rules held back); once, `ControlStartupDelay` (1 min) after start,
+members whose mode is unknown count too. Skipped during the fail-safe,
+while a setpoint waits, while any member or contact of the target reports
+an open window, and while any member boosts. Receivers are the command
+targets among the members that need it, or all command targets when none
+is (via_wall_thermostat: the wall thermostat forwards). At most one manual
+command per receiver per `EnforceInterval` (10 min, `b.now`), not while one
+is queued. Temperature: HA's intent (off → 4.5, heat → its setpoint), else
+the device's target (with via_wall_thermostat: that of the member that
+reported auto).
+
+**Fail-safe.** The link is up while a publisher is attached, it reports
+`Connected()` (ha.Client: paho's connection state) and `HAOnline()`
+(ha.Client: false while HA's last message on `<prefix>/status` was
+`offline`; HA's birth/will are not retained, so “unknown” counts as
+online). The control tick tracks since when the link is up or down (down
+since start if it never came up). Down for ≥ `fallback_after` → once per
+target: `fallback` set (under `b.mu`, it is read when states are
+published), auto (`80 ch`) to each command target, log `FAIL-SAFE`, metric
+`hmbridge_control_fallback_active{kind,name}`. Up for ≥ `ReconnectGrace`
+(1 min) → hand back: manual with HA's intent to each command target; without
+a known intent the target stays in fallback until HA sends a command. Any
+HA climate command for a target in fallback ends it at once (HA is
+evidently back). **Persistence:** `control.json` (store, version 1: per
+target key `fallback`, `ha_mode`, `ha_setpoint`) is written on every
+transition (synchronously on the event loop: rare and small) and on
+shutdown; loaded in `New`, so a restart during an outage stays in fallback
+(no startup enforcement) and hands back with the saved setpoint. The
+fallback timer itself is not persisted: it restarts with the process.
+
+Not handled: a fallback week program is the devices' own (set it with the
+group settings); there is no fail-safe for a dead hmbridge (the devices
+then keep the last manual setpoint, like with a dead CCU).
 
 ## Running alongside OpenCCU
 

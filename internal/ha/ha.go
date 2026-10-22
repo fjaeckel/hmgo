@@ -78,6 +78,9 @@
 // "auto" (no preset). See HAMode. Commands: mode "off" means manual 4.5 °C,
 // mode "heat" means manual mode at the current target temperature, preset
 // "none" means leaving boost (the bridge decides how, e.g. back to auto).
+// Under Home Assistant control (DeviceDesc.HAControl, GroupDesc.HAControl)
+// the climate entity offers "heat" and "off" only and shows auto as heat;
+// the diagnostic “Control” sensor reads State.Control.
 //
 // # Client
 //
@@ -235,6 +238,11 @@ type DeviceDesc struct {
 	// AllSettings are the settings of all models: AllStaleDiscoveryMessages
 	// and SettingsRemovalMessages remove those the device does not have.
 	AllSettings []SettingDesc
+	// HAControl: Home Assistant controls the thermostat (config
+	// "control": "home_assistant", also on the members of such a group):
+	// the climate entity offers the modes heat and off only (see
+	// climateConfig).
+	HAControl bool
 	// SuggestedArea, if set, is sent as the HA device's suggested_area
 	// (typically the name of the device's heating group). Home Assistant
 	// only uses it when it creates the device, so it never moves a device
@@ -257,6 +265,9 @@ type GroupDesc struct {
 	// SuggestArea sends the group name as suggested_area of the group's
 	// HA device (HA applies it only when it creates the device).
 	SuggestArea bool
+	// HAControl: Home Assistant controls the group (config "control":
+	// "home_assistant"): the climate entity offers heat and off only.
+	HAControl bool
 	// Settings are the group settings (see GroupSettingsState): config
 	// entities on the group's HA device, written to every thermostat
 	// member that has them, with a “Settings” status sensor, a
@@ -376,7 +387,27 @@ type State struct {
 	// LEDs are the colors of the HM-OU-LED16's LEDs (LEDColors), index 0
 	// = LED 1; "" means unknown. Merge merges them per LED.
 	LEDs []string
+	// Control tells who decides a thermostat's or heating group's
+	// target temperature: ControlDevice, ControlHomeAssistant or
+	// ControlFallback.
+	Control string
 }
+
+// Values of State.Control (the diagnostic “Control” sensor).
+const (
+	// ControlDevice: the thermostats run their week program; Home
+	// Assistant can switch between auto, heat and off.
+	ControlDevice = "device"
+	// ControlHomeAssistant: Home Assistant sets the target temperature,
+	// hmbridge keeps the thermostats in manual mode.
+	ControlHomeAssistant = "home_assistant"
+	// ControlFallback: Home Assistant is configured to control, but has
+	// been unreachable too long; the thermostats run their week program.
+	ControlFallback = "fallback"
+)
+
+// ControlValues are the options of the “Control” sensor.
+var ControlValues = []string{ControlDevice, ControlHomeAssistant, ControlFallback}
 
 // Window contact states.
 const (
@@ -482,6 +513,9 @@ func (s *State) Merge(u State) {
 	if u.Level != nil {
 		s.Level = ptr(*u.Level)
 	}
+	if u.Control != "" {
+		s.Control = u.Control
+	}
 	if len(u.LEDs) > 0 {
 		leds := make([]string, max(len(s.LEDs), len(u.LEDs)))
 		copy(leds, s.LEDs)
@@ -524,6 +558,7 @@ type stateJSON struct {
 	On                 *bool    `json:"on,omitempty"`
 	Level              *float64 `json:"level,omitempty"`
 	LEDs               []string `json:"leds,omitempty"`
+	Control            string   `json:"control,omitempty"`
 }
 
 // MarshalJSON encodes the state with snake_case field names, omitting
@@ -554,6 +589,7 @@ func (s State) MarshalJSON() ([]byte, error) {
 		On:                 s.On,
 		Level:              s.Level,
 		LEDs:               s.LEDs,
+		Control:            s.Control,
 	}
 	if !s.LastSeen.IsZero() {
 		j.LastSeen = s.LastSeen.UTC().Format(time.RFC3339)
@@ -601,6 +637,7 @@ func (s *State) UnmarshalJSON(b []byte) error {
 		On:                 j.On,
 		Level:              j.Level,
 		LEDs:               j.LEDs,
+		Control:            j.Control,
 	}
 	if j.LastSeen != "" {
 		t, err := time.Parse(time.RFC3339, j.LastSeen)

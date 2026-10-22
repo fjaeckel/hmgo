@@ -56,9 +56,9 @@ func TestGroupMemberDiscovery(t *testing.T) {
 		"binary_sensor/hmbridge_group_wohnzimmer/4c5d6e_window":    {"WZ Fenster window", "hmbridge/4c5d6e/state", "window_open", "window", "", false},
 		"binary_sensor/hmbridge_group_wohnzimmer/4c5d6e_available": {"WZ Fenster available", "hmbridge/4c5d6e/availability", "", "connectivity", "", true},
 	}
-	// climate + group window + member entities, nothing else.
-	if len(msgs) != 2+len(members) {
-		t.Errorf("got %d messages, want %d", len(msgs), 2+len(members))
+	// climate + group window + control + member entities, nothing else.
+	if len(msgs) != 3+len(members) {
+		t.Errorf("got %d messages, want %d", len(msgs), 3+len(members))
 	}
 	for path, w := range members {
 		topic := "homeassistant/" + path + "/config"

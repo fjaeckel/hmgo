@@ -130,6 +130,10 @@ var (
 		Namespace: "hmbridge", Name: "commands_total",
 		Help: "Commands from Home Assistant by action and result (ok, error, rejected).",
 	}, []string{"action", "result"})
+	metricFallbackActive = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: "hmbridge", Subsystem: "control", Name: "fallback_active",
+		Help: "1 while a heating group or thermostat controlled by Home Assistant runs its week program as the fail-safe (Home Assistant unreachable).",
+	}, []string{"kind", "name"})
 	metricQueueLength = prometheus.NewGauge(prometheus.GaugeOpts{
 		Namespace: "hmbridge", Name: "command_queue_length",
 		Help: "Radio jobs waiting to be executed.",
@@ -166,6 +170,7 @@ func init() {
 		metricFrames, metricUnknownSenders, metricCommands, metricQueueLength,
 		metricLevel, metricLEDColor, metricButtonPresses, metricStatusPolls,
 		metricPairing, metricUnpair, metricPairingActive, metricPairedDevices,
+		metricFallbackActive,
 	)
 	for _, r := range []string{"paired", "paired_with_warnings", "already_known", "unsupported_model", "other_central", "address_conflict", "invalid", "invalid_source", "failed", "timeout"} {
 		metricPairing.WithLabelValues(r)

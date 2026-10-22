@@ -90,6 +90,18 @@ var (
 	faultKinds = kinds(RadiatorThermostat, Dimmer)
 )
 
+// controlSensorConfig is the diagnostic “Control” sensor of thermostats
+// and heating groups: who decides the target temperature (State.Control).
+func controlSensorConfig() map[string]any {
+	return with(diagnostic, map[string]any{
+		"name":           "Control",
+		"device_class":   "enum",
+		"options":        ControlValues,
+		"icon":           "mdi:home-thermometer-outline",
+		"value_template": textTemplate("control", "None"),
+	})
+}
+
 func binarySensor(name, field, deviceClass string, extra map[string]any) map[string]any {
 	m := map[string]any{
 		"name":           name,
@@ -172,6 +184,7 @@ func entities() []entity {
 		// Former TC-only raw boost sensor: matches nothing, so
 		// StaleDiscoveryMessages removes it from existing installations.
 		{component: "sensor", key: "boost_state", match: func(DeviceDesc) bool { return false }, config: nil},
+		{component: "sensor", key: "control", match: thermostats, config: controlSensorConfig()},
 		{component: "sensor", key: "last_command", match: commandKinds, config: with(diagnostic, map[string]any{
 			"name":           "Last command",
 			"icon":           "mdi:send-check-outline",
@@ -345,6 +358,9 @@ type node struct {
 	// attrTopic, if set, is the climate entity's json_attributes_topic
 	// (a group's member list).
 	attrTopic string
+	// haControl: Home Assistant controls the target temperature (no
+	// "auto" mode, see climateConfig).
+	haControl bool
 }
 
 func deviceNode(cfg TopicConfig, d DeviceDesc) node {
@@ -376,6 +392,7 @@ func deviceNode(cfg TopicConfig, d DeviceDesc) node {
 		deviceAvail: cfg.DeviceAvailabilityTopic(addr),
 		eventTopic:  func(button int) string { return cfg.EventTopic(addr, button) },
 		topic:       func(suffix string) string { return cfg.base() + "/" + addr + "/" + suffix },
+		haControl:   d.HAControl,
 	}
 }
 
@@ -420,6 +437,21 @@ func common(cfg TopicConfig, n node, component, uid, key string, m map[string]an
 	m["availability_mode"] = "all"
 }
 
+// Temperature range of the climate entity under Home Assistant control:
+// the devices' real setpoint range. 4.5 °C (off) and 30.5 °C (valve fully
+// open) are special values of the devices; off is the mode "off".
+const (
+	HAControlMinTemp = 5.0
+	HAControlMaxTemp = 30.0
+)
+
+// climateConfig is the climate entity of a thermostat or group. Under
+// Home Assistant control (node.haControl) it offers the modes heat and
+// off only: the thermostats are kept in manual mode, so "auto" (the
+// devices' week program) is not offered, and a device that reports auto
+// (it runs its week program as the fail-safe, or until hmbridge has
+// switched it back) is shown as heat. The unique_id is the same in both
+// cases, so switching control keeps the entity.
 func climateConfig(cfg TopicConfig, n node) map[string]any {
 	st := n.stateTopic
 	m := map[string]any{
@@ -447,6 +479,12 @@ func climateConfig(cfg TopicConfig, n node) map[string]any {
 		"precision":        0.1,
 		"optimistic":       false,
 		"qos":              1,
+	}
+	if n.haControl {
+		m["modes"] = []string{ModeHeat, ModeOff}
+		m["mode_state_template"] = "{{ ('heat' if value_json.mode == 'auto' else value_json.mode) if value_json.mode is defined else 'None' }}"
+		m["min_temp"] = HAControlMinTemp
+		m["max_temp"] = HAControlMaxTemp
 	}
 	if n.humidity {
 		m["current_humidity_topic"] = st

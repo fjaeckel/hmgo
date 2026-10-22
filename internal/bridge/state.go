@@ -155,6 +155,9 @@ func setControl(s *ha.State, controlMode string, target float64, boostMinutes in
 
 // deriveState computes fields derived from other fields.
 func deriveState(d *device) {
+	if d.desc.Kind == ha.RadiatorThermostat || d.desc.Kind == ha.WallThermostat {
+		d.state.Control = d.ctl.controlValue()
+	}
 	if d.desc.Kind == ha.RadiatorThermostat && d.state.Mode != "" {
 		valve := 0
 		if d.state.ValvePosition != nil {
@@ -169,6 +172,7 @@ func deriveState(d *device) {
 // (wall thermostat if present); window and low battery are “any member”.
 func groupState(g *group) ha.State {
 	var s ha.State
+	s.Control = g.ctl.controlValue()
 	if c := g.climate; c != nil {
 		s.CurrentTemperature = c.state.CurrentTemperature
 		s.TargetTemperature = c.state.TargetTemperature

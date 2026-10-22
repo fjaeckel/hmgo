@@ -61,6 +61,14 @@ heating groups.
   temperature) that are written to every thermostat of the group, with
   mixed values across the members flagged; see
   [docs/DEPLOY.md](docs/DEPLOY.md#heating-groups-in-home-assistant).
+* **Home Assistant as the heating controller** (e.g. the Advanced Heating
+  Control blueprint): with `"control": "home_assistant"` on a group or
+  thermostat, Home Assistant sets the temperatures (climate modes heat/off,
+  setpoints debounced), hmbridge keeps the thermostats in manual mode and,
+  as a fail-safe, switches them to their own week program when Home
+  Assistant has been unreachable for `fallback_after` (default 30 min), and
+  back when it returns; see
+  [docs/DEPLOY.md](docs/DEPLOY.md#using-home-assistant-for-heating-control-eg-advanced-heating-control).
 * **Prometheus metrics** at `/metrics`, covering:
   * Per-device state.
   * The radio module (frames, acks, retries, duty cycle, errors).
@@ -239,6 +247,9 @@ HomeMatic modes map to Home Assistant like this:
 | manual at 4.5 °C | `off` |
 | boost | preset `boost` |
 
+Under `"control": "home_assistant"` the climate entities offer `heat` and
+`off` only (see above).
+
 The battery percentage is an estimate from the voltage, linear from 2.2 V
 (0 %) to 3.0 V (100 %). The voltage itself is exposed too.
 
@@ -253,6 +264,7 @@ Everything is under `/metrics` on the status port (default `:8013`):
 | `hmbridge_mqtt_*` | MQTT: connection state, publishes, commands, Home Assistant restarts. |
 | `hmbridge_commands_total`, `hmbridge_command_queue_length` | Commands from Home Assistant. |
 | `hmbridge_pairing_*` | Pairing: attempts by result, unpairings, pairing mode active, number of paired devices. |
+| `hmbridge_control_fallback_active` | Groups and thermostats under Home Assistant control: 1 while the fail-safe runs the week program. |
 | `hmbridge_settings_operations_total` | Device settings: reads and writes by result (ok, failed, pending, rejected). |
 | `hmheating_*`, `hmthermal_*`, `hmcontact_*` | Raw decoded device events, kept compatible with hmgo. |
 
