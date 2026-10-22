@@ -772,11 +772,36 @@ func TestDualRetryDefaults(t *testing.T) {
 		t.Fatalf("transmitted %d times, want 4 (1 + 3 retries, like OpenCCU)", len(sent))
 	}
 	for i := 1; i < len(sent); i++ {
-		if d := sent[i].At.Sub(sent[i-1].At); d < 240*time.Millisecond || d > 600*time.Millisecond {
-			t.Errorf("retransmission %d after %v, want ~250ms", i, d)
+		if d := sent[i].At.Sub(sent[i-1].At); d < 265*time.Millisecond || d > 600*time.Millisecond {
+			t.Errorf("retransmission %d after %v, want ~275ms", i, d)
 		}
 		if !bytes.Equal(sent[i].Msg, sent[0].Msg) {
 			t.Errorf("retransmission %x differs", sent[i].Msg)
+		}
+	}
+}
+
+func TestDualResponseWait(t *testing.T) {
+	// Restart capture, HM-OU-LED16 at 10:38:20: retransmissions 274-275ms
+	// after each send request, even after an LLMAC_ACK 195ms late.
+	c := &DualConn{responseTimeout: defaultResponseTimeout}
+	normal := bidiPacket(0x52)
+	burst := bidiPacket(0x53)
+	burst.Flags |= bidcos.Burst
+	t0 := time.Unix(0, 0)
+	ms := time.Millisecond
+	for _, tt := range []struct {
+		msg  []byte
+		ack  time.Duration
+		want time.Duration
+	}{
+		{normal.Encode()[3:], 23 * ms, 252 * ms},
+		{normal.Encode()[3:], 195 * ms, 80 * ms},
+		{normal.Encode()[3:], 260 * ms, minWaitAfterAck},
+		{burst.Encode()[3:], 384 * ms, defaultResponseTimeout},
+	} {
+		if got := c.responseWait(tt.msg, t0, t0.Add(tt.ack)); got != tt.want {
+			t.Errorf("ack after %v (flags %02x): wait %v, want %v", tt.ack, tt.msg[1], got, tt.want)
 		}
 	}
 }

@@ -150,9 +150,14 @@ const (
 
 // Defaults for the dual-coprocessor firmware.
 const (
-	// OpenCCU retransmits an unanswered command 3 times, ~275ms apart,
-	// i.e. ~250ms after each LLMAC_ACK (capture, lines 48-82).
-	defaultResponseTimeout = 250 * time.Millisecond
+	// OpenCCU retransmits an unanswered command 3 times, 274-275ms
+	// after each send request, even when the LLMAC_ACK only arrived
+	// 195ms after the request (restart capture: HM-OU-LED16 at
+	// 10:38:20; the first capture's lines 48-82 show the same spacing).
+	defaultResponseTimeout = 275 * time.Millisecond
+	// minWaitAfterAck is the least time to wait for a response after a
+	// late LLMAC_ACK (OpenCCU retransmitted 79ms after one).
+	minWaitAfterAck        = 75 * time.Millisecond
 	defaultSendRetries     = 3
 	defaultChangeAppWait   = 3500 * time.Millisecond // RFNETHM boot_probe: 3500ms
 	defaultTRXPollInterval = 10 * time.Second        // like multimacd
@@ -1590,6 +1595,23 @@ func countSendError(err error) {
 	}
 }
 
+// responseWait returns how long to wait for a response to msg, whose
+// send request was written at sent and confirmed (LLMAC_ACK) at acked.
+// Like OpenCCU, the timeout of a normal message counts from the send
+// request, but never ends sooner than minWaitAfterAck after a late
+// LLMAC_ACK. A burst message's LLMAC_ACK arrives only after the ~360ms
+// wake-up preamble, so its timeout counts from the LLMAC_ACK.
+func (c *DualConn) responseWait(msg []byte, sent, acked time.Time) time.Duration {
+	if len(msg) > 1 && msg[1]&0x10 != 0 { // BURST
+		return c.responseTimeout
+	}
+	d := c.responseTimeout - acked.Sub(sent)
+	if d < minWaitAfterAck {
+		d = minWaitAfterAck
+	}
+	return d
+}
+
 // transmit sends msg (the first time with opts, retransmissions at
 // once) and, if w is non-nil, waits for a response accepted by accept
 // (nil: any), retransmitting msg (same message counter) on timeout.
@@ -1603,15 +1625,14 @@ func (c *DualConn) transmit(ctx context.Context, msg []byte, opts [3]byte, w *re
 			dualEvents.WithLabelValues("retransmit").Inc()
 			opts = sendOpts(sendNow, msg[1])
 		}
+		sent := time.Now()
 		if err := c.llmacSend(ctx, msg, opts); err != nil {
 			return rxMsg{}, err
 		}
 		if w == nil {
 			return rxMsg{}, nil
 		}
-		// The timeout starts at the LLMAC_ACK, i.e. after the
-		// transmission (incl. the burst preamble).
-		t := time.NewTimer(c.responseTimeout)
+		t := time.NewTimer(c.responseWait(msg, sent, time.Now()))
 	wait:
 		for {
 			select {

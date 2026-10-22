@@ -297,9 +297,10 @@ type Config struct {
 	Signer AESSigner
 
 	// ResponseTimeout is how long Send waits for a device's response
-	// after the module confirmed the transmission (LLMAC_ACK, which for
-	// burst packets comes after the ~360ms preamble). Default 250ms,
-	// like OpenCCU. A received message is held at most
+	// (RPI-RF-MOD): counted from the send request, but at least 75ms
+	// after the module confirmed the transmission (LLMAC_ACK); for burst
+	// packets, whose LLMAC_ACK comes after the ~360ms preamble, counted
+	// from the LLMAC_ACK. Default 275ms, like OpenCCU. A received message is held at most
 	// max(1s, 100ms + 2*ResponseTimeout) for the answer to our AES
 	// challenge.
 	ResponseTimeout time.Duration
