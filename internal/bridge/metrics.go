@@ -5,6 +5,8 @@ package bridge
 
 import (
 	"fmt"
+	"strings"
+	"unicode/utf8"
 
 	"github.com/prometheus/client_golang/prometheus"
 
@@ -84,7 +86,7 @@ var (
 	}, deviceLabels)
 	metricUnauthenticated = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: "hmbridge", Subsystem: "device", Name: "unauthenticated_ignored_total",
-		Help: "Messages from AES devices that were not addressed to the central (so not authenticated) and were ignored.",
+		Help: "Messages from AES devices that were ignored because they were not AES-authenticated (see hmbridge_aes_rejected_total for the reasons).",
 	}, []string{"address", "name"})
 	metricClockSynced = prometheus.NewGauge(prometheus.GaugeOpts{
 		Namespace: "hmbridge", Name: "system_clock_synced",
@@ -136,7 +138,8 @@ var (
 	metricPairing = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: "hmbridge", Subsystem: "pairing", Name: "attempts_total",
 		Help: "Pairing attempts by result: paired, paired_with_warnings (key exchange or AES_ACTIVE failed), already_known, " +
-			"unsupported_model, other_central, address_conflict, invalid, failed, timeout (pairing mode ended without a device), disabled.",
+			"unsupported_model, other_central, address_conflict, invalid, invalid_source (spoofed: 000000, ffffff or the central's address), " +
+			"failed, timeout (pairing mode ended without a device), disabled.",
 	}, []string{"result"})
 	metricUnpair = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: "hmbridge", Subsystem: "pairing", Name: "unpair_total",
@@ -164,7 +167,7 @@ func init() {
 		metricLevel, metricLEDColor, metricButtonPresses, metricStatusPolls,
 		metricPairing, metricUnpair, metricPairingActive, metricPairedDevices,
 	)
-	for _, r := range []string{"paired", "paired_with_warnings", "already_known", "unsupported_model", "other_central", "address_conflict", "invalid", "failed", "timeout"} {
+	for _, r := range []string{"paired", "paired_with_warnings", "already_known", "unsupported_model", "other_central", "address_conflict", "invalid", "invalid_source", "failed", "timeout"} {
 		metricPairing.WithLabelValues(r)
 	}
 	for _, r := range []string{"unpaired", "waiting", "unconfirmed", "rejected"} {
@@ -174,7 +177,7 @@ func init() {
 
 // updateMetrics exports the device state. Caller holds b.mu.
 func (b *Bridge) updateMetrics(d *device) {
-	l := []string{d.desc.Addr, d.cfg.Name, d.cfg.Model}
+	l := []string{d.desc.Addr, labelValue(d.cfg.Name), labelValue(d.cfg.Model)}
 	st := &d.state
 	if !st.LastSeen.IsZero() {
 		metricLastSeen.WithLabelValues(l...).Set(float64(st.LastSeen.Unix()))
@@ -204,7 +207,7 @@ func (b *Bridge) updateMetrics(d *device) {
 	}
 	if st.Fault != "" {
 		metricFault.DeletePartialMatch(prometheus.Labels{"address": d.desc.Addr})
-		metricFault.WithLabelValues(append(l, st.Fault)...).Set(1)
+		metricFault.WithLabelValues(append(l, labelValue(st.Fault))...).Set(1)
 	}
 	if st.Level != nil {
 		metricLevel.WithLabelValues(l...).Set(*st.Level)
@@ -227,4 +230,14 @@ func setBool(g *prometheus.GaugeVec, labels []string, v *bool) {
 		f = 1
 	}
 	g.WithLabelValues(labels...).Set(f)
+}
+
+// labelValue makes s usable as a Prometheus label value:
+// WithLabelValues panics on invalid UTF-8, which must never take
+// hmbridge down (device names come from Home Assistant).
+func labelValue(s string) string {
+	if utf8.ValidString(s) {
+		return s
+	}
+	return strings.ToValidUTF8(s, "\uFFFD")
 }

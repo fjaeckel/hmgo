@@ -9,7 +9,8 @@
 #
 # The build job runs the tests and builds with a read-only token and
 # without persisted git credentials; only the publish job, which runs no
-# project code, can write.
+# project code, can write (and attests the binaries' build provenance).
+# Third-party actions are pinned by commit (the comment names the tag).
 
 name: Release
 
@@ -32,20 +33,25 @@ jobs:
       group: release-build-${{ github.ref }}
       cancel-in-progress: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0 # tags, for the version in the file names
           persist-credentials: false
-      - uses: actions/setup-go@v5
+      # The newest 1.27 patch release (security fixes) rather than the
+      # minimum in go.mod's go line.
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
-          go-version-file: go.mod
+          go-version: '1.27.x'
+          check-latest: true
       - name: Install mosquitto (end-to-end tests)
         run: sudo apt-get update && sudo apt-get install -y mosquitto
       - name: Test
         run: go vet ./... && go test -race ./...
+      - name: Known vulnerabilities (govulncheck)
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
       - name: Build
         run: make dist
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: release-binaries
           path: dist/
@@ -57,6 +63,10 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      # Build provenance attestations of the release binaries (verify
+      # with: gh attestation verify <file> -R <owner>/<repo>).
+      id-token: write
+      attestations: write
     # Never cancelled half-way (tag moved, assets not yet replaced); a
     # newer run's publish waits for this one.
     concurrency:
@@ -66,10 +76,14 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: release-binaries
           path: dist/
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/*
       - name: Publish tagged release
         if: startsWith(github.ref, 'refs/tags/v')
         run: |
@@ -77,7 +91,7 @@ jobs:
             --title "hmbridge $GITHUB_REF_NAME" --generate-notes --verify-tag
       # Moving the nightly tag needs git credentials: only this step's
       # checkout has them.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         if: github.ref == 'refs/heads/master'
         with:
           path: src

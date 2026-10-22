@@ -31,6 +31,7 @@ import (
 	"github.com/fjaeckel/hmgo/internal/hm/devices"
 	"github.com/fjaeckel/hmgo/internal/hm/power"
 	"github.com/fjaeckel/hmgo/internal/hm/remote"
+	"github.com/fjaeckel/hmgo/internal/ratelog"
 	"github.com/fjaeckel/hmgo/internal/store"
 	"github.com/fjaeckel/hmgo/internal/uartgw"
 )
@@ -128,6 +129,9 @@ type Bridge struct {
 	pairTick       time.Duration
 	version        string
 
+	// floodLog rate-limits log lines anyone in radio range can trigger.
+	floodLog *ratelog.Limiter
+
 	// Event-loop-only state (not guarded by mu).
 	clockWasSynced bool // result of the last clock sync check
 	clockChecked   bool
@@ -181,6 +185,9 @@ type device struct {
 	preBoostHAMode string
 	// warnedForeignDest is set once a message to another address was logged.
 	warnedForeignDest bool
+	// timeResp is the budget of time responses (rate limit against
+	// spoofed time requests; event loop only).
+	timeResp tokenBucket
 	// available is false while the device has been silent for longer
 	// than its stale timeout; availPublished once it was sent to MQTT.
 	available, availPublished bool
@@ -260,6 +267,7 @@ func New(opts Options) (*Bridge, error) {
 		outbox:       newOutbox(),
 		unknown:      make(map[[3]byte]*UnknownSender),
 		hmip:         opts.HMIP,
+		floodLog:     newFloodLog(),
 	}
 	if b.clockSync == nil {
 		b.clockSync = SystemClockSynced
@@ -351,7 +359,12 @@ func New(opts Options) (*Bridge, error) {
 // newDevice builds the registry entry for dc. stored is the devices
 // file record of a device paired with hmbridge (nil otherwise).
 func (b *Bridge) newDevice(dc *config.Device, stored *store.Device) (*device, error) {
+	// The name becomes a Prometheus label everywhere (here and in the
+	// hm packages), which must be valid UTF-8.
+	dc.Name = labelValue(dc.Name)
 	sd := hm.NewStandardDevice(b.bcs, dc.Addr(), dc.Name)
+	// ACKs to commands for AES channels must be authenticated.
+	sd.AESChannels = dc.AESChannelList()
 	kind, ok := ha.KindForModel(dc.Model)
 	if !ok {
 		return nil, fmt.Errorf("bridge: model %q of %s not supported by the Home Assistant layer", dc.Model, dc.Name)
@@ -648,7 +661,7 @@ func (b *Bridge) handleFrame(frame []byte) {
 	pkt, err := bidcos.Decode(frame)
 	if err != nil {
 		metricFrames.WithLabelValues("invalid").Inc()
-		b.logf("skipping invalid BidCoS frame %x: %v", frame, err)
+		b.floodLog.Logf(b.logf, floodKeyInvalid, "skipping invalid BidCoS frame %x: %v", frame, err)
 		return
 	}
 	central := b.cfg.CentralAddr()
@@ -684,17 +697,22 @@ func (b *Bridge) handleFrame(frame []byte) {
 
 	auth := pkt.Auth()
 	metricAuth.WithLabelValues(d.desc.Addr, d.cfg.Name, auth.String()).Inc()
-	// The radio module only authenticates messages addressed to the
-	// central. For an AES device, anything else (broadcasts, messages
-	// to its peers) could be forged by anyone in radio range, so it must
-	// not change the state (eQ-3: auth_violate_policy="reject").
-	if d.cfg.AESEnabled() && auth != bidcos.AuthOK && pkt.Dest != central {
-		metricUnauthenticated.WithLabelValues(d.desc.Addr, d.cfg.Name).Inc()
+	if auth == bidcos.AuthFailed {
+		metricAESRejected.WithLabelValues(aesRejectFailed).Inc()
+		b.floodLog.Logf(b.logf, floodKeyAESFailed, "%s (%s): message failed AES authentication, ignoring it (cmd %02x). If the key is right, the device may use another key index than %d: set key_index for this device", d.cfg.Name, d.desc.Addr, pkt.Cmd, d.cfg.KeyIndex())
 		return
 	}
-	if auth == bidcos.AuthFailed {
-		b.logf("%s (%s): message failed AES authentication, ignoring it (cmd %02x). If the key is right, the device may use another key index than %d: set key_index for this device", d.cfg.Name, d.desc.Addr, pkt.Cmd, d.cfg.KeyIndex())
-		return
+	// For an AES device, a frame that was not authenticated could have
+	// been forged by anyone in radio range (whatever its destination,
+	// flags or command): it must not change any state (eQ-3:
+	// auth_violate_policy="reject"). See aes.go for the few exceptions.
+	if d.cfg.AESEnabled() && auth != bidcos.AuthOK {
+		if reason := aesRejection(d, pkt, central); reason != "" {
+			metricUnauthenticated.WithLabelValues(d.desc.Addr, d.cfg.Name).Inc()
+			metricAESRejected.WithLabelValues(reason).Inc()
+			b.debugf("%s (%s): ignoring unauthenticated cmd %02x (flags %02x, to %x) payload %x: %s", d.cfg.Name, d.desc.Addr, pkt.Cmd, pkt.Flags, pkt.Dest[:], pkt.Payload, reason)
+			return
+		}
 	}
 
 	ev, err := d.dev.Decode(pkt)
@@ -705,7 +723,7 @@ func (b *Bridge) handleFrame(frame []byte) {
 	}
 	if err != nil {
 		metricDecodeErrors.WithLabelValues(d.desc.Addr, d.cfg.Name).Inc()
-		b.logf("%s (%s): decoding cmd %02x payload %x: %v", d.cfg.Name, d.desc.Addr, pkt.Cmd, pkt.Payload, err)
+		b.floodLog.Logf(b.logf, floodKeyDecode, "%s (%s): decoding cmd %02x payload %x: %v", d.cfg.Name, d.desc.Addr, pkt.Cmd, pkt.Payload, err)
 	} else if ev == nil && pkt.Cmd != bidcos.Ack {
 		b.debugf("%s (%s): ignoring cmd %02x (flags %02x) payload %x: not used for %s", d.cfg.Name, d.desc.Addr, pkt.Cmd, pkt.Flags, pkt.Payload, d.cfg.Model)
 	}
@@ -732,7 +750,12 @@ func (b *Bridge) handleFrame(frame []byte) {
 	}
 
 	if tr, ok := ev.(*hm.TimeRequest); ok && tr.Dest == central && b.cfg.AnswersTimeRequests() {
-		if b.timeUsable() {
+		switch {
+		case !d.timeResp.take(now, timeRespBurst, timeRespRefill):
+			// Spoofed time requests must not burn the duty cycle.
+			metricRateLimited.WithLabelValues(rateKindTimeResponse).Inc()
+			b.debugf("%s (%s): not answering time request %02x: rate limit", d.cfg.Name, d.desc.Addr, tr.Msgcnt)
+		case b.timeUsable():
 			b.queue.push(job{
 				key:      "time:" + d.desc.Addr,
 				kind:     jobTimeResponse,
@@ -740,7 +763,7 @@ func (b *Bridge) handleFrame(frame []byte) {
 				reqNo:    tr.Msgcnt,
 				priority: true,
 			})
-		} else {
+		default:
 			metricTimeRequestsSkipped.Inc()
 		}
 	}
@@ -792,7 +815,8 @@ func (b *Bridge) recordUnknown(pkt *bidcos.Packet) {
 		}
 		u = &UnknownSender{Address: fmt.Sprintf("%x", pkt.Source[:])}
 		b.unknown[pkt.Source] = u
-		b.logf("ignoring messages from unconfigured device %s (cmd %02x, rssi %d dBm); see the status page", u.Address, pkt.Cmd, pkt.RSSI())
+		// Random forged addresses would log a line per frame.
+		b.floodLog.Logf(b.logf, floodKeyUnknown, "ignoring messages from unconfigured device %s (cmd %02x, rssi %d dBm); see the status page", u.Address, pkt.Cmd, pkt.RSSI())
 	}
 	u.Messages++
 	u.LastSeen = b.now()

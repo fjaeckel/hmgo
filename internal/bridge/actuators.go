@@ -218,11 +218,11 @@ func (b *Bridge) executeActuator(ctx context.Context, j job) (any, error) {
 func (b *Bridge) handleStatusResult(res jobResult) {
 	d := res.job.dev
 	if res.err != nil {
-		metricStatusPolls.WithLabelValues(d.desc.Addr, d.cfg.Name, "error").Inc()
+		metricStatusPolls.WithLabelValues(d.desc.Addr, labelValue(d.cfg.Name), "error").Inc()
 		b.debugf("%s (%s): status request: %v", d.cfg.Name, d.desc.Addr, res.err)
 		return
 	}
-	metricStatusPolls.WithLabelValues(d.desc.Addr, d.cfg.Name, "ok").Inc()
+	metricStatusPolls.WithLabelValues(d.desc.Addr, labelValue(d.cfg.Name), "ok").Inc()
 	b.applyResponse(d, stateFromEvent(d, res.ev), res.ev)
 }
 
@@ -294,7 +294,7 @@ func (b *Bridge) publishPresses(d *device, presses []remote.Press) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	for _, p := range presses {
-		metricButtonPresses.WithLabelValues(d.desc.Addr, d.cfg.Name, d.cfg.Model, strconv.Itoa(p.Button), p.Type).Inc()
+		metricButtonPresses.WithLabelValues(d.desc.Addr, labelValue(d.cfg.Name), d.cfg.Model, strconv.Itoa(p.Button), p.Type).Inc()
 		d.lastEvent = fmt.Sprintf("button %d %s", p.Button, p.Type)
 		note := ""
 		if p.Synthetic {

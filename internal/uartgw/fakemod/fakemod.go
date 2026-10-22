@@ -104,6 +104,13 @@ type Options struct {
 	// BiDi flag (0x20) is set, otherwise with ack status 0x01.
 	OnSend func(msg []byte) (ackStatus byte, response []byte)
 
+	// ChallengeAES emulates AES devices: a response (ack status 0x03) to
+	// a command for a channel on which AES is enabled for the peer
+	// (SET 0x11: payload byte 1, CONFIG 0x01: byte 0; other commands
+	// are not challenged) is reported as authenticated (0x0c), as if the
+	// device had challenged the command and the module had answered.
+	ChallengeAES bool
+
 	// OnOS, if non-nil, is called for every request on DstOS before the
 	// built-in handling. If it returns handled, the module acks the
 	// request with ackStatus (no payload; NoAck swallows it) instead.
@@ -522,6 +529,9 @@ func (m *Module) handle(f Frame) error {
 		if status == NoAck {
 			return nil
 		}
+		if m.opts.ChallengeAES && status == AckWithResponse && m.aesCommand(msg) {
+			status = AckWithResponseAESOK
+		}
 		payload := []byte{status}
 		if len(resp) > 0 {
 			payload = append(payload, 0x00, DefaultRSSI)
@@ -530,6 +540,26 @@ func (m *Module) handle(f Frame) error {
 		return m.ack(f, payload...)
 	}
 	return m.ack(f, AckNACK)
+}
+
+// aesCommand reports whether the device addressed by msg would
+// challenge it (see Options.ChallengeAES).
+func (m *Module) aesCommand(msg []byte) bool {
+	var dst [3]byte
+	copy(dst[:], msg[6:9])
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	p, ok := m.peers[dst]
+	if !ok {
+		return false
+	}
+	switch {
+	case msg[2] == 0x11 && len(msg) >= 11:
+		return p.AES[msg[10]]
+	case msg[2] == 0x01 && len(msg) >= 10:
+		return p.AES[msg[9]]
+	}
+	return false
 }
 
 // aesBitmap encodes the AES channel set like the module does: the last

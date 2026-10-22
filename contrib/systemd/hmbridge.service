@@ -20,6 +20,40 @@ ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
 ReadOnlyPaths=/etc/hmbridge
+# Sandbox. hmbridge needs no capabilities: the radio module's UART, the
+# GPIO reset line (/dev/gpiochip0, character device ioctls) and OpenCCU's
+# raw-uart reset ioctl are reached through device permissions (groups
+# dialout, gpio), and it only reads the clock's sync state (adjtimex
+# without changes).
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+DevicePolicy=closed
+# /dev/serial0 is a symlink to ttyAMA0 or ttyS0 (mini UART), depending
+# on the Pi and dtoverlay=disable-bt; missing devices are skipped.
+DeviceAllow=/dev/serial0 rw
+DeviceAllow=/dev/ttyAMA0 rw
+DeviceAllow=/dev/ttyS0 rw
+DeviceAllow=/dev/raw-uart rw
+DeviceAllow=/dev/gpiochip0 rw
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+# adjtimex is in @clock, not in @system-service; hmbridge only reads
+# with it (is the clock NTP-synchronised?). Setting the clock stays
+# impossible without CAP_SYS_TIME.
+SystemCallFilter=@system-service adjtimex
+SystemCallErrorNumber=EPERM
+UMask=0077
+LimitCORE=0
 # state_dir (default /var/lib/hmbridge): the paired devices and the last
 # known device state. systemd creates it, owned by hmbridge and private.
 StateDirectory=hmbridge

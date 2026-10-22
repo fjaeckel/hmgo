@@ -25,10 +25,12 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"net/http"
 	"os"
+	"syscall"
 	"time"
 
 	"github.com/fjaeckel/hmgo/internal/buildinfo"
@@ -107,10 +109,52 @@ func run() error {
 		_, err = os.Stdout.Write(out)
 		return err
 	}
-	// 0600: the file will hold the passphrase once filled in.
-	if err := os.WriteFile(*outPath, out, 0o600); err != nil {
+	if err := writeOut(*outPath, out); err != nil {
 		return err
 	}
 	fmt.Fprintf(os.Stderr, "hmgenconfig: configuration written to %s\n", *outPath)
 	return nil
+}
+
+// writeOut writes the configuration to path, mode 0600: the file will
+// hold the passphrase once filled in. Like hmsniff's -out, it never
+// follows a symbolic link to a regular file (a link planted in a shared
+// directory must not redirect the write), and an existing file is
+// truncated and made private.
+func writeOut(path string, data []byte) error {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|syscall.O_NOFOLLOW, 0o600)
+	if errors.Is(err, syscall.ELOOP) {
+		// A symlink, e.g. /dev/stdout → /proc/self/fd/1: only to
+		// something that is not a regular file (no O_CREATE).
+		f, err = os.OpenFile(path, os.O_WRONLY, 0)
+		if err != nil {
+			return err
+		}
+		if fi, err := f.Stat(); err != nil || fi.Mode().IsRegular() {
+			f.Close()
+			if err == nil {
+				err = fmt.Errorf("%s is a symlink to a regular file; refusing to follow it", path)
+			}
+			return err
+		}
+	} else if err != nil {
+		return err
+	} else if fi, err := f.Stat(); err != nil {
+		f.Close()
+		return err
+	} else if fi.Mode().IsRegular() {
+		if err := f.Truncate(0); err != nil {
+			f.Close()
+			return err
+		}
+		if err := f.Chmod(0o600); err != nil {
+			f.Close()
+			return err
+		}
+	}
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		return err
+	}
+	return f.Close()
 }

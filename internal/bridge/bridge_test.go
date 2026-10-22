@@ -132,7 +132,19 @@ func newEnv(t *testing.T, cfgJSON string, modOpts fakemod.Options) *env {
 	return newEnvWith(t, cfgJSON, modOpts, nil)
 }
 
+// newEnvWith is newEnv with options. The emulated AES devices
+// challenge commands for their AES channels, so their ACKs arrive
+// authenticated (fakemod.Options.ChallengeAES); newEnvPlainAES does not.
 func newEnvWith(t *testing.T, cfgJSON string, modOpts fakemod.Options, opt func(*Options)) *env {
+	t.Helper()
+	modOpts.ChallengeAES = true
+	return newEnvPlainAES(t, cfgJSON, modOpts, opt)
+}
+
+// newEnvPlainAES is newEnvWith without fakemod.Options.ChallengeAES
+// (unless set in modOpts): ACKs of AES devices are not authenticated,
+// like forged ones.
+func newEnvPlainAES(t *testing.T, cfgJSON string, modOpts fakemod.Options, opt func(*Options)) *env {
 	t.Helper()
 	cfg, err := config.Parse([]byte(cfgJSON))
 	if err != nil {
@@ -256,7 +268,7 @@ func TestSetupRegistersPeersWithAES(t *testing.T) {
 func TestRadiatorInfoEvent(t *testing.T) {
 	e := newEnv(t, testConfig, fakemod.Options{})
 	// INFO_LEVEL: target 22.0, actual 22.6, no fault, 2.3 V, valve 37 %, auto.
-	e.inject(0x01, msg(0x05, 0xa6, 0x10, rtdn, central, 0x0a, 0xb0, 0xe2, 0x08, 0x25, 0x00))
+	e.inject(0x02, msg(0x05, 0xa6, 0x10, rtdn, central, 0x0a, 0xb0, 0xe2, 0x08, 0x25, 0x00))
 	topic := "hmbridge/38f59c/state"
 	e.waitFor("RT-DN state", func() bool {
 		st := e.state(topic)
@@ -781,7 +793,7 @@ func TestStatePersistedAndRestored(t *testing.T) {
 	cfg := strings.Replace(testConfig, `"state_file": "",`, `"state_file": "`+path+`",`, 1)
 	e := newEnv(t, cfg, fakemod.Options{})
 	e.inject(0x11, msg(0x07, 0x84, 0x41, sco, central, 0x01, 0x1c, 0xc8))
-	e.inject(0x01, msg(0x05, 0xa6, 0x10, rtdn, central, 0x0a, 0xb0, 0xe2, 0x08, 0x25, 0x00))
+	e.inject(0x02, msg(0x05, 0xa6, 0x10, rtdn, central, 0x0a, 0xb0, 0xe2, 0x08, 0x25, 0x00))
 	e.waitFor("state", func() bool { return e.state("hmbridge/38f59c/state")["current_temperature"] != nil })
 	if err := e.b.saveState(e.b.stateFile); err != nil {
 		t.Fatal(err)
@@ -813,14 +825,14 @@ func TestDeviceAvailability(t *testing.T) {
 	avail := func(addr string) string { return string(e.pub.get("hmbridge/" + addr + "/availability")) }
 	e.waitFor("initially online", func() bool { return avail("38f59c") == "online" && avail("4c5d6e") == "online" })
 
-	e.inject(0x01, msg(0x05, 0xa6, 0x10, rtdn, central, 0x0a, 0xb0, 0xe2, 0x08, 0x25, 0x00))
+	e.inject(0x02, msg(0x05, 0xa6, 0x10, rtdn, central, 0x0a, 0xb0, 0xe2, 0x08, 0x25, 0x00))
 	e.waitFor("state", func() bool { return e.state("hmbridge/38f59c/state")["current_temperature"] != nil })
 	advance(31 * time.Minute)
 	e.waitFor("thermostats offline", func() bool { return avail("38f59c") == "offline" && avail("2a1b3c") == "offline" })
 	if avail("4c5d6e") != "online" {
 		t.Errorf("contact offline after 31 minutes; its timeout is 6h")
 	}
-	e.inject(0x01, msg(0x06, 0xa6, 0x10, rtdn, central, 0x0a, 0xb0, 0xe2, 0x08, 0x25, 0x00))
+	e.inject(0x02, msg(0x06, 0xa6, 0x10, rtdn, central, 0x0a, 0xb0, 0xe2, 0x08, 0x25, 0x00))
 	e.waitFor("back online", func() bool { return avail("38f59c") == "online" })
 }
 
@@ -850,12 +862,12 @@ func TestStateFileWrittenOnlyForSignificantChanges(t *testing.T) {
 		o.StateSaveInterval = 50 * time.Millisecond
 	})
 	// The first report is significant (mode, target, battery known now).
-	e.inject(0x01, msg(0x05, 0xa6, 0x10, rtdn, central, 0x0a, 0xb0, 0xe2, 0x08, 0x25, 0x00))
+	e.inject(0x02, msg(0x05, 0xa6, 0x10, rtdn, central, 0x0a, 0xb0, 0xe2, 0x08, 0x25, 0x00))
 	e.waitFor("first save", func() bool { _, ok := readStateFile(t, path); return ok })
 	first, _ := os.Stat(path)
 
 	// Only the temperature and valve change: no write.
-	e.inject(0x01, msg(0x06, 0xa6, 0x10, rtdn, central, 0x0a, 0xb0, 0xe8, 0x08, 0x30, 0x00))
+	e.inject(0x02, msg(0x06, 0xa6, 0x10, rtdn, central, 0x0a, 0xb0, 0xe8, 0x08, 0x30, 0x00))
 	e.waitFor("processed", func() bool { return e.state("hmbridge/38f59c/state")["valve_position"] == 48.0 })
 	time.Sleep(200 * time.Millisecond)
 	if st, _ := os.Stat(path); !st.ModTime().Equal(first.ModTime()) {
@@ -875,7 +887,7 @@ func TestStateFileWrittenOnShutdown(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.json")
 	cfg := strings.Replace(testConfig, `"state_file": "",`, `"state_file": "`+path+`",`, 1)
 	e := newEnv(t, cfg, fakemod.Options{}) // default interval: 15 minutes
-	e.inject(0x01, msg(0x05, 0xa6, 0x10, rtdn, central, 0x0a, 0xb0, 0xe2, 0x08, 0x25, 0x00))
+	e.inject(0x02, msg(0x05, 0xa6, 0x10, rtdn, central, 0x0a, 0xb0, 0xe2, 0x08, 0x25, 0x00))
 	e.waitFor("processed", func() bool { return e.state("hmbridge/38f59c/state")["current_temperature"] != nil })
 	if _, ok := readStateFile(t, path); ok {
 		t.Fatal("state file written before the save interval passed")
@@ -900,7 +912,7 @@ func TestStateSaveFailureIsRetried(t *testing.T) {
 		o.StateSaveInterval = 20 * time.Millisecond
 		o.Logf = func(f string, a ...any) { mu.Lock(); logs = append(logs, fmt.Sprintf(f, a...)); mu.Unlock() }
 	})
-	e.inject(0x01, msg(0x05, 0xa6, 0x10, rtdn, central, 0x0a, 0xb0, 0xe2, 0x08, 0x25, 0x00))
+	e.inject(0x02, msg(0x05, 0xa6, 0x10, rtdn, central, 0x0a, 0xb0, 0xe2, 0x08, 0x25, 0x00))
 	time.Sleep(300 * time.Millisecond) // many save attempts
 	count := func(sub string) int {
 		mu.Lock()

@@ -159,6 +159,15 @@ type Config struct {
 	// /metrics. Default ":8013"; "" disables the HTTP server.
 	HTTPListen *string `json:"http_listen,omitempty"`
 
+	// HTTPAllowedHosts lists additional host names under which the
+	// status page and /metrics may be reached (the Host header of the
+	// request), e.g. a DNS name or a reverse proxy's name. IP addresses,
+	// "localhost" and the machine's host name (also with ".local") are
+	// always accepted; requests for other names are refused, so that a
+	// web site cannot reach hmbridge through DNS rebinding. "*" accepts
+	// every name (disables that protection).
+	HTTPAllowedHosts []string `json:"http_allowed_hosts,omitempty"`
+
 	// TimeSyncInterval is how often the radio module's clock is set
 	// (Go duration string). Default "1h".
 	TimeSyncInterval Duration `json:"time_sync_interval"`
@@ -229,6 +238,9 @@ type Config struct {
 	centralAddr [3]byte
 	current     hmkey.Key
 	previous    *hmkey.Key
+	// permWarnings are problems with the configuration file's
+	// permissions found by Load.
+	permWarnings []string
 }
 
 // Pairing configures how hmbridge pairs new devices.
@@ -449,9 +461,19 @@ func (d *Duration) UnmarshalJSON(b []byte) error {
 
 func (d Duration) MarshalJSON() ([]byte, error) { return json.Marshal(d.Duration.String()) }
 
-// Load reads and parses the configuration file at path.
+// Load reads and parses the configuration file at path. Insecure
+// permissions of the file are reported by PermissionWarnings.
 func Load(path string) (*Config, error) {
-	b, err := os.ReadFile(path)
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	b, err := io.ReadAll(f)
 	if err != nil {
 		return nil, err
 	}
@@ -459,7 +481,16 @@ func Load(path string) (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
+	cfg.permWarnings = permissionWarnings(path, fi)
 	return cfg, nil
+}
+
+// PermissionWarnings returns the problems with the configuration file's
+// permissions (readable by other users, owned by another user) found by
+// Load. The file holds the AES system key: anyone who can read it can
+// impersonate the central.
+func (c *Config) PermissionWarnings() []string {
+	return append([]string(nil), c.permWarnings...)
 }
 
 // Parse parses and validates a JSON configuration.
@@ -672,6 +703,13 @@ func (c *Config) resolve() error {
 	if c.HTTPListen == nil {
 		s := DefaultHTTPListen
 		c.HTTPListen = &s
+	}
+	for i, h := range c.HTTPAllowedHosts {
+		h = strings.TrimSpace(h)
+		if h == "" || strings.ContainsAny(h, "/ \t@") {
+			return fmt.Errorf("http_allowed_hosts: %q is not a host name", c.HTTPAllowedHosts[i])
+		}
+		c.HTTPAllowedHosts[i] = h
 	}
 	if !c.TimeSyncInterval.set {
 		c.TimeSyncInterval.Duration = DefaultTimeSyncInterval

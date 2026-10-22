@@ -318,9 +318,28 @@ func TestEndToEndRPIRFModButtonAES(t *testing.T) {
 	pending := map[byte][]byte{} // message counter → button message awaiting the challenge
 	level := map[string]byte{}
 	var challenges int
+	swCh := [6]byte{0x11, 0x22, 0x33, 0x44, 0x55, 0x66}
+	swOrig := map[byte][]byte{} // message counter → command to the switch awaiting our AES answer
 	mod, rw := fakemod.New(fakemod.Options{DualCoPro: true, OnLLMACSend: func(m []byte) [][]byte {
 		mu.Lock()
 		defer mu.Unlock()
+		// The switch uses AES: it challenges LEVEL_SET (key index 2) and
+		// sends its ACK_STATUS, with the auth bytes, only after our
+		// correct answer (hmbridge rejects an unauthenticated ACK).
+		if len(m) >= 11 && m[2] == 0x11 && bytes.Equal(m[6:9], e2ePlug) {
+			swOrig[m[0]] = append([]byte(nil), m...)
+			return [][]byte{bmsg(m[0], 0xa0, 0x02, e2ePlug, e2eCentral, append(append([]byte{0x04}, swCh[:]...), 2*2)...)}
+		}
+		if len(m) >= 25 && m[2] == 0x03 && bytes.Equal(m[6:9], e2ePlug) {
+			orig := swOrig[m[0]]
+			var r [16]byte
+			copy(r[:], m[9:25])
+			auth, ok := device.VerifyAuth(2, swCh, orig, r)
+			if orig == nil || !ok {
+				return [][]byte{bmsg(m[0], 0x80, 0x02, e2ePlug, e2eCentral, 0x80)}
+			}
+			return [][]byte{append(actuatorReply(orig, level), auth[:]...)}
+		}
 		// The bridge challenges the button's message: answer like the
 		// device, with the real AES key.
 		if m[2] == 0x02 && len(m) >= 17 && m[9] == 0x04 && bytes.Equal(m[6:9], e2ePB) {

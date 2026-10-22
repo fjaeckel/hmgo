@@ -41,6 +41,27 @@ func TestParsePairingCommands(t *testing.T) {
 			t.Errorf("%s %q: got %+v, %v; want %+v", tc.topic, tc.payload, got, err, tc.want)
 		}
 	}
+	// Names must be valid UTF-8 without control or invisible formatting
+	// characters: an invalid name crashed hmbridge (Prometheus label).
+	bad := []string{
+		"K\xfcche", "\xff\xfe", "a\x00b", "a\x7fb", "a\u0085b", "a\u009fb", "�",
+		strings.Repeat("ä", 65),
+	}
+	for _, r := range []rune{0x200b, 0x200c, 0x200d, 0x200e, 0x200f, 0x202a, 0x202b, 0x202c, 0x202d, 0x202e,
+		0x2066, 0x2067, 0x2068, 0x2069, 0x2028, 0x2029, 0xfeff, 0x00ad} {
+		bad = append(bad, "Fenster"+string(r)+"Bad")
+	}
+	for _, name := range bad {
+		if _, err := ParseCommand(cfg, "hmbridge/4c5d6e/set/name", []byte(name)); err == nil {
+			t.Errorf("name %+q accepted", name)
+		}
+	}
+	for _, name := range []string{"Küche Fenster", "Büro 2 (Süd)", "Тест", "窓", strings.Repeat("ä", 64), "Fenster 🪟"} {
+		if _, err := ParseCommand(cfg, "hmbridge/4c5d6e/set/name", []byte(name)); err != nil {
+			t.Errorf("name %q refused: %v", name, err)
+		}
+	}
+
 	// The bridge command topic is covered by the device command
 	// subscription.
 	if sub := cfg.CommandSubscription(); sub != "hmbridge/+/set/+" || cfg.PairCommandTopic() != "hmbridge/bridge/set/pair" {

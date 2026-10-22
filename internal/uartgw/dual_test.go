@@ -435,9 +435,20 @@ func (d *aesDevice) onSend(msg []byte) [][]byte {
 	return nil
 }
 
+// addKeyPeer registers testDevice with key index 1 (the key index the
+// emulated devices challenge with): DualConn only answers challenges
+// with the configured key index.
+func addKeyPeer(t *testing.T, c *DualConn) {
+	t.Helper()
+	if err := c.AddPeer(context.Background(), Peer{Addr: testDevice, KeyIndex: 1, Channels: 2}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestDualSendAES(t *testing.T) {
 	dev := &aesDevice{}
 	c, mod := openDualTest(t, fakemod.Options{OnLLMACSend: dev.onSend}, Config{Signer: fakeSigner{}})
+	addKeyPeer(t, c)
 	enc := bidiPacket(0x47).Encode()
 	resp, err := c.Send(context.Background(), enc)
 	if err != nil {
@@ -467,6 +478,7 @@ func TestDualSendAESFailed(t *testing.T) {
 	t.Run("nack", func(t *testing.T) {
 		dev := &aesDevice{nack: true}
 		c, _ := openDualTest(t, fakemod.Options{OnLLMACSend: dev.onSend}, Config{Signer: fakeSigner{}})
+		addKeyPeer(t, c)
 		resp, err := c.Send(context.Background(), bidiPacket(0x48).Encode())
 		if !errors.Is(err, ErrAESFailed) {
 			t.Fatalf("Send: got %v, want ErrAESFailed", err)
@@ -942,8 +954,12 @@ func TestDualClose(t *testing.T) {
 
 func TestDualConcurrentSendRecv(t *testing.T) {
 	c, mod := openDualTest(t, fakemod.Options{}, Config{})
-	c.AddPeer(context.Background(), Peer{Addr: testOtherDevice})
-	const n = 30
+	// Three peers: software ACKs are limited to ackBurst at once per peer.
+	peers := [3][3]byte{testOtherDevice, {0x11, 0x22, 0x34}, {0x11, 0x22, 0x35}}
+	for _, p := range peers {
+		c.AddPeer(context.Background(), Peer{Addr: p})
+	}
+	const n = 3 * ackBurst
 	var wg sync.WaitGroup
 	errs := make(chan error, 2*n)
 	for i := 0; i < n; i++ {
@@ -963,7 +979,7 @@ func TestDualConcurrentSendRecv(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			// BiDi messages of a peer: delivered and software-acked.
-			if err := mod.InjectLLMACRecv(0x40, msgBytes(byte(i), 0xa0, 0x10, testOtherDevice, testHMID, 0x06, 0x01)); err != nil {
+			if err := mod.InjectLLMACRecv(0x40, msgBytes(byte(i), 0xa0, 0x10, peers[i%3], testHMID, 0x06, 0x01)); err != nil {
 				errs <- err
 			}
 		}(i)
@@ -973,7 +989,7 @@ func TestDualConcurrentSendRecv(t *testing.T) {
 	for received < n {
 		select {
 		case b := <-c.Recv():
-			if !bytes.Equal(b[6:9], testOtherDevice[:]) {
+			if bytes.Equal(b[6:9], testDevice[:]) {
 				t.Errorf("Send response leaked to Recv: %x", b)
 			}
 			received++
@@ -1223,6 +1239,7 @@ func TestDualSendAESAuthBytes(t *testing.T) {
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			c, _ := openDualTest(t, fakemod.Options{OnLLMACSend: authDevice(tt.final)}, Config{Signer: tt.signer})
+			addKeyPeer(t, c)
 			resp, err := c.Send(context.Background(), bidiPacket(0x47).Encode())
 			if tt.ok {
 				if err != nil || resp == nil || resp[0] != 0x02 {
@@ -1263,6 +1280,9 @@ func TestDualSendAESRealSigner(t *testing.T) {
 		return nil
 	}
 	c, _ := openDualTest(t, fakemod.Options{OnLLMACSend: dev}, Config{Signer: signer})
+	if err := c.AddPeer(context.Background(), Peer{Addr: testDevice, KeyIndex: testKey.Index, Channels: 2}); err != nil {
+		t.Fatal(err)
+	}
 	resp, err := c.Send(context.Background(), bidiPacket(0x48).Encode())
 	if err != nil || resp[0] != 0x02 {
 		t.Fatalf("Send = %x, %v", resp, err)
@@ -1313,6 +1333,7 @@ func TestDualScheduledResponseWait(t *testing.T) {
 	}
 	c2, mod := openDualTest(t, fakemod.Options{OnLLMACSend: dev}, Config{Signer: fakeSigner{}, ResponseTimeout: 200 * time.Millisecond, SendRetries: -1})
 	modp.Store(mod)
+	addKeyPeer(t, c2)
 	resp, err := c2.Send(context.Background(), bidiPacket(0x4a).Encode())
 	if err != nil || resp[0] != 0x02 {
 		t.Fatalf("Send = %x, %v", resp, err)

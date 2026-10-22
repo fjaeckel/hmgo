@@ -87,6 +87,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 )
 
 // Kind is the device type.
@@ -960,14 +962,28 @@ func parsePairCommand(p string) (Command, error) {
 // MaxNameLength is the longest device name accepted by Rename.
 const MaxNameLength = 64
 
-// ValidDeviceName checks a new device name (Rename).
+// ValidDeviceName checks a new device name (Rename). The name ends up
+// in log lines, Prometheus labels (which must be valid UTF-8), Home
+// Assistant and the status page, so it must be valid UTF-8 without
+// control characters and without invisible format characters (zero
+// width spaces and joiners, bidirectional overrides and isolates, line
+// and paragraph separators, byte order marks) that could make one name
+// look like another.
 func ValidDeviceName(name string) error {
-	if name == "" || len([]rune(name)) > MaxNameLength {
+	if !utf8.ValidString(name) {
+		return errors.New("ha: device name is not valid UTF-8")
+	}
+	if name == "" || utf8.RuneCountInString(name) > MaxNameLength {
 		return fmt.Errorf("ha: device name must have 1 … %d characters", MaxNameLength)
 	}
 	for _, r := range name {
-		if r < 0x20 || r == 0x7f {
+		switch {
+		case unicode.IsControl(r): // C0, DEL, C1
 			return fmt.Errorf("ha: device name %q contains control characters", name)
+		case unicode.In(r, unicode.Cf, unicode.Zl, unicode.Zp), r == utf8.RuneError:
+			// Cf covers U+200B–U+200F, U+202A–U+202E, U+2066–U+2069
+			// and U+FEFF; Zl/Zp are U+2028/U+2029.
+			return fmt.Errorf("ha: device name %+q contains invisible formatting characters (U+%04X)", name, r)
 		}
 	}
 	return nil

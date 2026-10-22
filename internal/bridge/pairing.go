@@ -35,7 +35,14 @@ package bridge
 // devices get it immediately, wake-on-radio thermostats with a burst;
 // devices that only listen in config mode (contacts, remotes, weather
 // sensors) get it when their config button is pressed within the
-// pairing duration.
+// pairing duration. The device stays registered with the radio module
+// until the unpair messages were sent: the module needs its key index
+// and AES channels to answer the device's AES challenges.
+//
+// Security (pairing.aes "system_key", like a CCU): the key exchange
+// hands the system key to whatever device announces itself while
+// pairing mode is on, encrypted only with the publicly known eQ-3
+// default key. Every hand-out is logged and shown in the last result.
 
 import (
 	"context"
@@ -43,7 +50,9 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -86,8 +95,64 @@ type pairingMode struct {
 	lastRemaining int
 
 	// unpairWait: devices that were removed but only listen in config
-	// mode; their next DEVICE_INFO triggers the unpair messages.
+	// mode; their next DEVICE_INFO triggers the unpair messages. Their
+	// radio module peer is kept until then.
 	unpairWait map[[3]byte]unpairWaiting
+
+	// logLimit rate-limits log lines that anyone in radio range can
+	// trigger (rejected DEVICE_INFOs).
+	logLimit logLimiter
+}
+
+// logLimiter allows one log line per key and interval and counts the
+// suppressed ones. Keys are fixed labels (never addresses), so the map
+// stays small.
+type logLimiter struct {
+	mu   sync.Mutex
+	last map[string]*limitedLog
+}
+
+type limitedLog struct {
+	at         time.Time
+	suppressed int
+}
+
+// logLimitInterval is the minimum time between two log lines of one
+// key.
+const logLimitInterval = time.Minute
+
+// allow reports whether a line for key may be logged now, and how many
+// were suppressed since the last one.
+func (l *logLimiter) allow(key string, now time.Time) (bool, int) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.last == nil {
+		l.last = make(map[string]*limitedLog)
+	}
+	e := l.last[key]
+	if e == nil {
+		l.last[key] = &limitedLog{at: now}
+		return true, 0
+	}
+	if now.Sub(e.at) < logLimitInterval && now.After(e.at.Add(-logLimitInterval)) {
+		e.suppressed++
+		return false, 0
+	}
+	n := e.suppressed
+	e.at, e.suppressed = now, 0
+	return true, n
+}
+
+// logLimited logs like logf, at most once per logLimitInterval and key.
+func (b *Bridge) logLimited(key, format string, args ...any) {
+	ok, suppressed := b.pair.logLimit.allow(key, b.now())
+	if !ok {
+		return
+	}
+	if suppressed > 0 {
+		format += fmt.Sprintf(" (%d similar messages suppressed)", suppressed)
+	}
+	b.logf(format, args...)
 }
 
 type unpairWaiting struct {
@@ -162,6 +227,7 @@ func (b *Bridge) pairingSnapshotLocked(now time.Time) PairingSnapshot {
 	for a, w := range b.pair.unpairWait {
 		s.UnpairWaiting = append(s.UnpairWaiting, fmt.Sprintf("%s (%x, %d s)", w.job.name, a[:], remainingSeconds(w.until, now)))
 	}
+	sort.Strings(s.UnpairWaiting)
 	return s
 }
 
@@ -178,9 +244,15 @@ func (b *Bridge) publishPairingLocked(now time.Time) {
 // setResultLocked records the outcome of a pairing or unpairing. Caller
 // holds b.mu.
 func (b *Bridge) setResultLocked(msg string) {
+	b.setResultQuietLocked(msg)
+	b.logf("pairing: %s", msg)
+}
+
+// setResultQuietLocked records a result without logging it. Caller
+// holds b.mu.
+func (b *Bridge) setResultQuietLocked(msg string) {
 	b.pair.lastResult = msg
 	b.pair.lastResultAt = b.now()
-	b.logf("pairing: %s", msg)
 }
 
 // startPairing turns pairing mode on (or extends it). Runs on the event
@@ -225,6 +297,10 @@ func (b *Bridge) pairingTick() {
 			metricUnpair.WithLabelValues("unconfirmed").Inc()
 			b.setResultLocked(fmt.Sprintf("%s (%x) was removed, but its config button was not pressed in time; the device still believes it is paired (factory-reset it, or pair it again)", w.job.name, a[:]))
 			b.publishPairingLocked(now)
+			// Only now forget it in the radio module.
+			j := w.job
+			j.send = false
+			b.queue.push(job{key: fmt.Sprintf("unpair:%x", a[:]), kind: jobUnpair, unpair: &j})
 		}
 	}
 	if !b.pair.active {
@@ -252,7 +328,13 @@ type pairJob struct {
 	// only confirms the central address), nil for a new device.
 	known    *device
 	keyIndex byte // the device's current key index
-	// aes: give the device the system key and enable AES_ACTIVE.
+	// ourCentral: a new device that announced itself to our central
+	// address, i.e. is paired to it already (by OpenCCU, or by hmbridge
+	// before an unpairing the device never confirmed). It is assumed to
+	// use the system key already (keyIndex): no key exchange.
+	ourCentral bool
+	// aes: give the device the system key (unless ourCentral) and enable
+	// AES_ACTIVE.
 	aes bool
 }
 
@@ -261,48 +343,93 @@ type pairOutcome struct {
 	keyIndex    byte
 	aesChannels []int
 	notes       []string // partial failures (key exchange, AES_ACTIVE)
+	// keyHandedOut: the system key was sent to the device (key
+	// exchange attempted, whatever its result).
+	keyHandedOut bool
+}
+
+// pairingSourceProblem returns why src cannot be a device to pair (or
+// to unpair), or "". It is checked before anything is sent.
+func pairingSourceProblem(src, central [3]byte) string {
+	switch src {
+	case [3]byte{}:
+		return "000000 is the broadcast address, not a device address"
+	case [3]byte{0xff, 0xff, 0xff}:
+		return "ffffff is not a device address"
+	case central:
+		return "it is the central's own address (central_address); a spoofed message"
+	}
+	return ""
 }
 
 // handleDeviceInfo handles a DEVICE_INFO frame: known is the device at
-// its address, if any. Runs on the event loop.
+// its address, if any. Runs on the event loop. Anyone in radio range
+// can send DEVICE_INFO, so everything is checked before any radio
+// traffic, and the log lines of rejections are rate-limited.
 func (b *Bridge) handleDeviceInfo(pkt *bidcos.Packet, known *device) {
 	now := b.now()
 	b.mu.Lock()
-	if w, ok := b.pair.unpairWait[pkt.Source]; ok && known == nil {
-		delete(b.pair.unpairWait, pkt.Source)
-		b.mu.Unlock()
-		j := w.job
-		j.send, j.peerRemoved = true, true
-		b.logf("pairing: %s (%x) pressed its config button: sending the unpair messages", j.name, j.addr[:])
-		b.queue.push(job{key: fmt.Sprintf("unpair:%x", j.addr[:]), kind: jobUnpair, unpair: &j, priority: true})
-		return
-	}
+	w, waiting := b.pair.unpairWait[pkt.Source]
+	waiting = waiting && known == nil
 	active, busy := b.pair.active && now.Before(b.pair.until), b.pair.busy
 	b.mu.Unlock()
-	if !active || busy {
+	if !waiting && (!active || busy) {
 		return
 	}
 
+	addr := fmt.Sprintf("%x", pkt.Source[:])
+	// reject reports a refused DEVICE_INFO: as the pairing result while
+	// pairing mode is on, and in the (rate-limited) log.
 	reject := func(label, msg string) {
 		metricPairing.WithLabelValues(label).Inc()
+		b.logLimited("pairing:"+label, "pairing: %s", msg)
+		if !active || busy {
+			return
+		}
 		b.mu.Lock()
-		b.setResultLocked(msg)
+		b.setResultQuietLocked(msg)
 		b.publishPairingLocked(now)
 		b.mu.Unlock()
 	}
-	addr := fmt.Sprintf("%x", pkt.Source[:])
+	central := b.cfg.CentralAddr()
+	if why := pairingSourceProblem(pkt.Source, central); why != "" {
+		reject("invalid_source", fmt.Sprintf("ignoring DEVICE_INFO from %s: %s", addr, why))
+		return
+	}
 	di, err := pairing.ParseDeviceInfo(pkt.Payload)
 	if err != nil {
 		reject("invalid", fmt.Sprintf("ignoring DEVICE_INFO of %s: %v", addr, err))
 		return
 	}
-	central := b.cfg.CentralAddr()
+	model, modelOK := pairing.ModelForID(di.ModelID)
+
+	if waiting {
+		// An unpaired device that only listens in config mode pressed
+		// its config button: send the unpair messages. Not to another
+		// model that claims its address.
+		if w.job.model.ID != 0 && (!modelOK || model.Name != w.job.model.Name) {
+			reject("address_conflict", fmt.Sprintf("%s (%s, model %04X) has the address of the unpaired %s (%s); not sending it the unpair messages", di.Serial, addr, di.ModelID, w.job.name, w.job.model.Name))
+			return
+		}
+		b.mu.Lock()
+		_, still := b.pair.unpairWait[pkt.Source]
+		delete(b.pair.unpairWait, pkt.Source)
+		b.mu.Unlock()
+		if !still {
+			return
+		}
+		j := w.job
+		j.send = true
+		b.logf("pairing: %s (%x) pressed its config button: sending the unpair messages", j.name, j.addr[:])
+		b.queue.push(job{key: "unpair:" + addr, kind: jobUnpair, unpair: &j, priority: true})
+		return
+	}
+
 	if pkt.Dest != central && pkt.Dest != ([3]byte{}) {
 		reject("other_central", fmt.Sprintf("%s (%s, model %04X) is paired to another central (%x); factory-reset it first (see its manual), then pair it again", di.Serial, addr, di.ModelID, pkt.Dest[:]))
 		return
 	}
-	model, ok := pairing.ModelForID(di.ModelID)
-	if !ok {
+	if !modelOK {
 		reject("unsupported_model", fmt.Sprintf("%s (%s) has model ID %04X, which hmbridge does not support", di.Serial, addr, di.ModelID))
 		return
 	}
@@ -315,16 +442,46 @@ func (b *Bridge) handleDeviceInfo(pkt *bidcos.Packet, known *device) {
 		pj.known = known
 		pj.keyIndex = known.cfg.KeyIndex()
 	} else {
+		if k := b.keptRecord(pkt.Source); k != nil && (k.Model != model.Name || k.Serial != "" && k.Serial != di.Serial) {
+			reject("address_conflict", fmt.Sprintf("%s (%s, %s) has the address of %s (%s, serial %q) in the devices file; not pairing it", di.Serial, addr, model.Name, k.Name, k.Model, k.Serial))
+			return
+		}
 		cur, _ := b.cfg.Keys()
 		pj.aes = b.pair.aes == config.PairingAESSystemKey && model.AES && cur.Index > 0
+		if pkt.Dest == central {
+			// Paired to this central already but not configured: it got
+			// the system key when it was paired (a CCU and hmbridge
+			// always give it to AES-capable devices). Don't hand the key
+			// out again; register it with the current key index.
+			pj.ourCentral = true
+			if model.AES && cur.Index > 0 {
+				pj.keyIndex = cur.Index
+			}
+		}
+	}
+	// A pending unpairing of this address is superseded by the pairing.
+	if _, ok := b.queue.remove("unpair:" + addr); ok {
+		b.logf("pairing: %s is being paired again: dropping its pending unpairing", addr)
 	}
 	b.mu.Lock()
 	b.pair.busy = true
 	b.publishPairingLocked(now)
 	b.mu.Unlock()
-	b.logf("pairing: %s %s (%s, firmware %s) announced itself; configuring it", model.Name, di.Serial, addr, di.FirmwareString())
+	b.logf("pairing: %s %s (%s, firmware %s, RSSI %d dBm) announced itself; configuring it", model.Name, di.Serial, addr, di.FirmwareString(), pj.rssi)
 	// The device listens only while in config mode: jump the queue.
 	b.queue.push(job{key: "pair:" + addr, kind: jobPair, pair: pj, priority: true})
+}
+
+// keptRecord returns the unusable devices file record at addr, if any.
+func (b *Bridge) keptRecord(addr [3]byte) *store.Device {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for i, k := range b.pair.kept {
+		if a, err := hex.DecodeString(k.Address); err == nil && len(a) == 3 && [3]byte(a) == addr {
+			return &b.pair.kept[i]
+		}
+	}
+	return nil
 }
 
 // sendConfig sends one configuration message to addr and checks the
@@ -341,6 +498,16 @@ func (b *Bridge) sendConfig(ctx context.Context, addr [3]byte, flags byte, m pai
 	return nil
 }
 
+// cleanupTimeout bounds clean-up radio module requests (removing a
+// peer) made after a job failed, possibly because its context expired.
+const cleanupTimeout = 5 * time.Second
+
+// cleanupContext returns a fresh short context for clean-up after a job
+// whose context may have expired.
+func cleanupContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
+}
+
 // executePair configures a device (worker goroutine).
 func (b *Bridge) executePair(ctx context.Context, p *pairJob) (any, error) {
 	out := &pairOutcome{keyIndex: p.keyIndex}
@@ -355,16 +522,17 @@ func (b *Bridge) executePair(ctx context.Context, p *pairJob) (any, error) {
 		return out, nil
 	}
 
-	peer := uartgw.Peer{Addr: p.addr, KeyIndex: 0, Channels: config.ModelChannels(p.model.Name) + 1}
+	peer := uartgw.Peer{Addr: p.addr, KeyIndex: p.keyIndex, Channels: config.ModelChannels(p.model.Name) + 1}
 	// Register the device first, so that the module (HM-MOD-RPI-PCB)
 	// passes its responses on (Homegear does the same).
 	if err := b.radio.AddPeer(ctx, peer); err != nil {
+		b.removePeerAfter(ctx, p.addr) // the module may have stored it
 		return nil, fmt.Errorf("registering with the radio module: %w", err)
 	}
 	ok := false
 	defer func() {
 		if !ok {
-			b.removePeer(ctx, p.addr)
+			b.removePeerAfter(ctx, p.addr)
 		}
 	}()
 	for _, m := range pairing.PairSequence(b.cfg.CentralAddr(), p.model.InternalKeysVisible) {
@@ -374,29 +542,44 @@ func (b *Bridge) executePair(ctx context.Context, p *pairJob) (any, error) {
 	}
 	ok = true
 
-	if p.aes {
+	keyOK := p.ourCentral && p.keyIndex > 0
+	if p.ourCentral && p.aes {
+		out.notes = append(out.notes, fmt.Sprintf("it was paired to this central address already, so it is assumed to use the system key (index %d) and was not given it again; if its messages fail AES authentication, factory-reset it and pair it again", p.keyIndex))
+	}
+	if p.aes && !p.ourCentral {
 		cur, _ := b.cfg.Keys()
-		if err := b.keyExchange(ctx, p.addr, hmkey.EQ3Default, *cur); err != nil {
-			out.notes = append(out.notes, fmt.Sprintf("AES key exchange failed (%v); the device keeps the eQ-3 default key and AES stays off", err))
-		} else {
+		out.keyHandedOut = true
+		b.logf("pairing: KEY HAND-OUT: giving the system key (index %d) to %s %s (%x, RSSI %d dBm), encrypted with the publicly known eQ-3 default key",
+			cur.Index, p.model.Name, p.info.Serial, p.addr[:], p.rssi)
+		switch part, err := b.keyExchange(ctx, p.addr, hmkey.EQ3Default, *cur); {
+		case err == nil:
+			keyOK = true
 			out.keyIndex = cur.Index
 			peer.KeyIndex = cur.Index
 			if err := b.radio.AddPeer(ctx, peer); err != nil {
 				out.notes = append(out.notes, fmt.Sprintf("updating the radio module: %v", err))
 			}
-			for _, ch := range p.model.AESDefault {
-				var err error
-				for _, m := range pairing.AESActiveSequence(ch, true) {
-					if err = b.sendConfig(ctx, p.addr, pairing.ConfigFlags, m); err != nil {
-						break
-					}
-				}
-				if err != nil {
-					out.notes = append(out.notes, fmt.Sprintf("enabling AES on channel %d failed (%v)", ch, err))
+		case part == 2 && !isNack(err):
+			// The device may have taken the new key and only its ACK
+			// got lost.
+			out.notes = append(out.notes, fmt.Sprintf("AES key exchange: part 2 was not confirmed (%v), so it is unknown whether the device uses the system key (index %d) or still the eQ-3 default key; AES stays off and key index 0 is stored. Verify: if commands to it fail, unpair it, factory-reset it and pair it again", err, cur.Index))
+		default:
+			out.notes = append(out.notes, fmt.Sprintf("AES key exchange failed in part %d (%v); the device keeps its previous key (normally the eQ-3 default key) and AES stays off", part, err))
+		}
+	}
+	if p.aes && keyOK {
+		for _, ch := range p.model.AESDefault {
+			var err error
+			for _, m := range pairing.AESActiveSequence(ch, true) {
+				if err = b.sendConfig(ctx, p.addr, pairing.ConfigFlags, m); err != nil {
 					break
 				}
-				out.aesChannels = append(out.aesChannels, int(ch))
 			}
+			if err != nil {
+				out.notes = append(out.notes, fmt.Sprintf("enabling AES on channel %d failed (%v)", ch, err))
+				break
+			}
+			out.aesChannels = append(out.aesChannels, int(ch))
 		}
 	}
 	if len(out.aesChannels) > 0 {
@@ -410,13 +593,20 @@ func (b *Bridge) executePair(ctx context.Context, p *pairJob) (any, error) {
 	return out, nil
 }
 
-// keyExchange gives the device at addr (using old) the key newKey.
-func (b *Bridge) keyExchange(ctx context.Context, addr [3]byte, old, newKey hmkey.Key) error {
+// isNack reports whether err is a definite refusal by the device.
+func isNack(err error) bool {
+	var ne *hm.NackError
+	return errors.As(err, &ne)
+}
+
+// keyExchange gives the device at addr (using old) the key newKey. On
+// failure, part is the part (1 or 2) that failed.
+func (b *Bridge) keyExchange(ctx context.Context, addr [3]byte, old, newKey hmkey.Key) (part int, err error) {
 	var payloads [2][]byte
 	if hk, ok := b.radio.(interface{ HostKeyExchange() bool }); ok && hk.HostKeyExchange() {
 		enc, err := bidcosaes.KeyExchangePayloads(old.Bytes, newKey, rand.Reader)
 		if err != nil {
-			return err
+			return 1, err
 		}
 		payloads = [2][]byte{enc[0][:], enc[1][:]}
 	} else {
@@ -425,10 +615,10 @@ func (b *Bridge) keyExchange(ctx context.Context, addr [3]byte, old, newKey hmke
 	for i, p := range payloads {
 		m := pairing.Message{Cmd: pairing.CmdKeyExchange, Payload: p, What: fmt.Sprintf("AES key exchange part %d of 2", i+1)}
 		if err := b.sendConfig(ctx, addr, pairing.ConfigFlags, m); err != nil {
-			return err
+			return i + 1, err
 		}
 	}
-	return nil
+	return 0, nil
 }
 
 func (b *Bridge) removePeer(ctx context.Context, addr [3]byte) {
@@ -439,6 +629,14 @@ func (b *Bridge) removePeer(ctx context.Context, addr [3]byte) {
 			b.logf("removing %x from the radio module: %v", addr[:], err)
 		}
 	}
+}
+
+// removePeerAfter removes addr from the radio module with a fresh
+// context: ctx (the job's) may have expired.
+func (b *Bridge) removePeerAfter(ctx context.Context, addr [3]byte) {
+	cctx, cancel := cleanupContext(ctx)
+	defer cancel()
+	b.removePeer(cctx, addr)
 }
 
 // handlePairResult applies the outcome of a pair job (event loop).
@@ -468,6 +666,9 @@ func (b *Bridge) handlePairResult(p *pairJob, ev any, err error) {
 		metricPairing.WithLabelValues("failed").Inc()
 		b.setResultLocked(fmt.Sprintf("pairing %s %s (%s) failed: %v. Press the config button again while pairing mode is on; if the device keeps refusing (NACK), factory-reset it", p.model.Name, p.info.Serial, addr, err))
 		return
+	}
+	if ev == nil {
+		return // not reached: executePair returns an outcome or an error
 	}
 	out := ev.(*pairOutcome)
 	if p.known != nil {
@@ -532,6 +733,11 @@ func (b *Bridge) handlePairResult(p *pairJob, ev any, err error) {
 		msg += fmt.Sprintf(", key index %d", out.keyIndex)
 	}
 	msg += ")"
+	if out.keyHandedOut {
+		// Make every hand-out of the system key visible in Home
+		// Assistant: check that it was your device (serial, RSSI).
+		msg += fmt.Sprintf("; system key handed out to serial %s at RSSI %d dBm", p.info.Serial, p.rssi)
+	}
 	save = b.devicesSaverLocked()
 	if len(out.notes) > 0 {
 		msg += "; " + strings.Join(out.notes, "; ")
@@ -595,10 +801,9 @@ type unpairJob struct {
 	name  string
 	model pairing.Model
 	// send: send the unpair messages (else: only remove the peer from
-	// the radio module and wait for the config button).
+	// the radio module, after the config button was not pressed in
+	// time). The peer is removed after the messages, in any case.
 	send bool
-	// peerRemoved: the radio module peer was removed by an earlier job.
-	peerRemoved bool
 }
 
 // unpairDevice handles the “Unpair” command (event loop).
@@ -629,17 +834,23 @@ func (b *Bridge) unpairDevice(addrHex string) {
 	if !ok {
 		model = pairing.Model{Name: d.cfg.Model, RX: pairing.ConfigOnly}
 	}
+	// A queued re-confirmation of the device is superseded.
+	if _, ok := b.queue.remove("pair:" + addrHex); ok {
+		b.pair.busy = false
+	}
 	b.removeDeviceLocked(d)
 	save = b.devicesSaverLocked()
 	j := unpairJob{addr: d.cfg.Addr(), name: d.cfg.Name, model: model}
 	if model.RX == pairing.ConfigOnly {
+		// The radio module keeps the peer (key index, AES channels)
+		// until the unpair messages were sent.
 		b.pair.unpairWait[j.addr] = unpairWaiting{until: now.Add(b.pair.duration), job: j}
 		metricUnpair.WithLabelValues("waiting").Inc()
 		b.setResultLocked(fmt.Sprintf("removed %s (%s); press its config button within %v to unpair the device itself", j.name, addrHex, b.pair.duration))
-	} else {
-		j.send = true
-		b.setResultLocked(fmt.Sprintf("removed %s (%s); unpairing the device", j.name, addrHex))
+		return
 	}
+	j.send = true
+	b.setResultLocked(fmt.Sprintf("removed %s (%s); unpairing the device", j.name, addrHex))
 	b.queue.push(job{key: "unpair:" + addrHex, kind: jobUnpair, unpair: &j, priority: true})
 }
 
@@ -661,11 +872,12 @@ func (b *Bridge) removeDeviceLocked(d *device) {
 	b.stateDirty, b.significantDirty = true, true
 }
 
-// executeUnpair sends the unpair messages (worker goroutine).
+// executeUnpair sends the unpair messages (worker goroutine) and then
+// removes the device from the radio module, also when sending failed:
+// while the messages are sent, the module needs the peer to answer the
+// device's AES challenges.
 func (b *Bridge) executeUnpair(ctx context.Context, u *unpairJob) error {
-	if !u.peerRemoved {
-		b.removePeer(ctx, u.addr)
-	}
+	defer b.removePeerAfter(ctx, u.addr)
 	if !u.send {
 		return nil
 	}
@@ -715,6 +927,11 @@ func (b *Bridge) renameDevice(addrHex, name string) {
 		}
 	}
 	switch {
+	case ha.ValidDeviceName(name) != nil:
+		// ha.ParseCommand checks this already; never let an invalid
+		// name reach the logs, metrics or the devices file.
+		b.logf("rename %s: %v", addrHex, ha.ValidDeviceName(name))
+		return
 	case d == nil:
 		b.logf("rename: unknown device %s", addrHex)
 		return

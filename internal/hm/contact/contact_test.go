@@ -131,4 +131,22 @@ func TestDecodeErrors(t *testing.T) {
 	if ev, err := c.Decode(hmtest.Packet(0x01, 0x45, 0x10, 0x80, 0x02, scoAddr, central, 0x00)); ev != nil || err != nil {
 		t.Errorf("plain ack: %v %v", ev, err)
 	}
+	// Frames for another channel than 1 (forged: the channel comes from
+	// the payload) are rejected.
+	for _, pl := range [][]byte{
+		{0x3f, 0x1c, 0xc8},       // EVENT, channel 63
+		{0x80, 0x1c, 0xc8},       // EVENT, channel 0
+		{0x06, 0x02, 0xc8, 0x00}, // INFO_LEVEL, channel 2
+	} {
+		cmd := byte(0x41)
+		if pl[0] == 0x06 {
+			cmd = 0x10
+		}
+		if ev, err := c.Decode(hmtest.Packet(0x01, 0x45, 0x10, 0xa4, cmd, scoAddr, central, pl...)); err == nil {
+			t.Errorf("payload %x: got %v, want an error", pl, ev)
+		}
+	}
+	if ev, err := c.Decode(hmtest.Packet(0x01, 0x45, 0x10, 0x80, 0x02, scoAddr, central, 0x01, 0x05, 0xc8, 0x00)); err == nil {
+		t.Errorf("ACK_STATUS for channel 5: got %v, want an error", ev)
+	}
 }

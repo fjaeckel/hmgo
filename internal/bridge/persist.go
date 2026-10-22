@@ -310,7 +310,7 @@ func (b *Bridge) checkAvailability(now time.Time) []ha.Message {
 				msgs = append(msgs, ha.DeviceAvailabilityMessage(topics, d.desc.Addr, online))
 			}
 		}
-		metricAvailable.WithLabelValues(d.desc.Addr, d.cfg.Name, d.cfg.Model).Set(boolFloat(online))
+		metricAvailable.WithLabelValues(d.desc.Addr, labelValue(d.cfg.Name), d.cfg.Model).Set(boolFloat(online))
 	}
 	for _, g := range b.groups {
 		online := false

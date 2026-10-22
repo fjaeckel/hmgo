@@ -60,8 +60,9 @@ type job struct {
 	seq    uint64 // assigned by the queue
 	kind   jobKind
 	dev    *device
-	// priority jobs (time responses) jump the queue: a device listens
-	// for the answer only briefly.
+	// priority jobs (time responses, pairing) jump the queue: a device
+	// listens for the answer only briefly. They run in the order they
+	// were pushed.
 	priority bool
 
 	action  climateAction
@@ -122,12 +123,40 @@ func (q *jobQueue) insert(j job) {
 		}
 	}
 	if j.priority {
-		q.order = append([]string{j.key}, q.order...)
+		// Priority jobs go before all other jobs, but behind the
+		// priority jobs queued before them (FIFO among themselves): an
+		// older time response or pairing step must not starve.
+		i := 0
+		for i < len(q.order) && q.jobs[q.order[i]].priority {
+			i++
+		}
+		q.order = append(q.order, "")
+		copy(q.order[i+1:], q.order[i:])
+		q.order[i] = j.key
 	} else {
 		q.order = append(q.order, j.key)
 	}
 	q.jobs[j.key] = j
 	metricQueueLength.Set(float64(len(q.order)))
+}
+
+// remove drops the queued job with key, if any, and returns it.
+func (q *jobQueue) remove(key string) (job, bool) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	j, ok := q.jobs[key]
+	if !ok {
+		return job{}, false
+	}
+	delete(q.jobs, key)
+	for i, k := range q.order {
+		if k == key {
+			q.order = append(q.order[:i], q.order[i+1:]...)
+			break
+		}
+	}
+	metricQueueLength.Set(float64(len(q.order)))
+	return j, true
 }
 
 func (q *jobQueue) wake() {
@@ -545,6 +574,9 @@ func (b *Bridge) applyUpdate(d *device, upd ha.State) {
 func isRetryable(err error) bool {
 	return errors.Is(err, uartgw.ErrNoResponse) ||
 		errors.Is(err, hm.ErrNoResponse) ||
+		// A forged plain ACK may have been taken for the answer; the
+		// device then did not get our AES answer and did nothing.
+		errors.Is(err, hm.ErrUnauthenticatedReply) ||
 		errors.Is(err, uartgw.ErrBusy) ||
 		errors.Is(err, uartgw.ErrNoCredits) ||
 		errors.Is(err, uartgw.ErrTimeout) ||

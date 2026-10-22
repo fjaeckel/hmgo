@@ -249,6 +249,12 @@ func (c *Contact) Decode(pkt *bidcos.Packet) (any, error) {
 	if err != nil {
 		return nil, err
 	}
+	if ev.Channel != Channel {
+		// The channel comes from the sender's payload: a frame for
+		// another channel is malformed or forged (it may even bypass a
+		// per-channel AES check).
+		return nil, fmt.Errorf("contact: frame for channel %d, but the contact has only channel %d", ev.Channel, Channel)
+	}
 	if !c.caps.Sabotage {
 		ev.HasError, ev.Sabotage = false, false
 	}

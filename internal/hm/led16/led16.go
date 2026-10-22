@@ -185,8 +185,12 @@ func (d *Display) RequestStatus(ctx context.Context, chn byte) (*Event, error) {
 	if d.BCS == nil {
 		return nil, hm.ErrNoSender
 	}
-	resp, err := d.BCS.Send(ctx, StatusRequestPacket(d.Addr, chn))
+	req := StatusRequestPacket(d.Addr, chn)
+	resp, err := d.BCS.Send(ctx, req)
 	if err != nil {
+		return nil, fmt.Errorf("%v: %w", &d.StandardDevice, err)
+	}
+	if err := d.CheckReplyAuth(req, resp); err != nil {
 		return nil, fmt.Errorf("%v: %w", &d.StandardDevice, err)
 	}
 	return power.DecodeStatusResponse(d.Addr, resp, DecodeStatus)

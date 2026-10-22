@@ -279,6 +279,67 @@ Robustness:
   the process exits for systemd to restart it. Module firmware ≤ 1.0.6
   is refused (`uartgw.ErrFirmwareTooOld`).
 
+## AES enforcement
+
+Anyone in radio range can send frames with a device's address, and
+neither radio module challenges every frame of an AES device: frames
+without BiDi (the device does not wait for a challenge), ACKs (cmd 0x02)
+and frames whose payload names a channel without AES pass with status
+0x01 (unauthenticated). The bridge therefore decides per frame
+(`internal/bridge/aes.go`); for a device with AES, an unauthenticated
+frame changes nothing unless it is:
+
+* DEVICE_INFO (0x00) or a time request (0x3F): never state; time
+  responses are rate-limited (below);
+* a KEY_EVENT/SENSOR_EVENT/INFO_LEVEL addressed to the central whose
+  channel (0x40/0x41: byte 0, 0x10 06: byte 1) exists and has no AES
+  (e.g. a remote with AES on some buttons only).
+
+Everything else is dropped and counted in
+`hmbridge_aes_rejected_total{reason}`: frames not addressed to the
+central (broadcasts and direct links can never be authenticated; like
+Homegear, `BidCoSPeer::packetReceived`), unsolicited ACK/ACK_STATUS
+(answers to our commands are consumed by `Send`), channels the device
+does not have, unauthenticated frames of AES channels (e.g. without
+BiDi) and frames that do not name their channel (e.g. a thermostat's
+INFO 0x10 0A). Real AES devices send their state to the central with
+BiDi, so it is challenged (DualConn challenges every BiDi frame of an
+AES peer whose channel is unknown; FHEM only challenges 0x40/0x41/0x10
+04/06, Homegear every non-ACK frame). Consequences: an AES thermostat's
+broadcasts (climate event 0x58, weather 0x70) were already ignored; with
+an HM-MOD-RPI-PCB, whose per-channel challenge rule is not documented, a
+frame of an AES device the module did not challenge is now ignored
+instead of applied. Remote long-press repeats (no BiDi) on AES buttons
+are dropped as before. Devices without AES are not affected. The
+decoders also reject channels the device does not have (contacts:
+channel 1 only; remotes: 1..buttons).
+
+**Answers to our commands.** `hm.StandardDevice.CheckReplyAuth`: the
+ACK/ACK_STATUS to a command for an AES channel (SET 0x11: byte 1, CONFIG
+0x01: byte 0) must be authenticated: a real device challenges such a
+command, so its final ACK is (HM-MOD-RPI-PCB 0x0C; DualConn checks the
+auth bytes). A plain ACK fails the command
+(`hm.ErrUnauthenticatedReply`, retried). Like Homegear (`validAesAck`
+for 0x02 only) and FHEM, the INFO_LEVEL answer to a status request is
+not required to be authenticated: a forger racing the device can still
+fake one poll result (no action on the device; the next event or poll
+corrects it). DualConn answers a device's challenge only with the
+configured key index of that peer (also shortly after RemovePeer, for
+unpairing), never with another key, e.g. the default key (index 0).
+
+**Duty cycle.** DualConn sends at most 10 AES challenges (new and
+re-sent ones) per peer and 10 s, and software ACKs from a per-peer
+token bucket (10, refilled with 1/s; AES-verified final ACKs are not
+limited); the bridge answers at most 2 time requests per device at
+once, then one per minute. Refusals are counted in
+`hmbridge_uartgw_dual_rate_limited_total{kind}` and
+`hmbridge_rate_limited_total{kind="time_response"}`. The module's duty
+cycle: `hmbridge_uartgw_duty_cycle_percent` (HM-MOD-RPI-PCB) and
+`hmbridge_uartgw_dual_trx_status` (RPI-RF-MOD, meaning unconfirmed).
+Log lines anyone can trigger (failed AES, undecodable frames, unknown
+senders, dropped frames) are rate-limited per kind (`internal/ratelog`:
+10 resp. 5 per minute, then one summary line).
+
 ## Other device families
 
 Layouts from eQ-3's device descriptions (rftypes XML, as shipped with
@@ -354,14 +415,21 @@ Hm-Mod-Rpi-Pcb.cpp, and eQ-3's device descriptions as shipped with Homegear
 only, no code copied.
 
 **Flow.** Pairing mode (HA button `hmbridge/bridge/set/pair`, status page
-POST `/pairing/start` with a same-origin check, default 60 s) is state of
-the event loop. A DEVICE_INFO (cmd 0x00: `fw model(2) serial(10) class
-peer-channels…`) while it is on becomes a priority radio job, so it runs
-while the device is still in config mode:
+POST `/pairing/start` with a same-origin check and the page's random
+per-process token, default 60 s) is state of the event loop. A DEVICE_INFO
+(cmd 0x00: `fw model(2) serial(10) class peer-channels…`) while it is on
+becomes a priority radio job, so it runs while the device is still in
+config mode. Priority jobs run before all others, FIFO among themselves;
+a pair job drops a queued unpair job of the same address and vice
+versa. Before anything is sent, the sender is checked: 000000, FFFFFF and
+the central's own address are refused (`invalid_source`), as are other
+models (or serials) at the address of a configured, paired or kept
+devices-file entry. Rejections are rate-limited in the log (one line per
+kind and minute):
 
 | step | messages (flags 0xA0 BIDI\|RPTEN, each ACKed `02 00`) |
 |---|---|
-| register | `AddPeer` (key index 0, no AES) |
+| register | `AddPeer` (key index 0, no AES; the current index for a device already paired to our address, see below) |
 | central address | `01 00 05 000000 00 00` (CONFIG_START ch 0 list 0), `01 00 08 02 01 0A hh 0B mm 0C ll` (WRITE_INDEX; reg 02 = 0x81 for models with INTERNAL_KEYS_VISIBLE: switch, dimmer), `01 00 06` (CONFIG_END) |
 | key exchange (pairing.aes system_key, AES-capable model, key index > 0) | `04` × 2, see below; the device answers each with an AES challenge with its old key (index 0), which the radio layer answers |
 | AES_ACTIVE (channels with aes_default in eQ-3's descriptions: contacts ch 1, PB-2-WM55 ch 1-2, RC-8 ch 1-8) | per channel `01 ch 05 000000 00 01`, `01 ch 08 08 01`, `01 ch 06` |
@@ -375,16 +443,35 @@ status request. Pairing mode then ends (one device at a time). A DEVICE_INFO
 from a known address (config.json or devices file, same model) only gets
 the central address sequence (“already known”: devices from OpenCCU share
 our address and key); one addressed to another central, an unsupported model
-ID, or a different model at a configured address are rejected.
+ID, or a different model at a configured address are rejected. A DEVICE_INFO
+addressed to our central from an address that is *not* configured comes
+from a device paired to this central before (OpenCCU, or hmbridge before an
+unpairing the device never confirmed): it is not factory-new, so it gets no
+key exchange; it is assumed to use the current system key (stored key
+index, AES_ACTIVE as for a new device), which the result says.
+
+**Key hand-out (pairing.aes `system_key`, the default like OpenCCU).** The
+key exchange gives the system key to whatever device announced itself,
+encrypted only with the publicly known eQ-3 default key: an attacker in
+radio range who answers in time, or records the exchange, learns it.
+hmbridge therefore logs every hand-out (`KEY HAND-OUT`, with address, model,
+serial and RSSI) and appends serial and RSSI to the last pairing result in
+Home Assistant. A key exchange whose part 2 was not acknowledged (no
+answer, not a NACK) leaves the device's key unknown; the result says so
+(stored as index 0, AES off) instead of asserting the default key.
 
 **Unpair** (HA button `set/unpair`, only devices from the devices file):
-the device is removed from registry, devices file, HA (empty retained
-discovery/state/name) and the module (`RemovePeer`), then gets the central
-address sequence with 000000 and reg 02 = 00 (Homegear `unpair`); always
-listening devices at once, wake-on-radio thermostats with burst (flags 0xB0),
-config-only devices (contacts, buttons, remotes, weather sensors) when their
-next DEVICE_INFO arrives within the pairing duration. Homegear's factory
-reset (`11 04 00`) is not used.
+the device is removed from registry, devices file and HA (empty retained
+discovery/state/name), then gets the central address sequence with 000000
+and reg 02 = 00 (Homegear `unpair`); always listening devices at once,
+wake-on-radio thermostats with burst (flags 0xB0), config-only devices
+(contacts, buttons, remotes, weather sensors) when their next DEVICE_INFO
+(same model) arrives within the pairing duration. The radio module peer
+(`RemovePeer`) is removed only after the unpair messages were sent (also
+when they failed), or when the wait for the config button ended: the
+module needs the device's key index and AES channels to answer its AES
+challenges. Clean-up after a failed or timed-out job uses a fresh 5 s
+context. Homegear's factory reset (`11 04 00`) is not used.
 
 **Devices file** (`devices.json`, see **Persistence**): written only on
 pair/unpair/rename, synchronously but outside `b.mu` (a snapshot is taken

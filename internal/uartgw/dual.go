@@ -44,6 +44,7 @@ import (
 	"time"
 
 	bidcosaes "github.com/fjaeckel/hmgo/internal/bidcos/aes"
+	"github.com/fjaeckel/hmgo/internal/ratelog"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
@@ -177,12 +178,20 @@ const (
 	// receive our challenge); each re-send extends the hold by
 	// aesHoldTimeout.
 	maxChallengeResends = 3
-	// At most challengeRateLimit new AES challenges are sent per peer
-	// within challengeRateWindow; further messages needing one are
-	// dropped. This protects the module's 1% duty cycle against spoofed
-	// frames (anyone can send frames with a peer's address).
+	// At most challengeRateLimit AES challenges (new and re-sent ones)
+	// are sent per peer within challengeRateWindow; further messages
+	// needing one are dropped. This protects the module's 1% duty cycle
+	// against spoofed frames (anyone can send frames with a peer's
+	// address).
 	challengeRateLimit  = 10
 	challengeRateWindow = 10 * time.Second
+	// Software ACKs are limited per peer by a token bucket: ackBurst
+	// ACKs at once, refilled with one per ackRefill (10 per 10s in the
+	// long run). Real devices send far less (a few messages a minute; a
+	// remote's key presses, each retransmitted at most a few times).
+	// AES-verified final ACKs are not limited (they cannot be forged).
+	ackBurst  = 10
+	ackRefill = time.Second
 )
 
 // AESSigner implements the BidCoS AES computations (software AES; see
@@ -249,6 +258,7 @@ var (
 				"aes_timeout, aes_superseded (another message with the counter of a held one; the held one failed), " +
 				"aes_duplicate (retransmission of an authenticated message, acknowledged again), " +
 				"aes_stray_answer (AES answer without a pending challenge, dropped), aes_challenge_received, " +
+				"aes_wrong_key_index (a device's challenge to our message names another key index than the configured one: not answered), " +
 				"response_timeout, retransmit, oneshot_failed (software ACK or challenge not transmitted: LLMAC_ACK error, DUAL_ERR, no free counter), " +
 				"reply_scheduled, reply_late (sent at once: the host was too slow to schedule it), hmip_ignored (Homematic IP frame, " +
 				"not used for BidCoS), hmip_dropped (Homematic IP frame not passed on: handler too slow), trx_poll_failed.",
@@ -272,11 +282,36 @@ var (
 			Help:      "Radio module kind, announced application and (RPI-RF-MOD) SGTIN (always 1).",
 		},
 		[]string{"kind", "app", "sgtin"})
+
+	dualRateLimited = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Subsystem: metricsSubsystem,
+			Name:      "dual_rate_limited_total",
+			Help: "RPI-RF-MOD: transmissions the host did not make because a per-peer rate limit protecting the 1% duty " +
+				"cycle was reached (anyone can send frames with a peer's address), by kind: aes_challenge (new or re-sent " +
+				"AES challenge; the message is dropped), software_ack (ACK not sent).",
+		},
+		[]string{"kind"})
 )
 
 func init() {
-	prometheus.MustRegister(dualEvents, dualTRXStatus, moduleInfo)
+	prometheus.MustRegister(dualEvents, dualTRXStatus, moduleInfo, dualRateLimited)
+	for _, k := range []string{rateKindChallenge, rateKindAck} {
+		dualRateLimited.WithLabelValues(k)
+	}
 }
+
+// Kinds of dual_rate_limited_total.
+const (
+	rateKindChallenge = "aes_challenge"
+	rateKindAck       = "software_ack"
+)
+
+// floodLog rate-limits the log lines anyone in radio range can trigger
+// (failed or unanswered AES challenges with forged frames, floods). Also
+// used by Conn.
+var floodLog = ratelog.New(5, time.Minute)
 
 // dualReq is an outstanding request, matched by frame counter.
 type dualReq struct {
@@ -406,8 +441,13 @@ type DualConn struct {
 	held         map[aesKey]*heldMsg
 	authed       map[aesKey]aesDone      // recently authenticated messages
 	challenges   map[[3]byte][]time.Time // recent challenges per peer (rate limit)
+	acks         map[[3]byte]tokenBucket // software ACK budget per peer
 	seen         map[aesKey]rxSeen       // recent messages to us, by sender and message counter
 	peers        map[[3]byte]Peer
+	// removedKeys keeps the key index of removed peers: unpairing
+	// removes the peer before it sends the device its last messages,
+	// which the device may challenge.
+	removedKeys  map[[3]byte]byte
 	clockTs      uint16    // module time of the last LLMAC_RECV …
 	clockAt      time.Time // … and the local time it was read
 	clockValid   bool
@@ -492,8 +532,10 @@ func openDual(rw io.ReadWriter, cfg Config, p *framePump, d detection) (*DualCon
 		held:         make(map[aesKey]*heldMsg),
 		authed:       make(map[aesKey]aesDone),
 		challenges:   make(map[[3]byte][]time.Time),
+		acks:         make(map[[3]byte]tokenBucket),
 		seen:         make(map[aesKey]rxSeen),
 		peers:        make(map[[3]byte]Peer),
+		removedKeys:  make(map[[3]byte]byte),
 		recv:         make(chan []byte, recvBufferSize),
 	}
 	if c.timeout <= 0 {
@@ -922,7 +964,7 @@ func (c *DualConn) sendOneshot(msg []byte, opts [3]byte, what string) {
 	cnt, err := c.nextCnt()
 	if err != nil {
 		c.mu.Unlock()
-		log.Printf("uartgw: dropping %s: %v", what, err)
+		floodLog.Logf(log.Printf, "oneshot_dropped", "uartgw: dropping %s: %v", what, err)
 		dualEvents.WithLabelValues("oneshot_failed").Inc()
 		c.ackTimeout(err)
 		return
@@ -931,7 +973,7 @@ func (c *DualConn) sendOneshot(msg []byte, opts [3]byte, what string) {
 	c.mu.Unlock()
 	f := frame{dst: dstLLMAC, cnt: cnt, cmd: llmacSend, payload: llmacSendPayload(opts, msg)[1:]}
 	if err := c.enqueue(context.Background(), f, true); err != nil {
-		log.Printf("uartgw: dropping %s: %v", what, err)
+		floodLog.Logf(log.Printf, "oneshot_dropped", "uartgw: dropping %s: %v", what, err)
 		c.mu.Lock()
 		delete(c.oneshots, cnt)
 		c.mu.Unlock()
@@ -1197,7 +1239,7 @@ func (c *DualConn) deliverLocked(b []byte) {
 	case c.recv <- b:
 	default:
 		recvDropped.Inc()
-		log.Printf("uartgw: consumer too slow, dropping received frame %x", b)
+		floodLog.Logf(log.Printf, "recv_dropped", "uartgw: consumer too slow, dropping received frame %x", b)
 	}
 }
 
@@ -1293,12 +1335,49 @@ func (c *DualConn) challengeAllowedLocked(dev [3]byte, now time.Time) bool {
 	return true
 }
 
+// tokenBucket is a simple token bucket (see ackBurst, ackRefill).
+type tokenBucket struct {
+	tokens float64
+	at     time.Time
+}
+
+// take refills b up to burst (one token per refill since b.at) and
+// takes a token if one is left.
+func (b *tokenBucket) take(now time.Time, burst int, refill time.Duration) bool {
+	if b.at.IsZero() {
+		b.tokens = float64(burst)
+	} else if d := now.Sub(b.at); d > 0 {
+		b.tokens += float64(d) / float64(refill)
+		if b.tokens > float64(burst) {
+			b.tokens = float64(burst)
+		}
+	}
+	b.at = now
+	if b.tokens < 1 {
+		return false
+	}
+	b.tokens--
+	return true
+}
+
+// ackAllowedLocked applies the per-peer software ACK budget (ackBurst,
+// ackRefill) and counts a refusal. c.mu must be held.
+func (c *DualConn) ackAllowedLocked(dev [3]byte, now time.Time) bool {
+	b := c.acks[dev]
+	ok := b.take(now, ackBurst, ackRefill)
+	c.acks[dev] = b
+	if !ok {
+		dualRateLimited.WithLabelValues(rateKindAck).Inc()
+	}
+	return ok
+}
+
 func (c *DualConn) handleRecv(f frame) {
 	// LLMAC_RECV payload after the command: ts_hi ts_lo info rssi msg…
 	// (from RFNETHM route_llmac_recv_to_fhem; capture)
 	p := f.payload
 	if len(p) < 4+minMsgLen {
-		log.Printf("uartgw: dropping short LLMAC_RECV: %v", f)
+		floodLog.Logf(log.Printf, "short_recv", "uartgw: dropping short LLMAC_RECV: %v", f)
 		return
 	}
 	ts := uint16(p[0])<<8 | uint16(p[1])
@@ -1345,10 +1424,14 @@ func (c *DualConn) handleRecv(f frame) {
 		}
 		if a, ok := c.authedLocked(k, now); ok {
 			// We verified this answer already, but the device missed our
-			// final ACK: acknowledge it again.
+			// final ACK: acknowledge it again (a replayed answer could be
+			// sent by anyone: budgeted).
+			allowed := c.ackAllowedLocked(src, now)
 			c.mu.Unlock()
 			dualEvents.WithLabelValues("aes_duplicate").Inc()
-			c.sendReply(c.ackMsg(msgcnt, src, a.auth), ts, "software_ack")
+			if allowed {
+				c.sendReply(c.ackMsg(msgcnt, src, a.auth), ts, "software_ack")
+			}
 			return
 		}
 		c.mu.Unlock()
@@ -1366,10 +1449,13 @@ func (c *DualConn) handleRecv(f frame) {
 		case w.ch <- rxMsg{frame: recvFrame(recvResp, info, rssi, msg), ts: ts}:
 		default:
 		}
-		c.mu.Unlock()
 		// e.g. a BiDi config read response (INFO 0x10) needs our ACK;
-		// it is not challenged (Send's caller asked for it).
-		if wantAck {
+		// it is not challenged (Send's caller asked for it; the caller
+		// requires AES authentication where it matters, e.g. for the
+		// ACK of a command on an AES channel, see hm.CheckReplyAuth).
+		ack := wantAck && c.ackAllowedLocked(src, now)
+		c.mu.Unlock()
+		if ack {
 			c.sendReply(c.ackMsg(msgcnt, src, nil), ts, "software_ack")
 		}
 		return
@@ -1385,19 +1471,34 @@ func (c *DualConn) handleRecv(f frame) {
 			h.timer.Stop()
 			delete(c.held, k)
 			dualEvents.WithLabelValues("aes_superseded").Inc()
-			log.Printf("uartgw: %X sent another message with the counter of one awaiting our AES challenge (%x), dropping the challenge", src, h.msg)
+			floodLog.Logf(log.Printf, "aes_superseded", "uartgw: %X sent another message with the counter of one awaiting our AES challenge (%x), dropping the challenge", src, h.msg)
 			c.deliverLocked(recvFrame(recvRespWithAESKO, h.info, h.rssi, h.msg))
 		}
 		if h := c.held[k]; h != nil {
 			// A retransmission: the device did not get our challenge (or
 			// its answer was lost). Challenge again, with the same
-			// challenge, and extend the hold (bounded).
-			if c.signer == nil || h.resends >= maxChallengeResends || !h.timer.Stop() {
+			// challenge, and extend the hold (bounded). Re-sent
+			// challenges count towards the rate limit like new ones
+			// (anyone can repeat a held message).
+			if c.signer == nil || h.resends >= maxChallengeResends {
 				c.mu.Unlock()
 				if c.debug {
 					log.Printf("uartgw: ignoring retransmission while challenging: %x", msg)
 				}
 				return
+			}
+			if !c.challengeAllowedLocked(src, now) {
+				c.mu.Unlock()
+				dualEvents.WithLabelValues("aes_challenge_rate_limited").Inc()
+				dualRateLimited.WithLabelValues(rateKindChallenge).Inc()
+				if c.debug {
+					log.Printf("uartgw: AES challenge rate limit for %X reached, not challenging the retransmission %x again", src, msg)
+				}
+				return
+			}
+			if !h.timer.Stop() {
+				c.mu.Unlock()
+				return // timing out right now
 			}
 			h.resends++
 			h.timer = time.AfterFunc(c.aesHoldTimeout, func() { c.aesTimeout(k, h) })
@@ -1408,10 +1509,13 @@ func (c *DualConn) handleRecv(f frame) {
 		}
 		if a, ok := c.authedLocked(k, now); ok && sameMsg(a.msg, msg) {
 			// Authenticated and delivered already; the device missed our
-			// final ACK.
+			// final ACK (or someone replays the message: budgeted).
+			allowed := c.ackAllowedLocked(src, now)
 			c.mu.Unlock()
 			dualEvents.WithLabelValues("aes_duplicate").Inc()
-			c.sendReply(c.ackMsg(msgcnt, src, a.auth), ts, "software_ack")
+			if allowed {
+				c.sendReply(c.ackMsg(msgcnt, src, a.auth), ts, "software_ack")
+			}
 			return
 		}
 		if c.signer == nil {
@@ -1427,6 +1531,7 @@ func (c *DualConn) handleRecv(f frame) {
 		if !c.challengeAllowedLocked(src, now) {
 			c.mu.Unlock()
 			dualEvents.WithLabelValues("aes_challenge_rate_limited").Inc()
+			dualRateLimited.WithLabelValues(rateKindChallenge).Inc()
 			if c.debug {
 				log.Printf("uartgw: AES challenge rate limit for %X reached, dropping %x", src, msg)
 			}
@@ -1447,10 +1552,16 @@ func (c *DualConn) handleRecv(f frame) {
 		return
 	}
 
-	// 4. Everything else.
+	// 4. Everything else, including frames of AES peers which cannot be
+	// authenticated: frames without BiDi (the device does not wait for
+	// a challenge), ACKs and frames on channels without AES. They are
+	// delivered with status 0x01 (unauthenticated); the bridge decides
+	// whether such a frame of an AES device may change any state (it
+	// may not, except on its channels without AES).
 	c.deliverLocked(recvFrame(recvResp, info, rssi, msg))
+	ack := wantAck && c.ackAllowedLocked(src, now)
 	c.mu.Unlock()
-	if wantAck {
+	if ack {
 		c.sendReply(c.ackMsg(msgcnt, src, nil), ts, "software_ack")
 	}
 }
@@ -1492,7 +1603,7 @@ func (c *DualConn) finishAES(src [3]byte, h *heldMsg, payload []byte, ts uint16)
 		dualEvents.WithLabelValues("aes_ok").Inc()
 	} else {
 		dualEvents.WithLabelValues("aes_failed").Inc()
-		log.Printf("uartgw: AES authentication of %X failed (message %x)", src, h.msg)
+		floodLog.Logf(log.Printf, "aes_failed", "uartgw: AES authentication of %X failed (message %x)", src, h.msg)
 	}
 	c.mu.Lock()
 	if ok {
@@ -1518,7 +1629,7 @@ func (c *DualConn) aesTimeout(k aesKey, h *heldMsg) {
 	}
 	delete(c.held, k)
 	dualEvents.WithLabelValues("aes_timeout").Inc()
-	log.Printf("uartgw: %X did not answer our AES challenge (message %x)", k.src, h.msg)
+	floodLog.Logf(log.Printf, "aes_timeout", "uartgw: %X did not answer our AES challenge (message %x)", k.src, h.msg)
 	c.deliverLocked(recvFrame(recvRespWithAESKO, h.info, h.rssi, h.msg))
 }
 
@@ -1858,6 +1969,7 @@ func (c *DualConn) AddPeer(ctx context.Context, p Peer) error {
 	cp.AESChannels = append([]byte(nil), p.AESChannels...)
 	c.mu.Lock()
 	c.peers[p.Addr] = cp
+	delete(c.removedKeys, p.Addr)
 	c.mu.Unlock()
 	if c.peerInit == nil {
 		return nil
@@ -1876,9 +1988,26 @@ func (c *DualConn) RemovePeer(ctx context.Context, addr [3]byte) error {
 		return err
 	}
 	c.mu.Lock()
+	if p, ok := c.peers[addr]; ok {
+		if len(c.removedKeys) >= 64 {
+			clear(c.removedKeys)
+		}
+		c.removedKeys[addr] = p.KeyIndex
+	}
 	delete(c.peers, addr)
+	delete(c.acks, addr)
 	c.mu.Unlock()
 	return nil
+}
+
+// peerKeyIndex returns the key index configured for dev (Peer.KeyIndex,
+// also shortly after RemovePeer). c.mu must be held.
+func (c *DualConn) peerKeyIndexLocked(dev [3]byte) (byte, bool) {
+	if p, ok := c.peers[dev]; ok {
+		return p.KeyIndex, true
+	}
+	k, ok := c.removedKeys[dev]
+	return k, ok
 }
 
 // HostKeyExchange reports whether the host must encrypt AES key
@@ -2082,6 +2211,22 @@ func (c *DualConn) answerChallenge(ctx context.Context, msg []byte, chal rxMsg, 
 	keyIndex, challenge, ok := bidcosaes.ParseChallenge(p)
 	if !ok {
 		return nil, fmt.Errorf("%w: malformed AES challenge %x", ErrAESFailed, chal.frame[3+minMsgLen:])
+	}
+	// Only answer with the key the device is configured to use: the
+	// challenge may be forged (anyone can send one with the device's
+	// address and our message counter), and answering it with any key
+	// we hold, e.g. the publicly known eQ-3 default key (index 0),
+	// would sign our message for an attacker.
+	c.mu.Lock()
+	want, known := c.peerKeyIndexLocked(w.dev)
+	c.mu.Unlock()
+	if !known || keyIndex != want {
+		dualEvents.WithLabelValues("aes_wrong_key_index").Inc()
+		if !known {
+			return nil, fmt.Errorf("%w: AES challenge from %X, which is not a registered peer", ErrAESFailed, w.dev)
+		}
+		floodLog.Logf(log.Printf, "aes_key_index", "uartgw: %X challenged us with key index %d, but uses key index %d; not answering (if the device really uses key index %d, set key_index)", w.dev, keyIndex, want, keyIndex)
+		return nil, fmt.Errorf("%w: AES challenge for key index %d, but the device uses key index %d", ErrAESFailed, keyIndex, want)
 	}
 	var r [16]byte
 	var wantAuth []byte

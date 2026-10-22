@@ -174,10 +174,16 @@ On a Raspberry Pi OS Lite installation:
    (Pi 3/4/Zero 2: gives the module the full PL011 UART on GPIO 14/15).
 2. Remove `console=serial0,115200` from `/boot/firmware/cmdline.txt` and run
    `sudo systemctl disable --now hciuart`.
-3. Install the binary to `/usr/local/bin/hmbridge`, the config to
-   `/etc/hmbridge/config.json`, and `contrib/systemd/hmbridge.service` to
-   `/etc/systemd/system/`. Create the user:
+3. Create the user:
    `sudo useradd --system --no-create-home --groups dialout,gpio hmbridge`.
+   Install the binary to `/usr/local/bin/hmbridge`, the config readable only
+   by root and hmbridge (it holds the AES system key and the MQTT password):
+   `sudo install -d -m 0750 -o root -g hmbridge /etc/hmbridge` and
+   `sudo install -m 0640 -o root -g hmbridge config.json /etc/hmbridge/config.json`,
+   and `contrib/systemd/hmbridge.service` to `/etc/systemd/system/`. hmbridge
+   warns (log, status page, `-check_config`, metric
+   `hmbridge_config_insecure_permissions`) if the config file is readable
+   by other users or groups, writable by its group, or owned by another user.
 4. A Raspberry Pi has no battery-backed clock. Make sure NTP works
    (`timedatectl` shows "System clock synchronized: yes"); hmbridge only hands
    out the time to the devices once it is. Optionally
@@ -191,8 +197,23 @@ Keep the default `"serial_port": "/dev/serial0"` and `"reset": "gpio"` (the
 module's reset line is GPIO 18).
 
 The status page and `/metrics` listen on all interfaces (`:8013`) so that
-Prometheus can scrape them. They contain no secrets, but they do show device
-names and addresses; set `"http_listen": "127.0.0.1:8013"` to keep them local.
+Prometheus can scrape them. They contain no keys or passwords, but they are
+not harmless: they show every device's name, model, address, serial
+number, state and battery level (which windows are open, whether someone is
+home), and the status page can **start pairing mode** (button "Pair new
+device"). The button needs a random token embedded in the page and a
+request from the page itself, so other web sites cannot press it in your
+browser; anyone who can open the page on your network can. Set
+`"http_listen": "127.0.0.1:8013"` to keep it local (and scrape through an
+SSH tunnel or a local Prometheus agent), or restrict port 8013 in your
+firewall.
+
+Requests must name hmbridge in their `Host` header: an IP address,
+`localhost`, the machine's host name (also `<name>.local`), or a name listed
+in `"http_allowed_hosts": ["hmbridge.example.lan"]` (e.g. behind a reverse
+proxy; `"*"` accepts any name). Other names get "421 Misdirected Request".
+This stops DNS rebinding, where a web site you visit re-points its own name
+to hmbridge's address to read the status page from your browser.
 
 ## 4. Home Assistant
 
@@ -299,6 +320,9 @@ is no longer needed for that. Supported are the models in the
    device** (or press the button on the status page, port 8013). Pairing mode
    stays on for 60 seconds (`pairing.duration`); the sensors "Pairing mode",
    "Pairing time remaining" and "Last pairing result" show what happens.
+   Anyone who can publish to the MQTT topic `hmbridge/bridge/set/pair` (any
+   MQTT user with write access to `hmbridge/#`) or open the status page can
+   start pairing mode too: give MQTT write access only to Home Assistant.
 2. Put the device into pairing mode: press its config button (usually a short
    press; the LED blinks), as described in its manual. Battery devices stay
    awake while their LED blinks.
@@ -312,6 +336,25 @@ is no longer needed for that. Supported are the models in the
    which also renames it in hmbridge's logs and metrics.
 
 Pairing mode ends after one device (one at a time) or when the time is up.
+
+**Pairing hands out your system security key.** With `pairing.aes`
+`"system_key"` (the default with a `security` block, like OpenCCU), the
+device that announces itself while pairing mode is on receives the system
+key, encrypted only with the eQ-3 default key, which is public. Someone
+within radio range who records the exchange, or whose own transmitter
+announces itself first, gets your key, and with it can forge messages of
+all your AES devices. So:
+
+* pair AES devices only when nobody suspicious is within radio range, and
+  keep pairing mode short (press the device's config button right away);
+* check every result: hmbridge logs each hand-out (`pairing: KEY HAND-OUT:
+  … serial …, RSSI … dBm`) and appends `system key handed out to serial …
+  at RSSI … dBm` to "Last pairing result". If the serial is not the one on
+  your device's label, or you did not pair anything, assume the key is
+  known: change it (as in OpenCCU) and re-key your devices;
+* `"pairing": {"aes": "off"}` pairs without giving out the key (devices then
+  stay on the default key, without AES).
+
 Messages you may see as the last result:
 
 | result | meaning |
@@ -320,7 +363,11 @@ Messages you may see as the last result:
 | `… has model ID XXXX, which hmbridge does not support` | Not a supported model. |
 | `… is paired to another central (…)` | The device belongs to another CCU. Factory-reset it (see its manual) or delete it in that CCU first. |
 | `pairing … failed: … NACK` | The device refused the configuration; factory-reset it and try again. |
-| `… AES key exchange failed …` | The device was paired but keeps the eQ-3 default key, without AES. Unpair it, factory-reset it and pair it again. |
+| `… AES key exchange failed …` | The device was paired but keeps its previous key (normally the eQ-3 default key), without AES. Unpair it, factory-reset it and pair it again. |
+| `… part 2 was not confirmed …` | The device did not acknowledge the second half of the key; it may use the system key or still the default key. Stored without AES and with key index 0; if commands to it fail, unpair, factory-reset and pair it again. |
+| `… paired to this central address already, so it is assumed to use the system key …` | The device was paired to your central before (OpenCCU, or hmbridge before an unpairing it never confirmed) and is not in `config.json`: it was not given the key again. If its messages fail AES authentication, factory-reset and pair it again. |
+| `ignoring DEVICE_INFO from 000000 / ffffff / <central>` | A spoofed announcement (no real device has these addresses); nothing was sent. |
+| `… has the address of …` | Another model claims the address of a configured or paired device; nothing was sent. |
 
 Paired devices are stored in `devices.json` in `state_dir` (default
 `/var/lib/hmbridge/devices.json`, see section 4, *Persistence*), which hmbridge
@@ -346,7 +393,10 @@ switches, dimmers and the LED display immediately, thermostats with a wake-up
 burst. Window contacts, buttons, remotes and weather sensors only listen in
 config mode: press their config button within the pairing duration after
 Unpair. Devices from `config.json` cannot be unpaired from Home Assistant;
-remove them from `config.json`.
+remove them from `config.json`. To pair a contact, button, remote
+or weather sensor again while hmbridge still waits for it to confirm the
+unpairing, start pairing mode and press its config button **twice**: the
+first press completes the unpairing, the second one pairs it again.
 
 **Before relying on it: check with a capture.** hmbridge's pairing follows
 the protocol as documented by FHEM and Homegear, but has not been compared with

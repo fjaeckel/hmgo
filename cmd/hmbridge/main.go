@@ -56,7 +56,12 @@ var buildInfo = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 	Help: "Build information (always 1).",
 }, []string{"version", "goversion"})
 
-func init() { prometheus.MustRegister(buildInfo) }
+var configInsecure = prometheus.NewGauge(prometheus.GaugeOpts{
+	Namespace: "hmbridge", Name: "config_insecure_permissions",
+	Help: "1 if the configuration file (AES system key, MQTT password) is readable by other users or owned by another user (see the log).",
+})
+
+func init() { prometheus.MustRegister(buildInfo, configInsecure) }
 
 func main() {
 	flag.Parse()
@@ -78,6 +83,9 @@ func main() {
 		fmt.Printf("%s: OK (%d devices, %d groups)\n", *configPath, len(cfg.Devices), len(cfg.Groups))
 		for _, m := range cfg.Deprecations() {
 			fmt.Printf("warning: %s\n", m)
+		}
+		for _, m := range cfg.PermissionWarnings() {
+			fmt.Printf("WARNING: %s\n", m)
 		}
 		if d := cfg.StateDirPath(); d != "" {
 			fmt.Printf("state directory: %s\n", d)
@@ -128,6 +136,11 @@ func run(ctx context.Context, cfg *config.Config, uart io.ReadWriteCloser) error
 	for _, m := range cfg.Deprecations() {
 		log.Printf("config: %s", m)
 	}
+	permWarnings := cfg.PermissionWarnings()
+	for _, m := range permWarnings {
+		log.Printf("WARNING: config: %s", m)
+	}
+	configInsecure.Set(boolGauge(len(permWarnings) > 0))
 	st := store.OpenConfig(cfg, log.Printf)
 	if d := st.Dir(); d != "" {
 		log.Printf("state directory: %s", d)
@@ -149,19 +162,25 @@ func run(ctx context.Context, cfg *config.Config, uart io.ReadWriteCloser) error
 	if addr := cfg.HTTPListenAddr(); addr != "" {
 		mux := http.NewServeMux()
 		mux.Handle("/metrics", promhttp.Handler())
-		mux.Handle("/", b.StatusHandler(bridge.Info{
-			"version":  version(),
-			"module":   conn.Kind(),
-			"firmware": conn.FirmwareVersion(),
-			"serial":   conn.SerialNumber(),
+		mux.Handle("/", b.StatusPage(bridge.StatusOptions{
+			Info: bridge.Info{
+				"version":  version(),
+				"module":   conn.Kind(),
+				"firmware": conn.FirmwareVersion(),
+				"serial":   conn.SerialNumber(),
+			},
+			Warnings: permWarnings,
 		}))
-		srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+		// Every request (status page, JSON, /metrics) must name hmbridge
+		// in its Host header (DNS rebinding).
+		srv := newHTTPServer(bridge.NewHostAllowlist(addr, cfg.HTTPAllowedHosts).Handler(mux))
 		// Listen before serving in the background: an address that
 		// cannot be bound is a startup error, not a log line.
 		ln, err := net.Listen("tcp", addr)
 		if err != nil {
 			return fmt.Errorf("http_listen: %w", err)
 		}
+		ln = limitListener(ln, httpMaxConns)
 		go func() {
 			if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				log.Printf("HTTP server: %v", err)
@@ -354,4 +373,11 @@ func openUART(cfg *config.Config) (*os.File, error) {
 		return nil, ctlErr
 	}
 	return uart, nil
+}
+
+func boolGauge(v bool) float64 {
+	if v {
+		return 1
+	}
+	return 0
 }

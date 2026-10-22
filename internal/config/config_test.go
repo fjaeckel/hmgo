@@ -4,6 +4,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -512,5 +513,17 @@ func TestPairingAndDevicesFile(t *testing.T) {
 	}
 	if c := cfg.ConfiguredDevice([3]byte{0x38, 0xf5, 0x9c}, ""); c == nil {
 		t.Error("ConfiguredDevice by address")
+	}
+}
+
+func TestHTTPAllowedHosts(t *testing.T) {
+	cfg, err := Parse([]byte(`{"central_address": "1A2B3C", "devices": [], "http_allowed_hosts": [" hmbridge.lan ", "*"]}`))
+	if err != nil || fmt.Sprint(cfg.HTTPAllowedHosts) != "[hmbridge.lan *]" {
+		t.Errorf("%v %v", cfg, err)
+	}
+	for _, bad := range []string{`""`, `"http://x"`, `"a b"`} {
+		if _, err := Parse([]byte(`{"central_address": "1A2B3C", "devices": [], "http_allowed_hosts": [` + bad + `]}`)); err == nil || !strings.Contains(err.Error(), "http_allowed_hosts") {
+			t.Errorf("%s: %v", bad, err)
+		}
 	}
 }

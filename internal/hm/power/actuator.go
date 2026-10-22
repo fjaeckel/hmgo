@@ -352,6 +352,9 @@ func requestStatus[E any](ctx context.Context, sd *hm.StandardDevice, pkt *bidco
 	if err != nil {
 		return zero, fmt.Errorf("%v: %w", sd, err)
 	}
+	if err := sd.CheckReplyAuth(pkt, resp); err != nil {
+		return zero, fmt.Errorf("%v: %w", sd, err)
+	}
 	return DecodeStatusResponse(sd.Addr, resp, decode)
 }
 

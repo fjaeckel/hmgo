@@ -111,9 +111,11 @@ func bridgeEntities() []entity {
 			"value_template": textTemplate("status", "None"),
 		}},
 		{component: "sensor", key: "pairing_last_result", config: map[string]any{
-			"name":           "Last pairing result",
-			"icon":           "mdi:message-text-outline",
-			"value_template": "{{ value_json.last_result if value_json.last_result else 'None' }}",
+			"name": "Last pairing result",
+			"icon": "mdi:message-text-outline",
+			// HA refuses states longer than 255 characters; the full
+			// text is on the status page and in the log.
+			"value_template": "{{ (value_json.last_result if value_json.last_result else 'None')[:255] }}",
 		}},
 	}
 }

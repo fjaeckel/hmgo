@@ -7,11 +7,14 @@ import (
 	"bytes"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -121,6 +124,10 @@ func TestPairNewContact(t *testing.T) {
 	})
 	e.inject(0x01, deviceInfo(newSCo, [3]byte{}, 0x00c7, "NEQ0000002"))
 	e.waitFor("paired", func() bool { return strings.HasPrefix(e.lastResult(), "paired HM-Sec-SCo NEQ0000002") })
+	// Every hand-out of the system key is visible in Home Assistant.
+	if res := e.lastResult(); !strings.Contains(res, "system key handed out to serial NEQ0000002 at RSSI") {
+		t.Errorf("result %q", res)
+	}
 
 	// CCU-style configuration: central address, key exchange (2-byte
 	// templates: the HM-MOD-RPI-PCB encrypts itself), AES_ACTIVE on
@@ -321,8 +328,22 @@ func TestPairingStatusPageAndDisabled(t *testing.T) {
 	e := newEnvWith(t, pairingConfig(t.TempDir()), fakemod.Options{}, fastPairing)
 	srv := httptest.NewServer(e.b.StatusHandler(nil))
 	defer srv.Close()
-	post := func(origin string) int {
-		req, _ := http.NewRequest("POST", srv.URL+"/pairing/start", nil)
+	// The page carries a random token that the form must send back.
+	page0 := httpBody(t, srv.URL+"/")
+	m := regexp.MustCompile(`name="token" value="([0-9a-f]{32})"`).FindStringSubmatch(page0)
+	if m == nil {
+		t.Fatalf("no pairing token in the status page:\n%s", page0)
+	}
+	token := m[1]
+	postToken := func(origin, tok string) int {
+		var body io.Reader
+		if tok != "" {
+			body = strings.NewReader(url.Values{"token": {tok}}.Encode())
+		}
+		req, _ := http.NewRequest("POST", srv.URL+"/pairing/start", body)
+		if tok != "" {
+			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		}
 		if origin != "" {
 			req.Header.Set("Origin", origin)
 		}
@@ -334,6 +355,7 @@ func TestPairingStatusPageAndDisabled(t *testing.T) {
 		resp.Body.Close()
 		return resp.StatusCode
 	}
+	post := func(origin string) int { return postToken(origin, token) }
 	if c := post("http://evil.example"); c != http.StatusForbidden {
 		t.Errorf("cross-origin POST: %d", c)
 	}
@@ -342,6 +364,13 @@ func TestPairingStatusPageAndDisabled(t *testing.T) {
 	}
 	if resp, _ := http.Get(srv.URL + "/pairing/start"); resp.StatusCode != http.StatusMethodNotAllowed {
 		t.Errorf("GET: %d", resp.StatusCode)
+	}
+	// Same origin (e.g. curl -H Origin:…) without or with a wrong token.
+	if c := postToken(srv.URL, ""); c != http.StatusForbidden {
+		t.Errorf("POST without token: %d", c)
+	}
+	if c := postToken(srv.URL, strings.Repeat("0", 32)); c != http.StatusForbidden {
+		t.Errorf("POST with a wrong token: %d", c)
 	}
 	if e.pairingState()["active"] == true {
 		t.Fatal("pairing started by a refused request")
@@ -357,8 +386,17 @@ func TestPairingStatusPageAndDisabled(t *testing.T) {
 	var page bytes.Buffer
 	page.ReadFrom(resp.Body)
 	resp.Body.Close()
-	if !strings.Contains(page.String(), "Status: <b>active</b>") || !strings.Contains(page.String(), `action="/pairing/start"`) {
+	if !strings.Contains(page.String(), "Status: <b>active</b>") || !strings.Contains(page.String(), `action="/pairing/start"`) ||
+		!strings.Contains(page.String(), "publicly known eQ-3 default key") {
 		t.Errorf("status page:\n%s", page.String())
+	}
+	for k, want := range map[string]string{"X-Frame-Options": "DENY", "Cache-Control": "no-store"} {
+		if got := resp.Header.Get(k); got != want {
+			t.Errorf("%s: %q, want %q", k, got, want)
+		}
+	}
+	if csp := resp.Header.Get("Content-Security-Policy"); !strings.Contains(csp, "frame-ancestors 'none'") {
+		t.Errorf("CSP %q", csp)
 	}
 
 	// state_dir "": pairing is disabled.
@@ -467,7 +505,8 @@ func TestStateDirRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	e := newEnvWith(t, pairingConfig(dir), fakemod.Options{}, fastPairing)
-	e.inject(0x11, msg(0x07, 0x84, 0x41, sco, central, 0x01, 0x1c, 0xc8))
+	// The contact uses AES: its BiDi event was challenged (status 0x12).
+	e.inject(0x12, msg(0x07, 0xa4, 0x41, sco, central, 0x01, 0x1c, 0xc8))
 	e.waitFor("window", func() bool { return e.state("hmbridge/4c5d6e/state")["window_open"] == true })
 	e.stop()
 	if got := entries(t, dir); fmt.Sprint(got) != "[devices.json state.json]" {

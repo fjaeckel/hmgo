@@ -84,6 +84,11 @@ type StandardDevice struct {
 
 	NumChannels int
 	ModelName   string
+
+	// AESChannels lists the channels on which the device uses AES (nil:
+	// none). The device's ACK to a command for one of them must be
+	// AES-authenticated (see CheckReplyAuth).
+	AESChannels []byte
 }
 
 // NewStandardDevice returns a StandardDevice. bcs may be nil.
@@ -126,7 +131,66 @@ func (sd *StandardDevice) Send(ctx context.Context, pkt *bidcos.Packet) (*bidcos
 	if err := CheckAck(sd.Addr, resp); err != nil {
 		return nil, fmt.Errorf("%v: %w", sd, err)
 	}
+	if err := sd.CheckReplyAuth(pkt, resp); err != nil {
+		return nil, fmt.Errorf("%v: %w", sd, err)
+	}
 	return resp, nil
+}
+
+// ErrUnauthenticatedReply is returned when a device answered a command
+// for one of its AES channels with an ACK that was not AES-authenticated.
+// A real device challenges such a command, so its final ACK is
+// authenticated; a plain ACK may have been forged by anyone in radio
+// range who saw our command.
+var ErrUnauthenticatedReply = errors.New("ACK to a command on an AES channel is not AES-authenticated")
+
+// RequestChannel returns the channel a command addresses, where it is
+// known: SET commands (cmd 0x11: LEVEL_SET, the climate commands, LED
+// colors) carry it in payload byte 1, CONFIG (cmd 0x01, including the
+// status request) in byte 0.
+func RequestChannel(pkt *bidcos.Packet) (byte, bool) {
+	switch {
+	case pkt.Cmd == 0x11 && len(pkt.Payload) >= 2:
+		return pkt.Payload[1], true
+	case pkt.Cmd == bidcos.Config && len(pkt.Payload) >= 1:
+		return pkt.Payload[0], true
+	}
+	return 0, false
+}
+
+// replyNeedsAuth reports whether the ACK to req must be authenticated:
+// req addresses one of the device's AES channels, or a channel that is
+// not known while the device uses AES at all.
+func (sd *StandardDevice) replyNeedsAuth(req *bidcos.Packet) bool {
+	if len(sd.AESChannels) == 0 {
+		return false
+	}
+	ch, ok := RequestChannel(req)
+	if !ok {
+		return true
+	}
+	for _, c := range sd.AESChannels {
+		if c == ch {
+			return true
+		}
+	}
+	return false
+}
+
+// CheckReplyAuth returns ErrUnauthenticatedReply if resp is an ACK or
+// ACK_STATUS (cmd 0x02, not a NACK) answering req, req addresses an AES
+// channel of the device and resp was not AES-authenticated. Other
+// answers (e.g. INFO_LEVEL to a status request) are not checked: like
+// Homegear and FHEM, hmbridge only requires the ACKs of AES channels to
+// be signed (BidCoSPeer::packetReceived: validAesAck).
+func (sd *StandardDevice) CheckReplyAuth(req, resp *bidcos.Packet) error {
+	if resp == nil || resp.Cmd != bidcos.Ack || len(resp.Payload) < 1 || resp.Payload[0] >= NackMin {
+		return nil
+	}
+	if resp.Auth() == bidcos.AuthOK || !sd.replyNeedsAuth(req) {
+		return nil
+	}
+	return ErrUnauthenticatedReply
 }
 
 // BidCoS ACK (cmd 0x02) subtypes, c.f. CUL_HM_parseCommon in FHEM.

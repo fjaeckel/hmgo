@@ -743,7 +743,7 @@ func (c *Conn) dispatch(f frame) {
 			case c.recv <- f.payload:
 			default:
 				recvDropped.Inc()
-				log.Printf("uartgw: consumer too slow, dropping received frame %x", f.payload)
+				floodLog.Logf(log.Printf, "recv_dropped", "uartgw: consumer too slow, dropping received frame %x", f.payload)
 			}
 		}
 		c.mu.Unlock()

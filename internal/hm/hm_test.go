@@ -197,3 +197,39 @@ func TestDecodeCommon(t *testing.T) {
 		t.Errorf("other frame: %v, %v", ev, err)
 	}
 }
+
+func TestCheckReplyAuth(t *testing.T) {
+	dev := [3]byte{1, 2, 3}
+	us := [3]byte{4, 5, 6}
+	sd := hm.NewStandardDevice(nil, dev, "x")
+	sd.AESChannels = []byte{1}
+	levelSet := func(ch byte) *bidcos.Packet {
+		return &bidcos.Packet{Flags: bidcos.DefaultFlags, Cmd: 0x11, Dest: dev, Payload: []byte{0x02, ch, 0xc8, 0, 0}}
+	}
+	ack := func(status byte, pl ...byte) *bidcos.Packet {
+		return hmtest.Packet(status, 0x40, 1, 0x80, bidcos.Ack, dev, us, pl...)
+	}
+	for _, tt := range []struct {
+		name    string
+		sd      hm.StandardDevice
+		req     *bidcos.Packet
+		resp    *bidcos.Packet
+		wantErr bool
+	}{
+		{"plain ACK on AES channel", sd, levelSet(1), ack(0x01, 0x00), true},
+		{"ACK_STATUS on AES channel", sd, levelSet(1), ack(0x01, 0x01, 0x01, 0xc8, 0x00), true},
+		{"authenticated ACK", sd, levelSet(1), ack(0x02, 0x00, 1, 2, 3, 4), false},
+		{"channel without AES", sd, levelSet(2), ack(0x01, 0x00), false},
+		{"status request on AES channel", sd, &bidcos.Packet{Cmd: bidcos.Config, Payload: []byte{1, 0x0e}}, ack(0x01, 0x01, 0x01, 0xc8, 0x00), true},
+		{"INFO answer is not checked", sd, &bidcos.Packet{Cmd: bidcos.Config, Payload: []byte{1, 0x0e}},
+			hmtest.Packet(0x01, 0x40, 1, 0x80, bidcos.Info, dev, us, 0x06, 0x01, 0xc8, 0x00), false},
+		{"NACK is not checked", sd, levelSet(1), ack(0x01, 0x80), false},
+		{"unknown channel of an AES device", sd, &bidcos.Packet{Cmd: 0x12}, ack(0x01, 0x00), true},
+		{"device without AES", hm.NewStandardDevice(nil, dev, "y"), levelSet(1), ack(0x01, 0x00), false},
+	} {
+		err := tt.sd.CheckReplyAuth(tt.req, tt.resp)
+		if (err != nil) != tt.wantErr || err != nil && !errors.Is(err, hm.ErrUnauthenticatedReply) {
+			t.Errorf("%s: err = %v, want error %v", tt.name, err, tt.wantErr)
+		}
+	}
+}

@@ -1,6 +1,9 @@
 # Copyright (c) 2026 Frederic Jung
 # SPDX-License-Identifier: BSD-3-Clause
 
+# Third-party actions are pinned by commit (the comment names the tag);
+# update both together.
+
 name: CI
 
 on:
@@ -14,10 +17,13 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      # The newest 1.27 patch release (security fixes) rather than the
+      # minimum in go.mod's go line.
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
-          go-version-file: go.mod
+          go-version: '1.27.x'
+          check-latest: true
       - name: Install mosquitto (end-to-end tests)
         run: sudo apt-get update && sudo apt-get install -y mosquitto
       - name: Vet
@@ -26,9 +32,11 @@ jobs:
         run: test -z "$(gofmt -l .)"
       - name: Test
         run: go test -race ./...
+      - name: Known vulnerabilities (govulncheck)
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
       - name: Build release binaries
         run: make dist
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: hmbridge-binaries
           path: dist/
