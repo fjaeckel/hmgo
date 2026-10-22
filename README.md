@@ -147,6 +147,12 @@ Example alerting rules are in
   duty cycle (1 % airtime). Normal use is far below the limit; the duty cycle
   is exported as a metric.
 
+## Recording OpenCCU's radio traffic
+
+`cmd/hmsniff` passively records and decodes the traffic between OpenCCU and
+its radio module while OpenCCU keeps running; see
+[docs/SNIFFING.md](docs/SNIFFING.md).
+
 ## Development
 
 ```sh
