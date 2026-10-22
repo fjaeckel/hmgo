@@ -3,7 +3,7 @@
     "hmbridge example configuration. Every object accepts an optional _comment field.",
     "Only central_address and devices are required; all other fields show their defaults or typical values.",
     "http_listen serves the status page and Prometheus /metrics (\"\" disables it; use 127.0.0.1:8013 to keep it local). time_sync_interval: how often the radio module clock is set.",
-    "require_synced_clock (default true): only hand out the time while the system clock is NTP-synchronised. state_file keeps the last known device state across restarts (\"\" disables it).",
+    "require_synced_clock (default true): only hand out the time while the system clock is NTP-synchronised. state_file is the fallback for restoring device state when the MQTT broker is unreachable at startup (\"\" disables it); it is written only after significant changes, at most every state_save_interval, and on shutdown.",
     "Every device accepts stale_after (e.g. \"2h\"): how long it may be silent before Home Assistant shows it as unavailable (default 30m thermostats, 6h HM-Sec-SCo, 50h other contacts).",
     "csma_ca enables listen-before-talk (default false, like the CCU). answer_time_requests (default true): set false if the radio module already answers the devices' time requests (duplicate 0x3F answers in the -debug log)."
   ],
@@ -44,6 +44,7 @@
   "answer_time_requests": true,
   "require_synced_clock": true,
   "state_file": "/var/lib/hmbridge/state.json",
+  "state_save_interval": "15m",
 
   "devices": [
     {

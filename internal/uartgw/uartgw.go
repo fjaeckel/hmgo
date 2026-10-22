@@ -258,6 +258,12 @@ type Config struct {
 	// status 0x06 and retried.
 	CSMACA bool
 
+	// SkipSetTime leaves the module's clock alone during Open. The
+	// caller sets it later with SetTime, e.g. once the system clock is
+	// NTP-synchronised (a Raspberry Pi has no RTC; after a power cut its
+	// clock may be wrong until NTP is reachable).
+	SkipSetTime bool
+
 	// Debug enables logging of every frame (key material is redacted).
 	Debug bool
 }
@@ -829,7 +835,12 @@ func (c *Conn) init(cfg Config) error {
 			_, err := c.simple(ctx, dstOS, osEnableCSMACA, []byte{csmaCAByte(cfg.CSMACA)})
 			return err
 		}},
-		{"setting time", func(ctx context.Context) error { return c.setTime(ctx, now()) }},
+		{"setting time", func(ctx context.Context) error {
+			if cfg.SkipSetTime {
+				return nil
+			}
+			return c.setTime(ctx, now())
+		}},
 		{"setting current key", func(ctx context.Context) error {
 			// on the wire: FD001401050300112233445566778899AABBCCDDEEFF024C6D
 			// ack:         FD0004010504010D7A

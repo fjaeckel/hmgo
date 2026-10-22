@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -90,6 +91,17 @@ type env struct {
 	b   *Bridge
 	pub *fakePub
 	run chan error
+
+	stopOnce sync.Once
+	cancel   context.CancelFunc
+}
+
+// stop stops the bridge and waits for Run to return.
+func (e *env) stop() {
+	e.stopOnce.Do(func() {
+		e.cancel()
+		<-e.run
+	})
 }
 
 func newEnv(t *testing.T, cfgJSON string, modOpts fakemod.Options) *env {
@@ -135,11 +147,9 @@ func newEnvWith(t *testing.T, cfgJSON string, modOpts fakemod.Options, opt func(
 	pub := &fakePub{}
 	b.SetPublisher(pub)
 	e := &env{t: t, mod: mod, b: b, pub: pub, run: make(chan error, 1)}
+	e.cancel = cancel
 	go func() { e.run <- b.Run(ctx) }()
-	t.Cleanup(func() {
-		cancel()
-		<-e.run
-	})
+	t.Cleanup(e.stop)
 	return e
 }
 
@@ -703,11 +713,6 @@ func TestTimeRequestJumpsQueueAndNeedsSyncedClock(t *testing.T) {
 	var once sync.Once
 	synced := false
 	var mu sync.Mutex
-	cfg, err := config.Parse([]byte(testConfig))
-	if err != nil {
-		t.Fatal(err)
-	}
-	_ = cfg
 	e := newEnvWith(t, testConfig, fakemod.Options{
 		OnSend: func(m []byte) (byte, []byte) {
 			if len(m) > 2 && m[2] == 0x11 {
@@ -735,6 +740,8 @@ func TestTimeRequestJumpsQueueAndNeedsSyncedClock(t *testing.T) {
 	e.b.Commands() <- ha.Command{Addr: "38f5a1", Kind: ha.SetTemperature, Temperature: 21}
 	e.inject(0x01, msg(0x42, 0xa6, 0x3f, tc, central))
 	e.waitFor("queued", func() bool { return e.b.queue.len() == 2 })
+	// Popping from the live queue is safe here: the worker is blocked in
+	// the first command (OnSend waits for block) and cannot pop.
 	j, _ := e.b.queue.pop()
 	if j.kind != jobTimeResponse || j.reqNo != 0x42 {
 		t.Errorf("first queued job = %+v, want the time response to request 42", j)
@@ -793,3 +800,208 @@ func TestDeviceAvailability(t *testing.T) {
 	e.inject(0x01, msg(0x06, 0xa6, 0x10, rtdn, central, 0x0a, 0xb0, 0xe2, 0x08, 0x25, 0x00))
 	e.waitFor("back online", func() bool { return avail("38f59c") == "online" })
 }
+
+// Persistence and availability (review of da1ada5).
+
+func readStateFile(t *testing.T, path string) (persistedState, bool) {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return persistedState{}, false
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ps persistedState
+	if err := json.Unmarshal(data, &ps); err != nil {
+		t.Fatal(err)
+	}
+	return ps, true
+}
+
+func TestStateFileWrittenOnlyForSignificantChanges(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	cfg := strings.Replace(testConfig, `"state_file": "",`, `"state_file": "`+path+`",`, 1)
+	e := newEnvWith(t, cfg, fakemod.Options{}, func(o *Options) {
+		o.HousekeepingInterval = 10 * time.Millisecond
+		o.StateSaveInterval = 50 * time.Millisecond
+	})
+	// The first report is significant (mode, target, battery known now).
+	e.inject(0x01, msg(0x05, 0xa6, 0x10, rtdn, central, 0x0a, 0xb0, 0xe2, 0x08, 0x25, 0x00))
+	e.waitFor("first save", func() bool { _, ok := readStateFile(t, path); return ok })
+	first, _ := os.Stat(path)
+
+	// Only the temperature and valve change: no write.
+	e.inject(0x01, msg(0x06, 0xa6, 0x10, rtdn, central, 0x0a, 0xb0, 0xe8, 0x08, 0x30, 0x00))
+	e.waitFor("processed", func() bool { return e.state("hmbridge/38f59c/state")["valve_position"] == 48.0 })
+	time.Sleep(200 * time.Millisecond)
+	if st, _ := os.Stat(path); !st.ModTime().Equal(first.ModTime()) {
+		t.Errorf("state file rewritten for a temperature-only change")
+	}
+
+	// A window opening is significant: written after the interval.
+	e.inject(0x11, msg(0x07, 0x84, 0x41, sco, central, 0x01, 0x1c, 0xc8))
+	e.waitFor("window saved", func() bool {
+		ps, _ := readStateFile(t, path)
+		wo := ps.Devices["4c5d6e"].State.WindowOpen
+		return wo != nil && *wo
+	})
+}
+
+func TestStateFileWrittenOnShutdown(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	cfg := strings.Replace(testConfig, `"state_file": "",`, `"state_file": "`+path+`",`, 1)
+	e := newEnv(t, cfg, fakemod.Options{}) // default interval: 15 minutes
+	e.inject(0x01, msg(0x05, 0xa6, 0x10, rtdn, central, 0x0a, 0xb0, 0xe2, 0x08, 0x25, 0x00))
+	e.waitFor("processed", func() bool { return e.state("hmbridge/38f59c/state")["current_temperature"] != nil })
+	if _, ok := readStateFile(t, path); ok {
+		t.Fatal("state file written before the save interval passed")
+	}
+	e.stop()
+	ps, ok := readStateFile(t, path)
+	if !ok || ps.Devices["38f59c"].State.CurrentTemperature == nil {
+		t.Errorf("state not saved on shutdown: %+v", ps)
+	}
+}
+
+func TestStateSaveFailureIsRetried(t *testing.T) {
+	dir := t.TempDir()
+	blocker := filepath.Join(dir, "file")
+	os.WriteFile(blocker, nil, 0o644)
+	path := filepath.Join(blocker, "state.json") // parent is a file: writes fail
+	cfg := strings.Replace(testConfig, `"state_file": "",`, `"state_file": "`+path+`",`, 1)
+	var mu sync.Mutex
+	var logs []string
+	e := newEnvWith(t, cfg, fakemod.Options{}, func(o *Options) {
+		o.HousekeepingInterval = 10 * time.Millisecond
+		o.StateSaveInterval = 20 * time.Millisecond
+		o.Logf = func(f string, a ...any) { mu.Lock(); logs = append(logs, fmt.Sprintf(f, a...)); mu.Unlock() }
+	})
+	e.inject(0x01, msg(0x05, 0xa6, 0x10, rtdn, central, 0x0a, 0xb0, 0xe2, 0x08, 0x25, 0x00))
+	time.Sleep(300 * time.Millisecond) // many save attempts
+	count := func(sub string) int {
+		mu.Lock()
+		defer mu.Unlock()
+		n := 0
+		for _, l := range logs {
+			if strings.Contains(l, sub) {
+				n++
+			}
+		}
+		return n
+	}
+	if n := count("saving state to"); n != 1 {
+		t.Errorf("save failure logged %d times, want once", n)
+	}
+	e.b.mu.Lock()
+	dirty := e.b.significantDirty
+	e.b.mu.Unlock()
+	if !dirty {
+		t.Error("state not dirty after a failed save; it would not be retried")
+	}
+	// Make the path writable: the next attempt succeeds.
+	os.Remove(blocker)
+	e.waitFor("saved after recovery", func() bool { _, ok := readStateFile(t, path); return ok })
+	e.waitFor("recovery logged", func() bool { return count("works again") == 1 })
+}
+
+func TestRestoredStaleDeviceStartsUnavailable(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	old := time.Now().Add(-2 * time.Hour)
+	writeFileAtomic(path, persistedState{Version: 1, Saved: old, Devices: map[string]persistedDevice{
+		"38f59c": {State: ha.State{CurrentTemperature: ptr(20.5), LastSeen: old}},
+		"4c5d6e": {State: ha.State{WindowOpen: ptr(true), WindowState: "open", LastSeen: old}},
+	}})
+	cfg := strings.Replace(testConfig, `"state_file": "",`, `"state_file": "`+path+`",`, 1)
+	e := newEnv(t, cfg, fakemod.Options{})
+	avail := func(topic string) string { return string(e.pub.get(topic)) }
+	e.waitFor("availability", func() bool { return avail("hmbridge/38f59c/availability") != "" })
+	if a := avail("hmbridge/38f59c/availability"); a != "offline" {
+		t.Errorf("thermostat last heard 2h ago: availability %q, want offline", a)
+	}
+	if a := avail("hmbridge/4c5d6e/availability"); a != "online" {
+		t.Errorf("contact last heard 2h ago (timeout 6h): availability %q, want online", a)
+	}
+	if a := avail("hmbridge/2a1b3c/availability"); a != "online" {
+		t.Errorf("never-heard device right after start: availability %q, want online", a)
+	}
+	// The group has the wall thermostat (never heard, online) → online.
+	if a := avail("hmbridge/group/wohnzimmer/availability"); a != "online" {
+		t.Errorf("group availability %q, want online", a)
+	}
+}
+
+func TestRestoreExpiresBoost(t *testing.T) {
+	cfg, err := config.Parse([]byte(testConfig))
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 10, 22, 9, 0, 0, 0, time.UTC)
+	b, err := New(Options{Config: cfg, Radio: nopRadio{}, Now: func() time.Time { return now }, Logf: t.Logf})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := b.byAddr[rtdn]
+	boost := ha.State{ControlMode: "boost", Mode: "heat", Preset: "boost", BoostMinutes: ptr(5), TargetTemperature: ptr(21.0)}
+
+	expired := boost
+	expired.LastSeen = now.Add(-10 * time.Minute)
+	b.restore(d, expired, 0, ha.ModeOff)
+	if d.state.ControlMode != "" || d.state.Preset != ha.PresetNone || d.state.Mode != ha.ModeOff {
+		t.Errorf("expired boost restored as %q/%q/%q, want no boost, mode off", d.state.ControlMode, d.state.Preset, d.state.Mode)
+	}
+	if d.lastOnTarget != 21 {
+		t.Errorf("lastOnTarget = %v, want 21 (from the restored target)", d.lastOnTarget)
+	}
+
+	running := boost
+	running.LastSeen = now.Add(-2 * time.Minute)
+	b.restore(d, running, 0, ha.ModeAuto)
+	if d.state.ControlMode != "boost" {
+		t.Errorf("running boost not restored")
+	}
+}
+
+func TestSeedFromRetained(t *testing.T) {
+	cfg, err := config.Parse([]byte(testConfig))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := New(Options{Config: cfg, Radio: nopRadio{}, Logf: t.Logf})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Truncate(time.Second)
+	topics := ha.TopicConfig{}
+	enc := func(s ha.State) []byte { m, _ := ha.StateMessage(topics, "x", s); return m.Payload }
+	// The wall thermostat was heard since startup: its retained state is older.
+	b.byAddr[tc].heardSinceStart = true
+	b.byAddr[tc].state = ha.State{CurrentTemperature: ptr(23.0), LastSeen: now}
+	b.SeedFromRetained(topics, map[string][]byte{
+		"hmbridge/38f59c/state":           enc(ha.State{TargetTemperature: ptr(19.5), MessagesReceived: ptr(uint64(7)), LastSeen: now}),
+		"hmbridge/4c5d6e/state":           enc(ha.State{WindowOpen: ptr(true), WindowState: "open", LastSeen: now}),
+		"hmbridge/2a1b3c/state":           enc(ha.State{CurrentTemperature: ptr(18.0), LastSeen: now.Add(-time.Hour)}),
+		"hmbridge/ffffff/state":           enc(ha.State{LastSeen: now}), // not configured
+		"hmbridge/group/wohnzimmer/state": enc(ha.State{WindowOpen: ptr(false), LastSeen: now}),
+		"hmbridge/38f5a1/state":           []byte("not json"),
+	})
+	if got := b.byAddr[rtdn].state; got.TargetTemperature == nil || *got.TargetTemperature != 19.5 || got.MessagesReceived != nil {
+		t.Errorf("RT-DN seeded as %+v", got)
+	}
+	if got := b.byAddr[tc].state.CurrentTemperature; *got != 23 {
+		t.Errorf("seed overwrote a device heard since startup: %v", *got)
+	}
+	g := b.bySlug["wohnzimmer"]
+	if g.state.WindowOpen == nil || !*g.state.WindowOpen {
+		t.Errorf("group window = %v, want derived from the seeded contact (open)", g.state.WindowOpen)
+	}
+}
+
+// nopRadio is a Radio that does nothing (for tests that don't run the bridge).
+type nopRadio struct{}
+
+func (nopRadio) Send(context.Context, []byte) ([]byte, error) { return nil, nil }
+func (nopRadio) Recv() <-chan []byte                          { return nil }
+func (nopRadio) Err() error                                   { return nil }
+func (nopRadio) AddPeer(context.Context, uartgw.Peer) error   { return nil }
+func (nopRadio) SetTime(context.Context, time.Time) error     { return nil }

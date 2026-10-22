@@ -58,7 +58,9 @@ monit summary 2>/dev/null   # OpenCCU restarts crashed services via monit
 ```
 
 Stop monit's supervision of those services and the services themselves, then
-run hmbridge with `"serial_port": "/dev/raw-uart"` and `"reset": "none"`. To
+run hmbridge with `"serial_port": "/dev/raw-uart"`, `"reset": "none"` and a
+writable `"state_file"` such as `"/usr/local/hmbridge/state.json"` (or `""`:
+the state is restored from the MQTT broker anyway). To
 return to OpenCCU, simply reboot the Pi.
 
 ## 3b. Running on Raspberry Pi OS (final setup)
@@ -96,9 +98,16 @@ appears as a device with a climate entity and sensors as soon as hmbridge
 connects. A device that stops reporting (empty battery, out of range) becomes
 unavailable in Home Assistant after its `stale_after` time (30 minutes for
 thermostats, 6 hours for the HM-Sec-SCo, 50 hours for other contacts); its
-"Last seen" sensor stays visible. hmbridge keeps the last known state in
-`/var/lib/hmbridge/state.json`, so a restart does not blank Home Assistant
-until every window contact has reported again. The status page on port 8013 lists configured devices and every
+"Last seen" sensor stays visible.
+
+After a restart or reboot, hmbridge reads its last published state back from
+the MQTT broker, so Home Assistant isn't blank until every window contact has
+reported again; this needs no writes on the Pi. As a fallback for when the
+broker is unreachable at startup, it also keeps `/var/lib/hmbridge/state.json`.
+To spare the SD card, that file is only written after significant changes
+(mode, target temperature, window, battery, fault), at most every 15 minutes
+(`state_save_interval`), and on shutdown; ordinary temperature reports never
+cause a write. The status page on port 8013 lists configured devices and every
 radio address that talked to the central but is not configured — handy for
 finding device addresses.
 

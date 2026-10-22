@@ -40,6 +40,9 @@ heating groups.
   * MQTT and commands.
 * **Status page** at `/` listing all devices, plus radio addresses that talk
   to the central but are not configured (handy for finding device addresses).
+* **Survives restarts:** the last known state is read back from the MQTT
+  broker, with a small state file as fallback that is written rarely to
+  spare the SD card.
 * **Robust:** a slow or unreachable MQTT broker never stalls the radio side.
   Commands from Home Assistant are coalesced (dragging a slider sends one
   radio command, not twenty) and retried when a device does not answer.

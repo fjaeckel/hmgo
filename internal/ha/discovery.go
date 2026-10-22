@@ -221,7 +221,8 @@ func groupNode(cfg TopicConfig, g GroupDesc) node {
 			"model":        "Heating group",
 			"manufacturer": "hmbridge",
 		},
-		humidity: true, // harmless when the group has no humidity
+		humidity:    true, // harmless when the group has no humidity
+		deviceAvail: cfg.GroupAvailabilityTopic(g.Slug),
 	}
 }
 
@@ -393,5 +394,6 @@ func GroupRemovalMessages(cfg TopicConfig, slug string) []Message {
 		retained(climateTopic(cfg, id), nil),
 		retained(entityTopic(cfg, e.component, id, e.key), nil),
 		retained(cfg.GroupStateTopic(slug), nil),
+		retained(cfg.GroupAvailabilityTopic(slug), nil),
 	}
 }

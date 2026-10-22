@@ -346,3 +346,43 @@ func TestConnectCanceled(t *testing.T) {
 		t.Errorf("Connect took %v after ctx deadline", d)
 	}
 }
+
+func TestReadRetained(t *testing.T) {
+	broker := startMosquitto(t)
+	obs := newObserver(t, broker)
+	cfg := TopicConfig{}
+	obs.publish(t, "hmbridge/38f59c/state", `{"target_temperature":21}`, true)
+	obs.publish(t, "hmbridge/group/bad/state", `{"window_open":true}`, true)
+	obs.publish(t, "hmbridge/38f59c/availability", "online", true)    // not a state topic
+	obs.publish(t, "hmbridge/2a1b3c/state", `{"humidity":50}`, false) // not retained
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	c, err := Connect(ctx, Options{Broker: broker, ClientID: "read-retained", Topics: cfg})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	start := time.Now()
+	got, err := c.ReadRetained(ctx, cfg.StateSubscriptions(), 200*time.Millisecond, 3*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || string(got["hmbridge/38f59c/state"]) != `{"target_temperature":21}` || got["hmbridge/group/bad/state"] == nil {
+		t.Errorf("ReadRetained = %q", got)
+	}
+	if d := time.Since(start); d > 2*time.Second {
+		t.Errorf("ReadRetained took %v; should return after the idle period", d)
+	}
+	for topic := range got {
+		addr, group, ok := cfg.ParseStateTopic(topic)
+		if !ok || (addr == "") == (group == "") {
+			t.Errorf("ParseStateTopic(%s) = %q, %q, %v", topic, addr, group, ok)
+		}
+	}
+	for _, bad := range []string{"hmbridge/38f59c/availability", "other/38f59c/state", "hmbridge/a/b/state", "hmbridge/group//state"} {
+		if _, _, ok := cfg.ParseStateTopic(bad); ok {
+			t.Errorf("ParseStateTopic(%s) accepted", bad)
+		}
+	}
+}

@@ -127,6 +127,15 @@ type Config struct {
 	// "/var/lib/hmbridge/state.json"; "" disables it.
 	StateFile *string `json:"state_file,omitempty"`
 
+	// StateSaveInterval is the minimum time between two writes of the
+	// state file (Go duration, default "15m"). The file is only written
+	// when something significant changed (mode, target, window, battery,
+	// fault), and once on shutdown; normal temperature reports never
+	// cause a write. The broker's retained messages are the primary
+	// source after a restart, so this only matters if the broker is
+	// unreachable at startup.
+	StateSaveIntervalSetting Duration `json:"state_save_interval,omitempty"`
+
 	Devices []Device `json:"devices"`
 	Groups  []Group  `json:"groups,omitempty"`
 
@@ -486,6 +495,9 @@ func (c *Config) resolve() error {
 		return fmt.Errorf("time_sync_interval: %v is too short (minimum 1m)", c.TimeSyncInterval.Duration)
 	}
 
+	if c.StateSaveIntervalSetting.set && c.StateSaveIntervalSetting.Duration < time.Minute {
+		return fmt.Errorf("state_save_interval: %v is too short (minimum 1m)", c.StateSaveIntervalSetting.Duration)
+	}
 	if len(c.Devices) == 0 {
 		return fmt.Errorf("devices: at least one device is required")
 	}
@@ -606,6 +618,18 @@ func (c *Config) StateFilePath() string {
 		return DefaultStateFile
 	}
 	return *c.StateFile
+}
+
+// DefaultStateSaveInterval is the default minimum time between writes.
+const DefaultStateSaveInterval = 15 * time.Minute
+
+// StateSaveInterval returns the resolved minimum time between writes of
+// the state file.
+func (c *Config) StateSaveInterval() time.Duration {
+	if c.StateSaveIntervalSetting.Duration > 0 {
+		return c.StateSaveIntervalSetting.Duration
+	}
+	return DefaultStateSaveInterval
 }
 
 // RequiresSyncedClock reports whether time is only handed out while the

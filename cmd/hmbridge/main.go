@@ -105,7 +105,10 @@ func run(ctx context.Context, cfg *config.Config, uart io.ReadWriteCloser) error
 		Current:  current,
 		Previous: previous,
 		CSMACA:   cfg.CSMACA,
-		Debug:    *debugFrames,
+		// Don't hand a stale clock to the module (no RTC on a Pi); the
+		// bridge sets it once NTP has synchronised.
+		SkipSetTime: cfg.RequiresSyncedClock() && !bridge.SystemClockSynced(),
+		Debug:       *debugFrames,
 	})
 	if err != nil {
 		uart.Close()
@@ -167,6 +170,15 @@ func run(ctx context.Context, cfg *config.Config, uart io.ReadWriteCloser) error
 				return // only on shutdown
 			}
 			log.Printf("MQTT connected to %s", broker)
+			// Restore the last published state from the broker's
+			// retained messages before publishing anything, so that a
+			// restart does not blank Home Assistant (and costs no SD
+			// card writes).
+			retained, err := client.ReadRetained(mqttCtx, client.Topics().StateSubscriptions(), 0, 0)
+			if err != nil && mqttCtx.Err() == nil {
+				log.Printf("MQTT: reading retained state: %v", err)
+			}
+			b.SeedFromRetained(client.Topics(), retained)
 			b.SetPublisher(client)
 			go func() {
 				for cmd := range client.Commands() {

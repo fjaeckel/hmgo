@@ -454,6 +454,7 @@ func (b *Bridge) handleResult(res jobResult) {
 func (b *Bridge) applyUpdate(d *device, upd ha.State) {
 	prevMode := d.state.ControlMode
 	prevHAMode := d.state.Mode
+	before := significantKey(d)
 	d.state.Merge(upd)
 	b.stateDirty = true
 	if t := d.state.TargetTemperature; t != nil && *t > ha.MinTemp && *t < ha.MaxTemp {
@@ -463,6 +464,9 @@ func (b *Bridge) applyUpdate(d *device, upd ha.State) {
 		d.preBoostHAMode = prevHAMode // "" (unknown) leaves boost to auto
 	}
 	deriveState(d)
+	if significantKey(d) != before {
+		b.significantDirty = true
+	}
 	b.updateMetrics(d)
 }
 

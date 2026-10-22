@@ -161,6 +161,29 @@ func TestEndToEnd(t *testing.T) {
 		t.Fatal("run did not return")
 	}
 	waitFor(t, "availability offline", func() bool { return string(get("hmbridge/bridge/availability")) == "offline" })
+
+	// Restart: without a state file, the second run restores the state
+	// from the broker's retained messages and republishes it before any
+	// device has reported (restored state has no message counter).
+	mu.Lock()
+	delete(seen, "hmbridge/38f59c/state")
+	mu.Unlock()
+	mod2, rw2 := fakemod.New(fakemod.Options{})
+	defer mod2.Close()
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	done2 := make(chan error, 1)
+	go func() { done2 <- run(ctx2, cfg, rw2) }()
+	waitFor(t, "online again", func() bool { return string(get("hmbridge/bridge/availability")) == "online" })
+	waitFor(t, "restored state republished", func() bool {
+		v := jsonOf("hmbridge/38f59c/state")
+		return v["target_temperature"] == 21.5 && v["battery_voltage"] == 3.0 && v["messages_received"] == nil
+	})
+	waitFor(t, "restored group state", func() bool { return jsonOf("hmbridge/group/bad/state")["current_temperature"] == 22.6 })
+	if a := string(get("hmbridge/38f59c/availability")); a != "online" {
+		t.Errorf("device availability after restart = %q, want online", a)
+	}
+	cancel2()
+	<-done2
 }
 
 func freePort(t *testing.T) int {

@@ -221,10 +221,21 @@ Robustness:
   topic; entities are available only while the bridge and the device are
   online. A device is offline once silent for longer than its stale
   timeout (30m thermostats, 6h HM-Sec-SCo, 50h other contacts).
-* **state file:** the last known state is restored at startup, and an
-  empty state is never published, so restarts don't blank Home Assistant.
+* **persistence, SD-card friendly:** after a restart the state is read back
+  from the broker's retained state messages (no writes on the Pi). A small
+  state file is the fallback when the broker is unreachable at startup; a
+  separate goroutine writes it only after significant changes (mode, target,
+  window, battery, fault; not temperature/valve/RSSI reports), at most every
+  `state_save_interval` (15m), and on shutdown. An empty state is never
+  published. A restored boost that has expired is dropped.
+* **availability** is measured from the device's last message, also across
+  restarts, so a device that died before a restart is unavailable at once;
+  groups are available while any of their thermostats is.
 * **AES:** for AES devices, frames not addressed to the central (which the
   module does not authenticate) never change the state.
+* **module clock:** Open leaves the module's clock alone while the system
+  clock is not NTP-synchronised (`uartgw.Config.SkipSetTime`); the bridge
+  sets it once it is.
 * **wedged module:** after 3 consecutive requests the module never
   acknowledged, the connection fails (`uartgw.ErrModuleUnresponsive`) and
   the process exits for systemd to restart it. Module firmware ≤ 1.0.6

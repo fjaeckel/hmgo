@@ -949,3 +949,23 @@ func TestOpenFirmwareVersion(t *testing.T) {
 		})
 	}
 }
+
+func TestOpenSkipSetTime(t *testing.T) {
+	mod, rw := fakemod.New(fakemod.Options{})
+	defer mod.Close()
+	c, err := Open(rw, Config{HMID: [3]byte{1, 2, 3}, AnnounceWait: 50 * time.Millisecond, CreditsInterval: -1, SkipSetTime: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if got := mod.TimePayload(); got != nil {
+		t.Errorf("module clock set during Open despite SkipSetTime: %x", got)
+	}
+	now := time.Unix(1700000000, 0)
+	if err := c.SetTime(context.Background(), now); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := mod.TimePayload(), timePayload(now); !bytes.Equal(got, want) {
+		t.Errorf("TimePayload = %x, want %x", got, want)
+	}
+}

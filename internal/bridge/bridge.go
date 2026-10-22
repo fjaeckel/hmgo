@@ -65,8 +65,11 @@ type Options struct {
 	// configuration requires a synced clock.
 	ClockSynced func() bool
 	// HousekeepingInterval is how often device availability is checked
-	// and the state file is written. Zero means 1 minute.
+	// and a state file save is considered. Zero means 1 minute.
 	HousekeepingInterval time.Duration
+	// StateSaveInterval overrides the configured minimum time between
+	// state file writes (for tests). Zero means the configuration.
+	StateSaveInterval time.Duration
 }
 
 // Bridge is the hmbridge core. Create it with New, then call Setup once
@@ -83,6 +86,13 @@ type Bridge struct {
 	housekeep  time.Duration
 	stateFile  string
 
+	// Event-loop-only state (not guarded by mu).
+	clockWasSynced bool // result of the last clock sync check
+	clockChecked   bool
+	lastSave       time.Time // when the last state file save was requested
+	saveInterval   time.Duration
+	saveReq        chan struct{} // to the saver goroutine
+
 	devices []*device
 	byAddr  map[[3]byte]*device
 	groups  []*group
@@ -95,15 +105,13 @@ type Bridge struct {
 	queue   *jobQueue
 	outbox  *outbox
 
-	mu         sync.Mutex // guards the fields below and all device/group state
-	pub        Publisher
-	unknown    map[[3]byte]*UnknownSender
-	started    time.Time
-	stateDirty bool
-	// clockWasSynced tracks the last clock sync check (for logging and
-	// for setting the module clock as soon as NTP has synchronised).
-	clockWasSynced bool
-	clockChecked   bool
+	mu      sync.Mutex // guards the fields below and all device/group state
+	pub     Publisher
+	unknown map[[3]byte]*UnknownSender
+	started time.Time
+	// stateDirty: any state changed since the last save;
+	// significantDirty: a change worth writing to the SD card.
+	stateDirty, significantDirty bool
 }
 
 type device struct {
@@ -137,9 +145,12 @@ type group struct {
 	slug        string
 	thermostats []*device // wall thermostats first
 	targets     []*device // receivers of group commands
-	contacts    []*device
-	climate     *device // source of temperature/humidity/target/mode
-	state       ha.State
+	// available while at least one thermostat is; availPublished once
+	// sent to MQTT.
+	available, availPublished bool
+	contacts                  []*device
+	climate                   *device // source of temperature/humidity/target/mode
+	state                     ha.State
 }
 
 // maxUnknownSenders bounds the list of unconfigured senders.
@@ -165,28 +176,33 @@ func New(opts Options) (*Bridge, error) {
 		return nil, errors.New("bridge: Config and Radio are required")
 	}
 	b := &Bridge{
-		cfg:        opts.Config,
-		radio:      opts.Radio,
-		now:        opts.Now,
-		logf:       opts.Logf,
-		retryDelay: opts.RetryDelay,
-		retries:    opts.Retries,
-		clockSync:  opts.ClockSynced,
-		housekeep:  opts.HousekeepingInterval,
-		stateFile:  opts.Config.StateFilePath(),
-		byAddr:     make(map[[3]byte]*device),
-		bySlug:     make(map[string]*group),
-		commands:   make(chan ha.Command, 32),
-		results:    make(chan jobResult, 32),
-		queue:      newJobQueue(),
-		outbox:     newOutbox(),
-		unknown:    make(map[[3]byte]*UnknownSender),
+		cfg:          opts.Config,
+		radio:        opts.Radio,
+		now:          opts.Now,
+		logf:         opts.Logf,
+		retryDelay:   opts.RetryDelay,
+		retries:      opts.Retries,
+		clockSync:    opts.ClockSynced,
+		housekeep:    opts.HousekeepingInterval,
+		stateFile:    opts.Config.StateFilePath(),
+		saveInterval: opts.Config.StateSaveInterval(),
+		saveReq:      make(chan struct{}, 1),
+		byAddr:       make(map[[3]byte]*device),
+		bySlug:       make(map[string]*group),
+		commands:     make(chan ha.Command, 32),
+		results:      make(chan jobResult, 32),
+		queue:        newJobQueue(),
+		outbox:       newOutbox(),
+		unknown:      make(map[[3]byte]*UnknownSender),
 	}
 	if b.clockSync == nil {
-		b.clockSync = systemClockSynced
+		b.clockSync = SystemClockSynced
 	}
 	if b.housekeep <= 0 {
 		b.housekeep = time.Minute
+	}
+	if opts.StateSaveInterval > 0 {
+		b.saveInterval = opts.StateSaveInterval
 	}
 	if b.now == nil {
 		b.now = time.Now
@@ -298,6 +314,7 @@ func (b *Bridge) Setup(ctx context.Context) error {
 	}
 	b.mu.Lock()
 	b.started = b.now()
+	b.checkAvailability(b.started) // restored state may already be stale
 	b.mu.Unlock()
 	return nil
 }
@@ -345,6 +362,8 @@ func (b *Bridge) PublishAll() {
 	}
 	for _, g := range b.groups {
 		msgs = append(msgs, ha.GroupDiscoveryMessages(topics, ha.GroupDesc{Slug: g.slug, Name: g.name})...)
+		msgs = append(msgs, ha.GroupAvailabilityMessage(topics, g.slug, g.available))
+		g.availPublished = true
 		if !g.state.LastSeen.IsZero() {
 			if m, err := ha.GroupStateMessage(topics, g.slug, g.state); err == nil {
 				msgs = append(msgs, m)
@@ -362,7 +381,7 @@ func (b *Bridge) PublishAll() {
 func (b *Bridge) Run(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	var wg sync.WaitGroup
-	wg.Add(2)
+	wg.Add(3)
 	go func() {
 		defer wg.Done()
 		b.worker(ctx)
@@ -371,10 +390,26 @@ func (b *Bridge) Run(ctx context.Context) error {
 		defer wg.Done()
 		b.publisher(ctx)
 	}()
-	// Stop the worker before waiting for it.
+	go func() {
+		defer wg.Done()
+		b.saver(ctx.Done())
+	}()
+	// Stop the helpers, then write the state file a last time (only now,
+	// so that it never races with the saver).
 	defer func() {
 		cancel()
 		wg.Wait()
+		if b.stateFile == "" {
+			return
+		}
+		b.mu.Lock()
+		dirty := b.stateDirty
+		b.mu.Unlock()
+		if dirty {
+			if err := b.saveState(b.stateFile); err != nil {
+				b.logf("saving state to %s: %v", b.stateFile, err)
+			}
+		}
 	}()
 
 	interval := b.cfg.TimeSyncInterval.Duration
@@ -385,14 +420,13 @@ func (b *Bridge) Run(ctx context.Context) error {
 	defer timeSync.Stop()
 	housekeeping := time.NewTicker(b.housekeep)
 	defer housekeeping.Stop()
-	if b.stateFile != "" {
-		defer func() {
-			if err := b.saveState(b.stateFile); err != nil {
-				b.logf("saving state: %v", err)
-			}
-		}()
-	}
+	b.lastSave = b.now()
 	b.checkClock()
+	// Set the module's clock now if possible: Open skips it while the
+	// system clock is not synchronised.
+	if b.timeUsable() {
+		b.queue.push(job{key: "settime", kind: jobSetTime, priority: true})
+	}
 
 	recv := b.radio.Recv()
 	for {
@@ -427,22 +461,18 @@ func (b *Bridge) Run(ctx context.Context) error {
 	}
 }
 
-// housekeeping checks device availability and clock sync and writes the
-// state file. Runs on the event loop.
+// housekeeping checks device availability and clock sync and asks the
+// saver to write the state file if due. Runs on the event loop.
 func (b *Bridge) housekeeping() {
+	now := b.now()
 	b.mu.Lock()
-	msgs := b.checkAvailability(b.now())
+	msgs := b.checkAvailability(now)
 	if len(msgs) > 0 {
 		b.outbox.put(msgs...)
 	}
-	dirty := b.stateDirty
 	b.mu.Unlock()
 	b.checkClock()
-	if dirty && b.stateFile != "" {
-		if err := b.saveState(b.stateFile); err != nil {
-			b.logf("saving state: %v", err)
-		}
-	}
+	b.requestSave(now)
 }
 
 // checkClock tracks whether the system clock is synchronised and sets

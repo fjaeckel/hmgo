@@ -344,3 +344,68 @@ func (nullStore) All() []string                     { return nil }
 func (nullStore) Del(string)                        {}
 func (nullStore) Close()                            {}
 func (nullStore) Reset()                            {}
+
+// ReadRetained subscribes to filters, collects the retained messages the
+// broker sends right after subscribing, and unsubscribes again. It
+// returns once no new message arrived for idle (default 500ms), at most
+// after maxWait (default 3s), or when ctx is done. hmbridge uses it to
+// restore the last published device state after a restart without
+// writing to the Pi's SD card: the broker keeps it anyway.
+func (c *Client) ReadRetained(ctx context.Context, filters []string, idle, maxWait time.Duration) (map[string][]byte, error) {
+	if idle <= 0 {
+		idle = 500 * time.Millisecond
+	}
+	if maxWait <= 0 {
+		maxWait = 3 * time.Second
+	}
+	var mu sync.Mutex
+	got := make(map[string][]byte)
+	activity := make(chan struct{}, 1)
+	handler := func(_ mqtt.Client, m mqtt.Message) {
+		if !m.Retained() {
+			return
+		}
+		mu.Lock()
+		got[m.Topic()] = append([]byte(nil), m.Payload()...)
+		mu.Unlock()
+		select {
+		case activity <- struct{}{}:
+		default:
+		}
+	}
+	subs := make(map[string]byte, len(filters))
+	for _, f := range filters {
+		subs[f] = 1
+	}
+	tok := c.mc.SubscribeMultiple(subs, handler)
+	if !tok.WaitTimeout(maxWait) {
+		return nil, fmt.Errorf("ha: subscribing to %v timed out", filters)
+	}
+	if err := tok.Error(); err != nil {
+		return nil, fmt.Errorf("ha: subscribing to %v: %w", filters, err)
+	}
+	deadline := time.NewTimer(maxWait)
+	defer deadline.Stop()
+	quiet := time.NewTimer(idle)
+	defer quiet.Stop()
+wait:
+	for {
+		select {
+		case <-ctx.Done():
+			break wait
+		case <-deadline.C:
+			break wait
+		case <-quiet.C:
+			break wait
+		case <-activity:
+			if !quiet.Stop() {
+				<-quiet.C
+			}
+			quiet.Reset(idle)
+		}
+	}
+	c.mc.Unsubscribe(filters...).WaitTimeout(time.Second)
+	mu.Lock()
+	defer mu.Unlock()
+	return got, ctx.Err()
+}

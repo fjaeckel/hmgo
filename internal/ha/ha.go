@@ -538,6 +538,45 @@ func DeviceAvailabilityMessage(cfg TopicConfig, addr string, online bool) Messag
 	return Message{Topic: cfg.DeviceAvailabilityTopic(addr), Payload: []byte(p), Retain: true, QoS: 1}
 }
 
+// GroupAvailabilityTopic is the retained availability topic of a heating
+// group: online while at least one of its thermostats is.
+func (c TopicConfig) GroupAvailabilityTopic(slug string) string {
+	return c.base() + "/group/" + slug + "/availability"
+}
+
+// GroupAvailabilityMessage returns the retained availability message of
+// a heating group.
+func GroupAvailabilityMessage(cfg TopicConfig, slug string, online bool) Message {
+	p := PayloadOffline
+	if online {
+		p = PayloadOnline
+	}
+	return Message{Topic: cfg.GroupAvailabilityTopic(slug), Payload: []byte(p), Retain: true, QoS: 1}
+}
+
+// StateSubscriptions returns the topic filters of all retained device and
+// group state topics (for ReadRetained).
+func (c TopicConfig) StateSubscriptions() []string {
+	return []string{c.base() + "/+/state", c.base() + "/group/+/state"}
+}
+
+// ParseStateTopic returns the device address or group slug of a state
+// topic (as published by StateMessage / GroupStateMessage).
+func (c TopicConfig) ParseStateTopic(topic string) (addr, group string, ok bool) {
+	rest, found := strings.CutPrefix(topic, c.base()+"/")
+	if !found {
+		return "", "", false
+	}
+	rest, found = strings.CutSuffix(rest, "/state")
+	if !found {
+		return "", "", false
+	}
+	if slug, isGroup := strings.CutPrefix(rest, "group/"); isGroup {
+		return "", slug, slug != "" && !strings.Contains(slug, "/")
+	}
+	return rest, "", rest != "" && !strings.Contains(rest, "/")
+}
+
 // StateTopic is the retained JSON state topic of a device.
 func (c TopicConfig) StateTopic(addr string) string {
 	return c.base() + "/" + strings.ToLower(addr) + "/state"

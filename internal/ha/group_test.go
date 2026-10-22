@@ -143,3 +143,17 @@ func TestSlugify(t *testing.T) {
 		}
 	}
 }
+
+func TestGroupAvailability(t *testing.T) {
+	cfg := TopicConfig{}
+	for _, m := range GroupDiscoveryMessages(cfg, GroupDesc{Slug: "bad", Name: "Bad"}) {
+		v := decode(t, m)
+		av, _ := v["availability"].([]any)
+		if len(av) != 2 || v["availability_mode"] != "all" || av[1].(map[string]any)["topic"] != "hmbridge/group/bad/availability" {
+			t.Errorf("%s: availability = %v", m.Topic, v["availability"])
+		}
+	}
+	if m := GroupAvailabilityMessage(cfg, "bad", false); m.Topic != "hmbridge/group/bad/availability" || string(m.Payload) != "offline" || !m.Retain {
+		t.Errorf("GroupAvailabilityMessage = %+v", m)
+	}
+}
