@@ -22,8 +22,10 @@ dist:
 	GOOS=linux GOARCH=amd64       CGO_ENABLED=0 go build $(GOFLAGS) -ldflags '$(LDFLAGS)' -o dist/hmbridge-$(VERSION)-linux-amd64 ./cmd/hmbridge
 	GOOS=linux GOARCH=arm64       CGO_ENABLED=0 go build $(GOFLAGS) -ldflags '$(LDFLAGS)' -o dist/hmsniff-$(VERSION)-linux-arm64 ./cmd/hmsniff
 	GOOS=linux GOARCH=arm GOARM=7 CGO_ENABLED=0 go build $(GOFLAGS) -ldflags '$(LDFLAGS)' -o dist/hmsniff-$(VERSION)-linux-armv7 ./cmd/hmsniff
+	GOOS=linux GOARCH=arm64       CGO_ENABLED=0 go build $(GOFLAGS) -ldflags '$(LDFLAGS)' -o dist/hmgenconfig-$(VERSION)-linux-arm64 ./cmd/hmgenconfig
+	GOOS=linux GOARCH=arm GOARM=7 CGO_ENABLED=0 go build $(GOFLAGS) -ldflags '$(LDFLAGS)' -o dist/hmgenconfig-$(VERSION)-linux-armv7 ./cmd/hmgenconfig
 	cp LICENSE dist/LICENSE
-	cd dist && sha256sum hmbridge-$(VERSION)-* hmsniff-$(VERSION)-* > SHA256SUMS-$(VERSION)
+	cd dist && sha256sum hmbridge-$(VERSION)-* hmsniff-$(VERSION)-* hmgenconfig-$(VERSION)-* > SHA256SUMS-$(VERSION)
 
 clean:
 	rm -rf dist hmbridge

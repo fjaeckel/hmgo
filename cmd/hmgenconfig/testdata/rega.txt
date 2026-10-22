@@ -1,0 +1,13 @@
+NEQ0873206	Büro Heizung
+MEQ1571441	Büro Wandthermostat
+SEQ2094299	Büro Fenster
+NEQ1004984	Spielzimmer Heizung
+REQ0836840	Spielzimmer Wandthermostat
+SEQ2094449	Spielzimmer Tür
+NEQ1007152	Wohnzimmer Heizkörper
+REQ0836852	Wohnzimmer Wandthermostat
+PEQ1190989	Wohnzimmer Heizkörper
+PEQ1315854	Küche Heizung
+LEQ0123456	Stehlampe Schalter
+BidCoS-RF	Zentrale
+<xml><exec>/rega.exe</exec><sessionId></sessionId><httpUserAgent></httpUserAgent><sId>2</sId><oDev>1234</oDev></xml>

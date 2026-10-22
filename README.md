@@ -69,7 +69,10 @@ GOOS=linux GOARCH=arm64 go build -o hmbridge ./cmd/hmbridge          # 64-bit OS
 GOOS=linux GOARCH=arm GOARM=7 go build -o hmbridge ./cmd/hmbridge    # 32-bit OS, Pi 2/3/4
 GOOS=linux GOARCH=arm GOARM=6 go build -o hmbridge ./cmd/hmbridge    # Pi 1 / Zero
 
-# Write a configuration (see internal/config/example.json) and check it.
+# Write a configuration and check it: either run hmgenconfig on your
+# OpenCCU (while it is running) and fill in the passphrase and MQTT
+# settings, or write it by hand (see internal/config/example.json).
+./hmgenconfig > config.json
 ./hmbridge -config config.json -check_config
 
 # Run.
@@ -102,6 +105,11 @@ A minimal configuration:
 
 [internal/config/example.json](internal/config/example.json) documents every
 option. Omit `security` if you never set a system security key on your CCU.
+
+`cmd/hmgenconfig` generates the whole configuration (devices, names, AES
+settings, heating groups) from a running OpenCCU; it reads nothing secret and
+changes nothing. See "Generating the configuration" in
+[docs/DEPLOY.md](docs/DEPLOY.md#generating-the-configuration).
 
 ## Home Assistant
 
@@ -177,7 +185,7 @@ Stapelberg's [hmgo](https://github.com/stapelberg/hmgo) (Copyright (c) 2017
 Michael Stapelberg); files that come from hmgo carry his copyright line in
 their header. Michael Stapelberg does not endorse this fork.
 
-`hmbridge -license` and `hmsniff -license` print the license. Protocol
+`hmbridge -license`, `hmsniff -license` and `hmgenconfig -license` print the license. Protocol
 knowledge comes from [FHEM](https://fhem.de/) (HMUARTLGW, CUL_HM),
 [Homegear](https://homegear.eu/) and [RFNETHM](https://github.com/tostmann/RFNETHM);
 no code from these GPL projects is included. The AES test vectors in

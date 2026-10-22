@@ -1,0 +1,4 @@
+HM_HMIP_DEV='RPI-RF-MOD'
+HM_HMIP_DEVNODE='/dev/mmd_hmip'
+HM_HMRF_DEV='RPI-RF-MOD'
+HM_HMRF_DEVNODE='/dev/mmd_bidcos'

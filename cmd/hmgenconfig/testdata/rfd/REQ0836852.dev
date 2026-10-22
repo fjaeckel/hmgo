@@ -1,0 +1,3 @@
+<device serial="REQ0836852" type="HM-TC-IT-WM-W-EU" address="0x2B1008" aes_key_index="2" firmware_version="1.5" interface="Default">
+	<config/>
+</device>

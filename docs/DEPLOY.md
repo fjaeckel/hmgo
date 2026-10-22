@@ -40,9 +40,89 @@ hmbridge logs a hint when a device's messages fail AES authentication.
 
 ## 2. Configuration
 
-Copy `internal/config/example.json` to `/etc/hmbridge/config.json` and fill
-in `central_address`, the MQTT broker of your Home Assistant installation and
-one entry per device. Start with one device and add the rest once it works.
+The easiest way is to let `hmgenconfig` write the configuration from your
+OpenCCU (next section). You can also write it by hand: copy
+`internal/config/example.json` to `/etc/hmbridge/config.json` and fill in
+`central_address`, the MQTT broker of your Home Assistant installation and one
+entry per device.
+
+### Generating the configuration
+
+`hmgenconfig` runs on OpenCCU's Pi **while OpenCCU is running normally** and
+prints a ready-to-use hmbridge configuration with all your BidCoS devices,
+their names, addresses, AES settings and heating groups.
+
+It only reads; nothing on OpenCCU is changed. It never reads key material
+(`/etc/config/keys` or similar), so the security passphrase is left for you to
+fill in. Its sources, each optional:
+
+| Source | What it provides | Flag to change / disable (`""`) |
+| --- | --- | --- |
+| `/etc/config/ids` | `central_address` (`BidCoS-Address`, converted to hex) | `-ids` |
+| `/etc/config/rfd/*.dev` | address, model, serial and AES key index of every device | `-rfd` |
+| rfd's XML-RPC API, `http://127.0.0.1:2001/` (`listDevices`) | which channels have AES ("secured" transmission mode); also devices and central address if the files are missing | `-xmlrpc` |
+| ReGaHss, `http://127.0.0.1:8183/rega.exe` (a read-only script) | the device names you gave in the WebUI | `-rega` |
+| `/etc/config/groups.gson` | the heating groups (`HomeMatic.heating`) | `-groups` |
+| `/var/hm_mode` | the radio module (`radio`) | `-hm_mode` |
+
+The names and AES settings need OpenCCU's services: if rfd or ReGaHss is not
+running (e.g. you already stopped them for hmbridge), `hmgenconfig` still
+writes a valid configuration, but with generated names (the group name plus
+the model, or the model plus the serial) and every device's AES state marked
+"unknown" (`aes` off). It tells you on stderr what it used and what was
+missing.
+
+Copy the binary (`hmgenconfig-…-linux-arm64` for OpenCCU on a Pi 3/4/5,
+`…-linux-armv7` for a 32-bit system) to the Pi and run it as root:
+
+```sh
+scp dist/hmgenconfig-*-linux-arm64 root@openccu:/usr/local/hmgenconfig
+ssh root@openccu
+cd /usr/local
+./hmgenconfig > config.json          # or: ./hmgenconfig -out config.json
+```
+
+If something looks wrong, run `./hmgenconfig -dump > config.json 2> dump.txt`:
+`dump.txt` then contains the raw inputs (first line of every `.dev` file,
+the `listDevices` summary, the ReGaHss output and `groups.gson`; no keys), which
+helps when reporting a problem.
+
+Then edit `config.json`:
+
+1. `security.passphrase`: replace `CHANGE-ME` with OpenCCU's system security
+   key. `security.index` is the key index most of your devices use (from the
+   `.dev` files). If some AES devices still use an older index, there is a
+   `security.previous` block with `CHANGE-ME-PREVIOUS` and those devices carry
+   `"key_index"`; enter the old passphrase, or re-key the devices in OpenCCU
+   and remove both. If all devices use the default key (index 0), there is no
+   `security` block.
+2. `mqtt`: the broker URL, user name and password of your Home Assistant MQTT
+   broker.
+
+What else to look at before the first run:
+
+* `devices` are sorted by group, then by name. `aes` is set when OpenCCU
+  reports AES active on any channel; `aes_channels` only appears when just some
+  channels are secured (typically `[2]` on a wall thermostat). Device names
+  must be unique: duplicates get the serial appended. A `_comment` on a device
+  says when its name was generated or its AES state is unknown.
+* `groups` mirror OpenCCU's heating groups; members refer to device names.
+  Groups without a supported thermostat are left out, and a device can only be
+  in one group.
+* Devices hmbridge does not support yet (switches, dimmers, remotes, the
+  central itself …) are not in `devices`; they are listed in the top-level
+  `_comment` as `not supported yet: <name> (<model> <address>)`.
+* `serial_port` is `/dev/raw-uart` with `reset` `none`, and `state_file` is
+  `""`, which fits running hmbridge on OpenCCU's Pi (section 3a). For Raspberry
+  Pi OS (section 3b), remove those three lines to get the defaults.
+* To start small, delete devices and groups you don't want yet (and remove
+  deleted devices from the groups' `members`).
+
+Finally check the result:
+
+```sh
+./hmbridge -config config.json -check_config
+```
 
 ## 3a. Running on OpenCCU's Pi without reinstalling (experimental)
 

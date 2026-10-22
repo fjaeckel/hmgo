@@ -1,0 +1,3 @@
+<device serial="NEQ1009870" type="HM-CC-RT-DN" address="0x3A1009" aes_key_index="1" firmware_version="1.5" interface="Default">
+	<config/>
+</device>

@@ -28,7 +28,6 @@ import (
 	"os/signal"
 	"path/filepath"
 	"regexp"
-	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -234,30 +233,6 @@ func enableDump() (func(), error) {
 		}
 		fmt.Fprintln(os.Stderr, "hmsniff: traffic dump disabled again")
 	}, nil
-}
-
-// loadCentral reads "BidCoS-Address = <decimal>" from OpenCCU's ids file.
-func loadCentral(path string) [3]byte {
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return [3]byte{}
-	}
-	for _, line := range strings.Split(string(b), "\n") {
-		k, v, ok := strings.Cut(line, "=")
-		if !ok || strings.TrimSpace(k) != "BidCoS-Address" {
-			continue
-		}
-		v = strings.TrimSpace(v)
-		base := 10
-		if strings.HasPrefix(strings.ToLower(v), "0x") {
-			v, base = v[2:], 16
-		}
-		n, err := strconv.ParseUint(v, base, 32)
-		if err == nil && n <= 0xFFFFFF {
-			return [3]byte{byte(n >> 16), byte(n >> 8), byte(n)}
-		}
-	}
-	return [3]byte{}
 }
 
 // limitedWriter stops writing after max bytes.
