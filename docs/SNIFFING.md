@@ -54,7 +54,8 @@ what every one of your devices reports.
   `echo 0 > /sys/class/raw-uart/raw-uart/dump_traffic`. A reboot also resets it.
 * `hmsniff -replay <file>` decodes a saved kernel log (e.g. `dmesg` output)
   instead of recording.
-* To record how OpenCCU initialises the module, start hmsniff and then run
-  `/etc/init.d/S60multimacd restart` in a second session. This briefly
-  interrupts OpenCCU's radio (a few seconds); the module may receive the AES key
-  during the restart, which hmsniff redacts.
+* Do **not** restart OpenCCU's `multimacd` while recording: rfd and
+  HMIPServer depend on it, and on an RPI-RF-MOD system a lone multimacd restart
+  can end in a reboot of the whole box (which also wipes `/tmp`, including the
+  log). A plain recording while OpenCCU runs normally is all that is needed.
+* Copy the log off the box before rebooting it: `/tmp` is in RAM.
