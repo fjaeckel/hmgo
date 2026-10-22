@@ -7,7 +7,7 @@
 // devices, answers time requests and keeps the module's clock in sync.
 //
 // Concurrency: Run's event loop owns all device state. Other goroutines
-// (the MQTT client's OnConnect callback, HTTP handlers) only read state
+// (the MQTT client's OnConnect callback, API handlers) only read state
 // through methods that take b.mu. Commands are executed sequentially by
 // a separate worker goroutine, because a single radio command can take
 // several seconds (burst transmission, retries), during which received
@@ -87,7 +87,7 @@ type Options struct {
 	// for a missing release. Zero means 500ms.
 	ReleaseCheckInterval time.Duration
 	// HMIP, if set, lists the Homematic IP devices the radio module
-	// heard on the status page.
+	// heard in the API (/api/v1/unknown).
 	HMIP *HMIPMonitor
 	// PairingDuration overrides the configured pairing mode duration
 	// (for tests). Zero means the configuration.
@@ -184,7 +184,7 @@ type device struct {
 	state    ha.State
 	msgs     uint64
 	lastAuth bidcos.Auth
-	// lastEvent is the type of the last decoded event, for the status page.
+	// lastEvent is the type of the last decoded event, for the API.
 	lastEvent string
 	// lastOnTarget is the last target temperature that was not “off”,
 	// used when HA switches the device back to heat mode.
@@ -235,17 +235,18 @@ type group struct {
 const maxUnknownSenders = 100
 
 // UnknownSender describes a radio address that talked to the central but
-// is not configured. Shown on the status page to help with setup.
+// is not configured. Listed by the API (/api/v1/unknown) to help with
+// setup.
 type UnknownSender struct {
-	Address  string
-	Messages uint64
-	LastSeen time.Time
-	LastCmd  string
-	RSSI     int
+	Address  string    `json:"address"`
+	Messages uint64    `json:"messages"`
+	LastSeen time.Time `json:"last_seen"`
+	LastCmd  string    `json:"last_cmd"`
+	RSSI     int       `json:"rssi"`
 	// Serial and ModelID are known once the device sent DEVICE_INFO
 	// (e.g. config button pressed).
-	Serial  string
-	ModelID string
+	Serial  string `json:"serial"`
+	ModelID string `json:"model_id"`
 }
 
 // New builds the device registry from the configuration.
@@ -856,7 +857,7 @@ func (b *Bridge) recordUnknown(pkt *bidcos.Packet) {
 		u = &UnknownSender{Address: fmt.Sprintf("%x", pkt.Source[:])}
 		b.unknown[pkt.Source] = u
 		// Random forged addresses would log a line per frame.
-		b.floodLog.Logf(b.logf, floodKeyUnknown, "ignoring messages from unconfigured device %s (cmd %02x, rssi %d dBm); see the status page", u.Address, pkt.Cmd, pkt.RSSI())
+		b.floodLog.Logf(b.logf, floodKeyUnknown, "ignoring messages from unconfigured device %s (cmd %02x, rssi %d dBm); see /api/v1/unknown", u.Address, pkt.Cmd, pkt.RSSI())
 	}
 	u.Messages++
 	u.LastSeen = b.now()
@@ -989,17 +990,16 @@ func (o *outbox) take() []ha.Message {
 	return res
 }
 
-// Snapshot is a read-only view of the bridge state for the status page
-// and the JSON API.
+// Snapshot is a read-only view of the bridge state (tests, and the
+// deprecated /api/state; the API in api.go builds its own views).
 type Snapshot struct {
-	Started time.Time         `json:"started"`
-	Pairing PairingSnapshot   `json:"pairing"`
-	Devices []DeviceSnapshot  `json:"devices"`
-	Groups  []GroupSnapshot   `json:"groups"`
-	Unknown []UnknownSender   `json:"unknown_senders"`
-	HMIP    []HMIPDevice      `json:"hmip_heard,omitempty"`
-	Queue   int               `json:"command_queue"`
-	Extra   map[string]string `json:"info,omitempty"`
+	Started time.Time        `json:"started"`
+	Pairing PairingSnapshot  `json:"pairing"`
+	Devices []DeviceSnapshot `json:"devices"`
+	Groups  []GroupSnapshot  `json:"groups"`
+	Unknown []UnknownSender  `json:"unknown_senders"`
+	HMIP    []HMIPDevice     `json:"hmip_heard,omitempty"`
+	Queue   int              `json:"command_queue"`
 }
 
 type DeviceSnapshot struct {
@@ -1013,7 +1013,7 @@ type DeviceSnapshot struct {
 	Paired    bool   `json:"paired,omitempty"`
 	LastEvent string `json:"last_event,omitempty"`
 	// Summary is a short rendering of a switch, dimmer, LED display or
-	// remote state for the status page.
+	// remote state.
 	Summary string   `json:"summary,omitempty"`
 	State   ha.State `json:"state"`
 	// Settings is the status of the device's settings (see the

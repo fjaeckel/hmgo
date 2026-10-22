@@ -10,8 +10,8 @@ import (
 	"time"
 )
 
-// Limits of the status page / metrics server. It serves small pages to
-// a browser and a Prometheus scraper; nothing needs more.
+// Limits of the API / metrics server. It serves small JSON documents
+// and a Prometheus scrape; nothing needs more.
 const (
 	httpReadHeaderTimeout = 10 * time.Second
 	httpReadTimeout       = 10 * time.Second
@@ -23,7 +23,7 @@ const (
 	httpMaxConns = 64
 )
 
-// newHTTPServer returns the server for the status page and /metrics.
+// newHTTPServer returns the server for the API and /metrics.
 func newHTTPServer(h http.Handler) *http.Server {
 	return &http.Server{
 		Handler:           h,

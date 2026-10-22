@@ -141,7 +141,7 @@ func TestSwitchCommandsAndStatus(t *testing.T) {
 	if v := testutil.ToFloat64(metricLevel.WithLabelValues("6a9d15", "Stehlampe", "HM-LC-Sw1-Pl-DN-R1")); v != 0 {
 		t.Errorf("level metric %v", v)
 	}
-	// Status page.
+	// API summary.
 	snap := e.b.Snapshot()
 	for _, d := range snap.Devices {
 		if d.Name == "Stehlampe" && d.Summary != "off" {

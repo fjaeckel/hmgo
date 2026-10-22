@@ -62,7 +62,7 @@ Package ownership (one owner per package while building in parallel):
 | `internal/hm/params` | device settings: register layout, encoding and validation per model, register read answers, week profile |
 | `internal/store` | persistence: the state directory with `state.json`, `devices.json` and `settings.json` |
 | `internal/ha` | HA discovery payloads, state/command topics, MQTT client |
-| `internal/bridge` | glue: registry, event loop, command handling, status page |
+| `internal/bridge` | glue: registry, event loop, command handling, read-only HTTP API |
 | `cmd/hmbridge` | main: flags, serial setup, GPIO reset, signal handling |
 
 ## Radio module protocol (HM-MOD-RPI-PCB, classic firmware 1.x)
@@ -226,6 +226,32 @@ RT-DN, humidity for TC, fault for RT-DN, window open for TC, RSSI).
 `security` may give `key` (32 hex chars) instead of `passphrase`; omitted
 means the eQ-3 default key (index 0). `previous` holds an optional older
 key in the same format.
+
+### HTTP API
+
+`http_listen` (default `:8013`) serves `/metrics` and a read-only JSON API
+(`bridge.API`, `internal/bridge/api.go`; user documentation in DEPLOY.md,
+“HTTP API”): `/api/v1/health` (200 ok/degraded, 503 down: radio module
+failed), `/api/v1/bridge`, `/api/v1/devices[/{address}]`,
+`/api/v1/groups`, `/api/v1/unknown`, and `/` as an index. There is no web
+UI and no state-changing endpoint: every action (pairing, unpairing,
+renaming, settings) is an MQTT command, so the HTTP side needs no CSRF
+token, origin checks or frame protection. Hardening that remains:
+
+* `bridge.HostAllowlist` on every request (DNS rebinding: a foreign name in
+  `Host` gets 421; IP literals, localhost, the host name and
+  `http_allowed_hosts` are accepted);
+* `bridge.ReadOnly`: anything but GET/HEAD gets 405 with `Allow: GET, HEAD`;
+* server timeouts, 16 KiB header limit, at most 64 connections
+  (`cmd/hmbridge/httpserver.go`);
+* handlers copy what they need under `b.mu` and encode outside it;
+  responses are bounded (4 MiB; the data is bounded anyway);
+* no key material in any response: devices show AES channels and key
+  index only (tested by scanning every response for the keys in hex,
+  base64 and raw form).
+
+`/api/state` (the JSON of the former HTML status page) is kept as a
+deprecated alias for one release (`Deprecation: true` header).
 
 ## Bridge concurrency
 
@@ -415,9 +441,8 @@ Hm-Mod-Rpi-Pcb.cpp, and eQ-3's device descriptions as shipped with Homegear
 (model IDs, AES defaults, receive modes). All GPL: read as references
 only, no code copied.
 
-**Flow.** Pairing mode (HA button `hmbridge/bridge/set/pair`, status page
-POST `/pairing/start` with a same-origin check and the page's random
-per-process token, default 60 s) is state of the event loop. A DEVICE_INFO
+**Flow.** Pairing mode (HA button `hmbridge/bridge/set/pair`, MQTT only;
+default 60 s) is state of the event loop. A DEVICE_INFO
 (cmd 0x00: `fw model(2) serial(10) class peer-channels…`) while it is on
 becomes a priority radio job, so it runs while the device is still in
 config mode. Priority jobs run before all others, FIFO among themselves;
@@ -481,7 +506,7 @@ after a newer one). Read in `bridge.New` after config.json's devices; an
 address or name conflict is resolved in favour of config.json and logged.
 Store devices may use key index 0 (`config.ResolveStoreDevice`); a record
 that does not resolve (e.g. its key index is no longer configured) is
-logged, shown on the status page and written back unchanged, so fixing the
+logged, reported by the API (`/api/v1/bridge` warnings) and written back unchanged, so fixing the
 configuration brings it back. Renaming replaces the device entry (jobs of
 the old entry are applied to the new one by address).
 
@@ -505,11 +530,11 @@ rules for every file:
 * a damaged or unreadable file is renamed to `<name>.corrupt-<UTC time>`
   (the newest three are kept) before anything can overwrite it, logged,
   and hmbridge continues without the data (never blocks startup); a
-  damaged devices file is also shown on the status page;
+  damaged devices file is also reported by the API;
 * a file with a newer version (after a downgrade), a symlink, or a damaged
   file that cannot be moved aside is left alone and *blocks* writes
   (`File.Blocked`): for `devices.json` this disables pairing, unpairing
-  and renaming, with the reason on the status page.
+  and renaming, with the reason in the API (`pairing.disabled_reason`).
 
 Compatibility: the deprecated `state_file` and `devices_file` (logged at
 startup) still name exact paths (`""` disables that file); `state_dir`

@@ -318,7 +318,7 @@ func (b *Bridge) expireLongPresses() {
 }
 
 // summary renders the state of switches, dimmers, the LED display and
-// remotes for the status page.
+// remotes for the API.
 func summary(kind ha.Kind, st *ha.State, lastEvent string) string {
 	switch kind {
 	case ha.Switch:

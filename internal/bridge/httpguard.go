@@ -4,6 +4,7 @@
 package bridge
 
 import (
+	"encoding/json"
 	"net"
 	"net/http"
 	"net/netip"
@@ -14,9 +15,9 @@ import (
 // HostAllowlist refuses HTTP requests whose Host header does not name
 // hmbridge. This stops DNS rebinding: a web site whose DNS name is
 // re-pointed at hmbridge's address after the page loaded would
-// otherwise be same-origin with the status page (read the JSON API,
-// start pairing) and could scrape /metrics. A browser always sends the
-// name it resolved, which is not on the list.
+// otherwise be same-origin with the API and could read it and scrape
+// /metrics from the browser of someone on the LAN. A browser always
+// sends the name it resolved, which is not on the list.
 //
 // Accepted are IP address literals (a browser that connects to an IP
 // address sends that address: no rebinding is possible), "localhost",
@@ -101,6 +102,23 @@ func (a *HostAllowlist) Handler(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !a.Allowed(r.Host) {
 			http.Error(w, "hmbridge: unknown host name; use the IP address, or add the name to http_allowed_hosts in the configuration", http.StatusMisdirectedRequest)
+			return
+		}
+		h.ServeHTTP(w, r)
+	})
+}
+
+// ReadOnly wraps h: only GET and HEAD reach it, other methods get 405
+// Method Not Allowed with "Allow: GET, HEAD". hmbridge's HTTP server
+// never changes anything (actions are MQTT commands).
+func ReadOnly(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			w.Header().Set("Allow", "GET, HEAD")
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("X-Content-Type-Options", "nosniff")
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			json.NewEncoder(w).Encode(APIError{Error: "method not allowed: the API is read-only; actions are done in Home Assistant (MQTT)"})
 			return
 		}
 		h.ServeHTTP(w, r)

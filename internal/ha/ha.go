@@ -1007,7 +1007,7 @@ const MaxNameLength = 64
 
 // ValidDeviceName checks a new device name (Rename). The name ends up
 // in log lines, Prometheus labels (which must be valid UTF-8), Home
-// Assistant and the status page, so it must be valid UTF-8 without
+// Assistant and the HTTP API, so it must be valid UTF-8 without
 // control characters and without invisible format characters (zero
 // width spaces and joiners, bidirectional overrides and isolates, line
 // and paragraph separators, byte order marks) that could make one name

@@ -53,8 +53,8 @@ type Device interface {
 	// HomeMaticType is a short type name used for metrics/status
 	// ("heating", "thermal", "contact", "power").
 	HomeMaticType() string
-	// MostRecentEvents returns the most recent decoded events for the
-	// status page.
+	// MostRecentEvents returns the most recent decoded events (from
+	// hmgo's status page; unused by hmbridge).
 	MostRecentEvents() []Event
 	// Decode decodes a packet received from this device. It returns a
 	// typed event (a pointer to one of the device package's event

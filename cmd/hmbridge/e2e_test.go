@@ -137,7 +137,7 @@ func TestEndToEnd(t *testing.T) {
 	})
 	waitFor(t, "updated target", func() bool { return jsonOf("hmbridge/38f59c/state")["target_temperature"] == 21.5 })
 
-	// Metrics and the status page.
+	// Metrics and the API.
 	metrics := httpGet(t, fmt.Sprintf("http://127.0.0.1:%d/metrics", httpPort))
 	for _, want := range []string{
 		`hmbridge_device_battery_volts{address="38f59c",model="HM-CC-RT-DN",name="Bad"} 3`,
@@ -151,8 +151,23 @@ func TestEndToEnd(t *testing.T) {
 			t.Errorf("/metrics lacks %q", want)
 		}
 	}
-	if page := httpGet(t, fmt.Sprintf("http://127.0.0.1:%d/", httpPort)); !strings.Contains(page, "Bad Fenster") {
-		t.Errorf("status page lacks device name")
+	var dev struct {
+		Name  string         `json:"name"`
+		State map[string]any `json:"state"`
+	}
+	if err := json.Unmarshal([]byte(httpGet(t, fmt.Sprintf("http://127.0.0.1:%d/api/v1/devices/38f59c", httpPort))), &dev); err != nil ||
+		dev.Name != "Bad" || dev.State["target_temperature"] != 21.5 {
+		t.Errorf("/api/v1/devices/38f59c: %v %+v", err, dev)
+	}
+	var health struct {
+		Status string `json:"status"`
+		MQTT   struct {
+			Connected bool `json:"connected"`
+		} `json:"mqtt"`
+	}
+	if err := json.Unmarshal([]byte(httpGet(t, fmt.Sprintf("http://127.0.0.1:%d/api/v1/health", httpPort))), &health); err != nil ||
+		health.Status != "ok" || !health.MQTT.Connected {
+		t.Errorf("/api/v1/health: %v %+v", err, health)
 	}
 
 	cancel()
@@ -243,7 +258,7 @@ func httpGet(t *testing.T, url string) string {
 }
 
 // An http_listen address that cannot be bound makes run fail instead of
-// running without status page and metrics.
+// running without API and metrics.
 func TestRunHTTPListenError(t *testing.T) {
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

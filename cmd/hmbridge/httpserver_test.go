@@ -4,6 +4,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -80,9 +81,9 @@ func TestHTTPServerLimits(t *testing.T) {
 	}
 }
 
-// The status page, the JSON API and /metrics refuse foreign host names
-// (DNS rebinding), and an insecure configuration file is reported on
-// the status page and in /metrics.
+// The API and /metrics refuse foreign host names (DNS rebinding) and
+// every method but GET and HEAD, and an insecure configuration file is
+// reported by the API and in /metrics.
 func TestEndToEndHTTPHardening(t *testing.T) {
 	port := freePort(t)
 	path := filepath.Join(t.TempDir(), "config.json")
@@ -110,8 +111,8 @@ func TestEndToEndHTTPHardening(t *testing.T) {
 	base := fmt.Sprintf("http://127.0.0.1:%d", port)
 	waitTCP(t, fmt.Sprintf("127.0.0.1:%d", port))
 
-	get := func(path, host string) (int, string) {
-		req, _ := http.NewRequest("GET", base+path, nil)
+	do := func(method, path, host string) (int, http.Header, string) {
+		req, _ := http.NewRequest(method, base+path, nil)
 		if host != "" {
 			req.Host = host
 		}
@@ -121,9 +122,14 @@ func TestEndToEndHTTPHardening(t *testing.T) {
 		}
 		defer resp.Body.Close()
 		b, _ := io.ReadAll(resp.Body)
-		return resp.StatusCode, string(b)
+		return resp.StatusCode, resp.Header, string(b)
 	}
-	for _, p := range []string{"/", "/api/state", "/metrics"} {
+	get := func(path, host string) (int, string) {
+		code, _, body := do("GET", path, host)
+		return code, body
+	}
+	paths := []string{"/", "/api/v1/health", "/api/v1/bridge", "/api/v1/devices", "/api/v1/devices/38f59c", "/api/v1/groups", "/api/v1/unknown", "/api/state", "/metrics"}
+	for _, p := range paths {
 		if code, _ := get(p, fmt.Sprintf("evil.example:%d", port)); code != http.StatusMisdirectedRequest {
 			t.Errorf("%s for evil.example: %d", p, code)
 		}
@@ -133,14 +139,33 @@ func TestEndToEndHTTPHardening(t *testing.T) {
 		if code, _ := get(p, fmt.Sprintf("localhost:%d", port)); code != http.StatusOK {
 			t.Errorf("%s for localhost: %d", p, code)
 		}
+		for _, m := range []string{"POST", "PUT", "DELETE"} {
+			if code, h, _ := do(m, p, ""); code != http.StatusMethodNotAllowed || h.Get("Allow") != "GET, HEAD" {
+				t.Errorf("%s %s: %d, Allow %q", m, p, code, h.Get("Allow"))
+			}
+		}
 	}
-	if code, page := get("/", ""); code != http.StatusOK || !strings.Contains(page, "WARNING: "+path+" is readable by every user") {
-		t.Errorf("status page %d:\n%s", code, page)
+	if code, _, _ := do("POST", "/pairing/start", ""); code != http.StatusMethodNotAllowed {
+		t.Errorf("POST /pairing/start: %d", code)
+	}
+	if code, idx := get("/", ""); code != http.StatusOK || !strings.Contains(idx, `"/api/v1/health"`) || strings.Contains(idx, "<html") {
+		t.Errorf("index %d:\n%s", code, idx)
+	}
+	warning := path + " is readable by every user"
+	for _, p := range []string{"/api/v1/health", "/api/v1/bridge"} {
+		var v struct {
+			Status   string   `json:"status"`
+			Warnings []string `json:"warnings"`
+		}
+		_, body := get(p, "")
+		if err := json.Unmarshal([]byte(body), &v); err != nil || len(v.Warnings) == 0 || !strings.Contains(v.Warnings[0], warning) {
+			t.Errorf("%s lacks the warning:\n%s", p, body)
+		}
+		if p == "/api/v1/health" && v.Status != "ok" { // MQTT disabled, clock not required
+			t.Errorf("health %s", body)
+		}
 	}
 	if _, m := get("/metrics", ""); !strings.Contains(m, "hmbridge_config_insecure_permissions 1") {
 		t.Error("/metrics lacks hmbridge_config_insecure_permissions 1")
-	}
-	if _, js := get("/api/state", ""); !strings.Contains(js, `"warnings": [`) {
-		t.Errorf("/api/state lacks the warnings:\n%s", js)
 	}
 }

@@ -15,7 +15,7 @@ import (
 
 // Homematic IP, phase 1 (docs/HMIP.md): the frames the RPI-RF-MOD
 // passes on are decoded for the debug log, and the radio addresses they
-// come from are listed on the status page. Nothing is sent to the
+// come from are listed by the API (/api/v1/unknown). Nothing is sent to the
 // module, nothing is published to MQTT.
 
 var metricHMIPFrames = prometheus.NewCounterVec(prometheus.CounterOpts{

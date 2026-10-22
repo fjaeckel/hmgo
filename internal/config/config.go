@@ -161,12 +161,13 @@ type Config struct {
 
 	MQTT MQTT `json:"mqtt"`
 
-	// HTTPListen is the listen address of the status page and
-	// /metrics. Default ":8013"; "" disables the HTTP server.
+	// HTTPListen is the listen address of the read-only JSON API
+	// (/api/v1/…) and /metrics. Default ":8013"; "" disables the HTTP
+	// server.
 	HTTPListen *string `json:"http_listen,omitempty"`
 
 	// HTTPAllowedHosts lists additional host names under which the
-	// status page and /metrics may be reached (the Host header of the
+	// API and /metrics may be reached (the Host header of the
 	// request), e.g. a DNS name or a reverse proxy's name. IP addresses,
 	// "localhost" and the machine's host name (also with ".local") are
 	// always accepted; requests for other names are refused, so that a

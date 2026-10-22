@@ -63,11 +63,11 @@ func TestHMIPMonitor(t *testing.T) {
 		t.Errorf("debug log:\n%s", log)
 	}
 
-	// The status page lists it.
+	// The API lists it.
 	e := newEnvWith(t, testConfig, fakemod.Options{}, func(o *Options) { o.HMIP = m })
-	srv := httptest.NewServer(e.b.StatusHandler(Info{}))
+	srv := httptest.NewServer(e.b.API(APIOptions{}))
 	defer srv.Close()
-	for path, want := range map[string]string{"/": "HomematicIP devices heard (not supported yet)", "/api/state": `"hmip_heard"`} {
+	for path, want := range map[string]string{"/api/v1/unknown": `"hmip_heard"`, "/api/state": `"hmip_heard"`} {
 		resp, err := srv.Client().Get(srv.URL + path)
 		if err != nil {
 			t.Fatal(err)

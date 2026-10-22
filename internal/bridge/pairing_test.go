@@ -6,15 +6,13 @@ package bridge
 import (
 	"bytes"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
-	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -330,79 +328,42 @@ func TestUnpairRenameAndReload(t *testing.T) {
 	}
 }
 
-func TestPairingStatusPageAndDisabled(t *testing.T) {
+func TestPairingAPIAndDisabled(t *testing.T) {
 	e := newEnvWith(t, pairingConfig(t.TempDir()), fakemod.Options{}, fastPairing)
-	srv := httptest.NewServer(e.b.StatusHandler(nil))
+	srv := httptest.NewServer(e.b.API(APIOptions{}))
 	defer srv.Close()
-	// The page carries a random token that the form must send back.
-	page0 := httpBody(t, srv.URL+"/")
-	m := regexp.MustCompile(`name="token" value="([0-9a-f]{32})"`).FindStringSubmatch(page0)
-	if m == nil {
-		t.Fatalf("no pairing token in the status page:\n%s", page0)
+	pairing := func() map[string]any {
+		var v struct {
+			Pairing map[string]any `json:"pairing"`
+		}
+		if err := json.Unmarshal([]byte(httpBody(t, srv.URL+"/api/v1/bridge")), &v); err != nil {
+			t.Fatal(err)
+		}
+		return v.Pairing
 	}
-	token := m[1]
-	postToken := func(origin, tok string) int {
-		var body io.Reader
-		if tok != "" {
-			body = strings.NewReader(url.Values{"token": {tok}}.Encode())
-		}
-		req, _ := http.NewRequest("POST", srv.URL+"/pairing/start", body)
-		if tok != "" {
-			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-		}
-		if origin != "" {
-			req.Header.Set("Origin", origin)
-		}
-		c := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
-		resp, err := c.Do(req)
+	if p := pairing(); p["enabled"] != true || p["active"] != false || p["status"] != "idle" || p["last_result_at"] != nil {
+		t.Errorf("pairing %v", p)
+	}
+	// The API cannot start pairing (there is no web UI any more).
+	for _, path := range []string{"/pairing/start", "/api/v1/bridge"} {
+		resp, err := http.Post(srv.URL+path, "application/x-www-form-urlencoded", strings.NewReader("token=x"))
 		if err != nil {
 			t.Fatal(err)
 		}
 		resp.Body.Close()
-		return resp.StatusCode
-	}
-	post := func(origin string) int { return postToken(origin, token) }
-	if c := post("http://evil.example"); c != http.StatusForbidden {
-		t.Errorf("cross-origin POST: %d", c)
-	}
-	if c := post(""); c != http.StatusForbidden {
-		t.Errorf("POST without Origin: %d", c)
-	}
-	if resp, _ := http.Get(srv.URL + "/pairing/start"); resp.StatusCode != http.StatusMethodNotAllowed {
-		t.Errorf("GET: %d", resp.StatusCode)
-	}
-	// Same origin (e.g. curl -H Origin:…) without or with a wrong token.
-	if c := postToken(srv.URL, ""); c != http.StatusForbidden {
-		t.Errorf("POST without token: %d", c)
-	}
-	if c := postToken(srv.URL, strings.Repeat("0", 32)); c != http.StatusForbidden {
-		t.Errorf("POST with a wrong token: %d", c)
-	}
-	if e.pairingState()["active"] == true {
-		t.Fatal("pairing started by a refused request")
-	}
-	if c := post(srv.URL); c != http.StatusSeeOther {
-		t.Errorf("same-origin POST: %d", c)
-	}
-	e.waitFor("pairing mode", func() bool { return e.pairingState()["active"] == true })
-	resp, err := http.Get(srv.URL + "/")
-	if err != nil {
-		t.Fatal(err)
-	}
-	var page bytes.Buffer
-	page.ReadFrom(resp.Body)
-	resp.Body.Close()
-	if !strings.Contains(page.String(), "Status: <b>active</b>") || !strings.Contains(page.String(), `action="/pairing/start"`) ||
-		!strings.Contains(page.String(), "publicly known eQ-3 default key") {
-		t.Errorf("status page:\n%s", page.String())
-	}
-	for k, want := range map[string]string{"X-Frame-Options": "DENY", "Cache-Control": "no-store"} {
-		if got := resp.Header.Get(k); got != want {
-			t.Errorf("%s: %q, want %q", k, got, want)
+		if resp.StatusCode != http.StatusMethodNotAllowed || resp.Header.Get("Allow") != "GET, HEAD" {
+			t.Errorf("POST %s: %d %v", path, resp.StatusCode, resp.Header)
 		}
 	}
-	if csp := resp.Header.Get("Content-Security-Policy"); !strings.Contains(csp, "frame-ancestors 'none'") {
-		t.Errorf("CSP %q", csp)
+	time.Sleep(50 * time.Millisecond)
+	if e.pairingState()["active"] == true {
+		t.Fatal("pairing started by an HTTP request")
+	}
+	// Home Assistant starts it; the API shows it.
+	e.b.Commands() <- ha.Command{Kind: ha.StartPairing}
+	e.waitFor("pairing mode", func() bool { return e.pairingState()["active"] == true })
+	if p := pairing(); p["active"] != true || p["status"] != "active" || p["aes"] != "system_key" || p["remaining_seconds"].(float64) <= 0 {
+		t.Errorf("pairing %v", p)
 	}
 
 	// state_dir "": pairing is disabled.
@@ -418,7 +379,7 @@ func TestPairingStatusPageAndDisabled(t *testing.T) {
 
 // A damaged devices file is moved aside before anything is written, so
 // that the next pairing does not destroy the paired devices; the
-// problem is shown on the status page.
+// problem is reported by the API.
 func TestDamagedDevicesFileQuarantined(t *testing.T) {
 	dir := t.TempDir()
 	file := filepath.Join(dir, "devices.json")
@@ -439,10 +400,16 @@ func TestDamagedDevicesFileQuarantined(t *testing.T) {
 	if _, err := os.Stat(file); !os.IsNotExist(err) {
 		t.Errorf("devices file still in place: %v", err)
 	}
-	rec := httptest.NewRecorder()
-	e.b.StatusHandler(nil).ServeHTTP(rec, httptest.NewRequest("GET", "/", nil))
-	if !strings.Contains(rec.Body.String(), "the devices file was damaged") {
-		t.Errorf("status page lacks the warning:\n%s", rec.Body.String())
+	for _, path := range []string{"/api/v1/bridge", "/api/v1/health"} {
+		rec := httptest.NewRecorder()
+		e.b.API(APIOptions{}).ServeHTTP(rec, httptest.NewRequest("GET", path, nil))
+		var v struct {
+			Warnings []string `json:"warnings"`
+		}
+		json.Unmarshal(rec.Body.Bytes(), &v)
+		if len(v.Warnings) != 1 || !strings.Contains(v.Warnings[0], "the devices file was damaged") {
+			t.Errorf("%s lacks the warning:\n%s", path, rec.Body.String())
+		}
 	}
 }
 
@@ -463,9 +430,13 @@ func TestNewerDevicesFileDisablesPairing(t *testing.T) {
 		return e.pairingState()["status"] == "disabled" && strings.Contains(e.lastResult(), "newer hmbridge")
 	})
 	rec := httptest.NewRecorder()
-	e.b.StatusHandler(nil).ServeHTTP(rec, httptest.NewRequest("GET", "/", nil))
-	if !strings.Contains(rec.Body.String(), "Pairing is disabled (the devices file cannot be used") {
-		t.Errorf("status page:\n%s", rec.Body.String())
+	e.b.API(APIOptions{}).ServeHTTP(rec, httptest.NewRequest("GET", "/api/v1/bridge", nil))
+	var v struct {
+		Pairing APIPairing `json:"pairing"`
+	}
+	json.Unmarshal(rec.Body.Bytes(), &v)
+	if v.Pairing.Enabled || !strings.HasPrefix(v.Pairing.DisabledReason, "the devices file cannot be used") {
+		t.Errorf("/api/v1/bridge:\n%s", rec.Body.String())
 	}
 	e.stop()
 	if b, _ := os.ReadFile(file); string(b) != newer {

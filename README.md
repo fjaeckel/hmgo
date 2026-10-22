@@ -22,7 +22,7 @@ heating groups.
   devices keep talking to "their" central. Direct links between devices (wall
   thermostat ↔ valves, window contact → valve) are left untouched.
 * **Pairing new devices** without a CCU: press "Pair new device" in Home
-  Assistant (or on the status page), then the device's config button.
+  Assistant, then the device's config button.
   hmbridge configures it like a CCU (central address, AES key exchange to your
   system key, AES on contacts and buttons), keeps it in a small devices file
   and shows it in Home Assistant at once. Devices paired with hmbridge can be
@@ -58,8 +58,12 @@ heating groups.
   * Per-device state.
   * The radio module (frames, acks, retries, duty cycle, errors).
   * MQTT and commands.
-* **Status page** at `/` listing all devices, plus radio addresses that talk
-  to the central but are not configured (handy for finding device addresses).
+* **Read-only JSON API** (`/api/v1/health`, `/bridge`, `/devices`,
+  `/unknown`) for monitoring and scripts: health check (HTTP 503 when the
+  radio is down), device state, and radio addresses that talk to the central
+  but are not configured (handy for finding device addresses). There is no
+  web UI; pairing, unpairing, renaming and settings are done in Home
+  Assistant. See [docs/DEPLOY.md](docs/DEPLOY.md#http-api).
 * **Survives restarts:** the last known state is read back from the MQTT
   broker, with a small state file as fallback that is written rarely to
   spare the SD card. Paired devices, that state and the device settings

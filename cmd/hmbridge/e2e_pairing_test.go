@@ -158,11 +158,11 @@ func TestEndToEndPairing(t *testing.T) {
 		p, ok := mod2.Peers()[e2eNewSCo]
 		return ok && p.KeyIndex == 2 && fmt.Sprint(p.AESChannels(2)) == "[1]"
 	})
-	var st bridge.Snapshot
-	waitFor(t, "status API", func() bool {
-		return json.Unmarshal([]byte(httpGet(t, fmt.Sprintf("http://127.0.0.1:%d/api/state", httpPort))), &st) == nil && len(st.Devices) == 1
+	var devs []bridge.APIDevice
+	waitFor(t, "API", func() bool {
+		return json.Unmarshal([]byte(httpGet(t, fmt.Sprintf("http://127.0.0.1:%d/api/v1/devices", httpPort))), &devs) == nil && len(devs) == 1
 	})
-	if d := st.Devices[0]; d.Name != "HM-Sec-SCo NEQ0000002" || !d.Paired || !d.AES {
+	if d := devs[0]; d.Name != "HM-Sec-SCo NEQ0000002" || d.Source != "paired" || !d.AES.Enabled || d.AES.KeyIndex != 2 || fmt.Sprint(d.AES.Channels) != "[1]" {
 		t.Errorf("device after restart %+v", d)
 	}
 

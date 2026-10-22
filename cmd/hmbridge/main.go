@@ -195,19 +195,12 @@ func run(ctx context.Context, cfg *config.Config, uart io.ReadWriteCloser) error
 	}
 
 	if addr := cfg.HTTPListenAddr(); addr != "" {
+		// Read-only: GET and HEAD only; all actions are MQTT commands.
 		mux := http.NewServeMux()
-		mux.Handle("/metrics", promhttp.Handler())
-		mux.Handle("/", b.StatusPage(bridge.StatusOptions{
-			Info: bridge.Info{
-				"version":  version(),
-				"module":   conn.Kind(),
-				"firmware": conn.FirmwareVersion(),
-				"serial":   conn.SerialNumber(),
-			},
-			Warnings: permWarnings,
-		}))
-		// Every request (status page, JSON, /metrics) must name hmbridge
-		// in its Host header (DNS rebinding).
+		mux.Handle("/metrics", bridge.ReadOnly(promhttp.Handler()))
+		mux.Handle("/", b.API(bridge.APIOptions{Warnings: permWarnings}))
+		// Every request (API, /metrics) must name hmbridge in its Host
+		// header (DNS rebinding).
 		srv := newHTTPServer(bridge.NewHostAllowlist(addr, cfg.HTTPAllowedHosts).Handler(mux))
 		// Listen before serving in the background: an address that
 		// cannot be bound is a startup error, not a log line.
@@ -222,7 +215,7 @@ func run(ctx context.Context, cfg *config.Config, uart io.ReadWriteCloser) error
 			}
 		}()
 		defer srv.Close()
-		log.Printf("status page and metrics on %s", addr)
+		log.Printf("read-only HTTP API (/api/v1) and metrics on %s", addr)
 	}
 
 	if broker := cfg.MQTT.BrokerURL(); broker != "" {

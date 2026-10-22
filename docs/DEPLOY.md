@@ -187,7 +187,7 @@ creates:
 The key is never printed and never written into `config.json`. **Back up
 `system.key`** (and later `devices.json`) somewhere safe: without it, every
 device that got the key while pairing must be factory-reset and paired
-again. hmbridge warns (log, status page, `-check_config`) if the key file is
+again. hmbridge warns (log, `GET /api/v1/health`, `-check_config`) if the key file is
 accessible by its group or other users. `hmbridge init` never overwrites an
 existing configuration or key file.
 
@@ -225,8 +225,9 @@ journalctl -u hmbridge -f
 The unit runs hmbridge as `hmbridge` in a sandbox with access only to the
 serial port, the GPIO chips, `/etc/hmbridge` (read-only) and
 `/var/lib/hmbridge`. The log shows `radio module ready: …` and `MQTT
-connected to …`. The status page is on port 8013 (see
-[3b](#3b-running-on-raspberry-pi-os-final-setup) for who can reach it).
+connected to …`. The read-only [HTTP API](#http-api) and `/metrics` are on
+port 8013; `curl -s localhost:8013/api/v1/health` should say `"status": "ok"`
+once MQTT is connected.
 
 ### Step 9: MQTT in Home Assistant
 
@@ -481,7 +482,7 @@ On a Raspberry Pi OS Lite installation:
    `sudo install -d -m 0750 -o root -g hmbridge /etc/hmbridge` and
    `sudo install -m 0640 -o root -g hmbridge config.json /etc/hmbridge/config.json`,
    and `contrib/systemd/hmbridge.service` to `/etc/systemd/system/`. hmbridge
-   warns (log, status page, `-check_config`, metric
+   warns (log, `GET /api/v1/health`, `-check_config`, metric
    `hmbridge_config_insecure_permissions`) if the config file is readable
    by other users or groups, writable by its group, or owned by another user.
 4. A Raspberry Pi has no battery-backed clock. Make sure NTP works
@@ -500,24 +501,67 @@ is attached first; `reset_gpio` overrides the line). The steps of the
 [fresh installation](#fresh-installation-no-openccu) (UART, user, binary,
 `hmbridge probe`, systemd) apply here as well.
 
-The status page and `/metrics` listen on all interfaces (`:8013`) so that
-Prometheus can scrape them. They contain no keys or passwords, but they are
-not harmless: they show every device's name, model, address, serial
-number, state and battery level (which windows are open, whether someone is
-home), and the status page can **start pairing mode** (button "Pair new
-device"). The button needs a random token embedded in the page and a
-request from the page itself, so other web sites cannot press it in your
-browser; anyone who can open the page on your network can. Set
-`"http_listen": "127.0.0.1:8013"` to keep it local (and scrape through an
-SSH tunnel or a local Prometheus agent), or restrict port 8013 in your
-firewall.
+The [HTTP API](#http-api) and `/metrics` listen on all interfaces (`:8013`)
+so that Prometheus and monitoring can reach them. They are read-only (only
+`GET` and `HEAD`; everything else gets "405 Method Not Allowed") and contain
+no keys or passwords, but they are not harmless: they show every device's
+name, model, address, serial number, state and battery level (which windows
+are open, whether someone is home). Set `"http_listen": "127.0.0.1:8013"` to
+keep them local (and scrape through an SSH tunnel or a local Prometheus
+agent), or restrict port 8013 in your firewall.
 
 Requests must name hmbridge in their `Host` header: an IP address,
 `localhost`, the machine's host name (also `<name>.local`), or a name listed
 in `"http_allowed_hosts": ["hmbridge.example.lan"]` (e.g. behind a reverse
 proxy; `"*"` accepts any name). Other names get "421 Misdirected Request".
 This stops DNS rebinding, where a web site you visit re-points its own name
-to hmbridge's address to read the status page from your browser.
+to hmbridge's address to read the API from your browser.
+
+### HTTP API
+
+hmbridge has no web UI. Port 8013 serves a small **read-only** JSON API for
+monitoring and scripts; pairing, unpairing, renaming and device settings are
+done in Home Assistant (MQTT) only. All responses are JSON
+(`Content-Type: application/json`, field names in `snake_case`, times in
+RFC 3339); errors are `{"error": "…"}` with 404 (unknown path or device) or
+405 (any method but `GET`/`HEAD`, with `Allow: GET, HEAD`). No response ever
+contains key material: devices show their AES channels and key index only.
+
+| endpoint | content |
+|---|---|
+| `GET /` | index of the endpoints |
+| `GET /api/v1/health` | `status` (`ok`, `degraded`, `down`), `radio` (`ok`, `kind`, `last_error`), `mqtt` (`enabled`, `connected`), `clock_synced`, `clock_sync_required`, `warnings`. HTTP 200 for `ok` and `degraded`, **503 for `down`** |
+| `GET /api/v1/bridge` | `version`, `go_version`, `started`, `uptime_seconds`, `module` (`kind`, `firmware`, `serial`, `sgtin`), `central_address`, `state_dir`, `pairing` (`enabled`, `disabled_reason`, `active`, `status`, `remaining_seconds`, `aes`, `last_result`, `last_result_at`, `unpair_waiting`), `devices` (count), `command_queue`, `warnings` (insecure configuration permissions, `devices.json` problems) |
+| `GET /api/v1/devices` | list of devices, each as below |
+| `GET /api/v1/devices/{address}` | one device (address: 6 hex digits, any case; 404 if unknown): `name`, `model`, `address`, `serial`, `source` (`config` or `paired`), `group`, `available`, `last_seen`, `rssi`, `messages_received`, `aes` (`enabled`, `channels`, `key_index`), `last_event`, `summary`, `last_command`, `state` (exactly as published to Home Assistant on `hmbridge/<address>/state`), `settings` (as published on `hmbridge/<address>/settings`: `current`, `status`, `detail` per changed setting, `read_at`; `null` for models without settings) |
+| `GET /api/v1/groups` | heating groups: `name`, `slug`, `members`, `state` |
+| `GET /api/v1/unknown` | `unknown_senders` (radio addresses that sent to the central but are not configured: `address`, `messages`, `last_seen`, `last_cmd`, `rssi`, `serial`, `model_id`; at most 100) and `hmip_heard` (Homematic IP devices the RPI-RF-MOD heard, [HMIP.md](HMIP.md)) |
+| `GET /metrics` | Prometheus metrics |
+
+`status` is `down` when the radio module failed (hmbridge then exits and
+systemd restarts it), `degraded` while MQTT is enabled but not connected or
+the system clock is not synchronised although `require_synced_clock` is set.
+`warnings` lists those reasons and configuration problems; the latter do not
+change `status`.
+
+```sh
+# Health check (exit status 0 unless down), e.g. for a monitoring system:
+curl -fsS http://hmbridge.lan:8013/api/v1/health | jq -r .status
+
+# Battery and signal of all devices:
+curl -s http://hmbridge.lan:8013/api/v1/devices |
+  jq -r '.[] | [.name, .state.battery_voltage, .state.low_battery, .rssi, .last_seen] | @tsv'
+
+# One device's settings and the result of the last command:
+curl -s http://hmbridge.lan:8013/api/v1/devices/38f59c | jq '{last_command, settings}'
+
+# Addresses of devices that talk to the central but are not configured:
+curl -s http://hmbridge.lan:8013/api/v1/unknown | jq -r '.unknown_senders[] | "\(.address) \(.serial) \(.model_id)"'
+```
+
+The former status page is gone. `GET /api/state` (its JSON) still answers
+for one more release, marked with a `Deprecation: true` header; move to
+`/api/v1`.
 
 ## 4. Home Assistant
 
@@ -598,7 +642,7 @@ Writes are atomic (a power cut leaves the old or the new version), files are
 readable only by the hmbridge user (0600), and symbolic links are not
 followed. If a file is damaged, hmbridge renames it to
 `<name>.corrupt-<time>` (keeping the newest three), logs it, and starts
-without it; for `devices.json` the status page shows a warning — repair the
+without it; for `devices.json` `GET /api/v1/bridge` shows a warning — repair the
 copy and put it back while hmbridge is stopped. A `devices.json` written by a
 newer hmbridge (after a downgrade) is left untouched and pairing is disabled
 until you upgrade again or remove it. `"state_dir": ""` disables all files
@@ -613,9 +657,9 @@ other locations (e.g. `/usr/local/hmbridge/devices.json` from an older
 OpenCCU setup) are not copied: move them into `state_dir` yourself, while
 hmbridge is stopped, then remove `devices_file` from the configuration.
 
-The status page on port 8013 lists configured devices and every
-radio address that talked to the central but is not configured — handy for
-finding device addresses.
+`GET /api/v1/devices` on port 8013 lists the configured and paired devices,
+`GET /api/v1/unknown` every radio address that talked to the central but is
+not configured — handy for finding device addresses ([HTTP API](#http-api)).
 
 ## 5. Adding devices
 
@@ -624,12 +668,13 @@ is no longer needed for that. Supported are the models in the
 [README](../README.md#supported-devices).
 
 1. In Home Assistant, open the device **hmbridge** and press **Pair new
-   device** (or press the button on the status page, port 8013). Pairing mode
+   device** (pairing is only started from Home Assistant or MQTT; the HTTP API
+   is read-only, `GET /api/v1/bridge` shows the pairing state). Pairing mode
    stays on for 60 seconds (`pairing.duration`); the sensors "Pairing mode",
    "Pairing time remaining" and "Last pairing result" show what happens.
    Anyone who can publish to the MQTT topic `hmbridge/bridge/set/pair` (any
-   MQTT user with write access to `hmbridge/#`) or open the status page can
-   start pairing mode too: give MQTT write access only to Home Assistant.
+   MQTT user with write access to `hmbridge/#`) can start pairing mode too:
+   give MQTT write access only to Home Assistant.
 2. Put the device into pairing mode: press its config button (usually a short
    press; the LED blinks), as described in its manual. Battery devices stay
    awake while their LED blinks.
@@ -686,8 +731,8 @@ copy name, model, address, serial, `aes_channels` and `key_index` from the
 devices file to `config.json`. On OpenCCU's Pi (section 3a), set
 `state_dir` to a writable path such as `/usr/local/hmbridge/state`.
 `"state_dir": ""` disables pairing. A paired device that hmbridge cannot use
-(e.g. its `key_index` is no longer configured) is reported in the log and on
-the status page and kept in the file.
+(e.g. its `key_index` is no longer configured) is reported in the log and in
+`GET /api/v1/bridge` (`warnings`) and kept in the file.
 
 `pairing.aes`: `"system_key"` (the default when `security` is configured) or
 `"off"` (devices stay on the eQ-3 default key without AES).

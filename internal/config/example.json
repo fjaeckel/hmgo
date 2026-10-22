@@ -3,7 +3,7 @@
     "hmbridge example configuration. Every object accepts an optional _comment field.",
     "radio: auto (default; detected at startup), hm-mod-rpi-pcb or rpi-rf-mod. reset: gpio (the module's reset line on the Pi's header), raw-uart (OpenCCU's driver, for /dev/raw-uart), none, or auto (default). reset_gpio: BCM GPIO of the reset line, default 18 (HM-MOD-RPI-PCB) or 19 (RPI-RF-MOD), chosen at startup with radio auto.",
     "Only central_address and devices are required; all other fields show their defaults or typical values.",
-    "http_listen serves the status page and Prometheus /metrics (\"\" disables it; use 127.0.0.1:8013 to keep it local). Requests must name hmbridge: an IP address, localhost, the machine's host name (or <name>.local), or a name listed in http_allowed_hosts (e.g. [\"hmbridge.example.lan\"]). time_sync_interval: how often the radio module clock is set.",
+    "http_listen serves the read-only JSON API (/api/v1/health, /bridge, /devices, /groups, /unknown; GET / lists them) and Prometheus /metrics (\"\" disables it; use 127.0.0.1:8013 to keep it local). Requests must name hmbridge: an IP address, localhost, the machine's host name (or <name>.local), or a name listed in http_allowed_hosts (e.g. [\"hmbridge.example.lan\"]). time_sync_interval: how often the radio module clock is set.",
     "require_synced_clock (default true): only hand out the time while the system clock is NTP-synchronised. state_dir (absolute; \"\" disables persistence and pairing) holds hmbridge's files: state.json, the fallback for restoring device state when the MQTT broker is unreachable at startup, written only after significant changes, at most every state_save_interval, and on shutdown; and devices.json, the paired devices. On OpenCCU use /usr/local/hmbridge/state. state_file and devices_file are deprecated.",
     "Every device accepts stale_after (e.g. \"2h\", \"0s\" = never): how long it may be silent before Home Assistant shows it as unavailable (default 30m thermostats, 1h weather sensors, 6h HM-Sec-SCo, 50h other contacts, 3 status_poll_interval for switches/dimmers/LED displays, never for remotes). For switches, dimmers and LED displays it must be longer than status_poll_interval.",
     "status_poll_interval (default 1h, \"0s\" disables): how often switches, dimmers and the LED display are asked for their status; they are always asked once shortly after startup.",
@@ -51,7 +51,7 @@
 
   "pairing": {
     "_comment": [
-      "Pairing new devices from Home Assistant (button \"Pair new device\" on the hmbridge device) or the status page. Paired devices are kept in devices.json in state_dir, which is only written on pair, unpair and rename; on a conflict, devices below win.",
+      "Pairing new devices from Home Assistant (button \"Pair new device\" on the hmbridge device; MQTT only, the HTTP API is read-only). Paired devices are kept in devices.json in state_dir, which is only written on pair, unpair and rename; on a conflict, devices below win.",
       "aes: \"system_key\" (default when security is set) gives AES-capable devices the security key and enables AES where a CCU does (contacts, push buttons, remotes); \"off\" leaves them on the eQ-3 default key without AES.",
       "duration: how long pairing mode stays on (10s … 10m)."
     ],

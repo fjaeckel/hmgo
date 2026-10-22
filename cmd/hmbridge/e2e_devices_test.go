@@ -281,10 +281,10 @@ func TestEndToEndDevices(t *testing.T) {
 			t.Errorf("/metrics lacks %q", w)
 		}
 	}
-	page := httpGet(t, fmt.Sprintf("http://127.0.0.1:%d/", httpPort))
-	for _, w := range []string{"on, 50 %", "last: button 2 press_long_release"} {
-		if !strings.Contains(page, w) {
-			t.Errorf("status page lacks %q", w)
+	devs := httpGet(t, fmt.Sprintf("http://127.0.0.1:%d/api/v1/devices", httpPort))
+	for _, w := range []string{`"summary": "on, 50 %"`, `"summary": "last: button 2 press_long_release"`} {
+		if !strings.Contains(devs, w) {
+			t.Errorf("/api/v1/devices lacks %q", w)
 		}
 	}
 }

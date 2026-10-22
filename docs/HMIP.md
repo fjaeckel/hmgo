@@ -24,15 +24,15 @@ Homematic and HmIP over one serial line):
   encryption, no keys.
 * hmbridge logs every decoded HmIP frame with `-debug`, counts them in
   `hmbridge_hmip_frames_total{kind="device"|"own"|"other"|"malformed"}`, and
-  lists the radio addresses of frames from other devices on the status page
-  under “HomematicIP devices heard (not supported yet)”, with last seen and
-  the RSSI the module measured. Nothing is published to MQTT.
+  lists the radio addresses of frames from other devices in the HTTP API
+  (`GET /api/v1/unknown`, field `hmip_heard`), with last seen and the RSSI the
+  module measured. Nothing is published to MQTT.
 * `hmsniff` decodes OpenCCU's HmIP traffic the same way instead of printing
   only command and length. Key material (network key, inclusion data, the
   0x0c exchange) is always redacted.
 
 **hmbridge never sends anything on the HmIP destinations**: no address, no
-key, no link partner, no answer. That is also why the status page section will
+key, no link partner, no answer. That is also why `hmip_heard` will
 most likely stay empty: when hmbridge owns the module, nobody gives the module
 its HmIP address, security counter and network key (OpenCCU's HMIPServer does
 that at every start, see below). Whether the module then passes on any frames

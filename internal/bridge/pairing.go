@@ -7,7 +7,7 @@ package bridge
 // CCU does it:
 //
 //  1. Pairing mode is started from Home Assistant (button “Pair new
-//     device”) or the status page and stays on for pairing.duration
+//     device”, MQTT) and stays on for pairing.duration
 //     (default 60s), one device at a time.
 //  2. The user presses the device's config button; it sends DEVICE_INFO
 //     (cmd 0x00, usually as a broadcast) with its model ID and serial.
@@ -74,7 +74,7 @@ type pairingMode struct {
 	enabled bool
 	// disabledReason says why pairing is off (when !enabled).
 	disabledReason string
-	// warnings are problems with the devices file, for the status page.
+	// warnings are problems with the devices file, for the API.
 	warnings []string
 	// kept are devices file records that could not be used (e.g. their
 	// key index is no longer configured). They are written back
@@ -173,8 +173,7 @@ func (p *pairingMode) init(cfg *config.Config, override time.Duration, enabled b
 	p.unpairWait = make(map[[3]byte]unpairWaiting)
 }
 
-// PairingSnapshot is the pairing state for the status page and the
-// JSON API.
+// PairingSnapshot is the pairing state for the API.
 type PairingSnapshot struct {
 	Enabled      bool      `json:"enabled"`
 	AES          string    `json:"aes"`
@@ -987,7 +986,7 @@ func (b *Bridge) renameDevice(addrHex, name string) {
 // cannot be read never leads to losing the paired devices: a damaged
 // one has been moved aside by the store (a copy is kept), and one that
 // must not be written (newer format version, symbolic link) disables
-// pairing, unpairing and renaming. Both are shown on the status page.
+// pairing, unpairing and renaming. Both are reported by the API.
 func (b *Bridge) loadStore() {
 	recs, err := b.store.LoadDevices()
 	if err != nil {

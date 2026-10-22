@@ -500,10 +500,10 @@ func TestUnknownSender(t *testing.T) {
 		return len(s.Unknown) == 1 && s.Unknown[0].Serial == "MEQ0123456"
 	})
 
-	// The status page renders it.
-	srv := httptest.NewServer(e.b.StatusHandler(Info{"firmware": "1.4.1"}))
+	// The API lists it.
+	srv := httptest.NewServer(e.b.API(APIOptions{}))
 	defer srv.Close()
-	for _, path := range []string{"/", "/api/state"} {
+	for _, path := range []string{"/api/v1/unknown", "/api/state"} {
 		resp, err := srv.Client().Get(srv.URL + path)
 		if err != nil {
 			t.Fatal(err)
