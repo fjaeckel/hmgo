@@ -331,8 +331,10 @@ func TestSettingsContactWaitsForConfigButton(t *testing.T) {
 	// The config button: DEVICE_INFO. The device listens now. AES is on
 	// for channel 1, so the ACKs must be authenticated (the emulated
 	// module challenges, see fakemod.Options.ChallengeAES).
+	// Real devices send it as a broadcast (flags 84 to 000000, seen on
+	// an HM-Sec-SCo), which must wake it although it isn't signed.
 	e.sco.SetAsleep(false)
-	e.inject(0x01, e.sco.DeviceInfo(0x31, central))
+	e.inject(0x01, e.sco.DeviceInfo(0x31, [3]byte{}))
 	e.waitFor("written", func() bool { return e.detail("4c5d6e", "event_delay") == "ok" })
 	if v, _ := e.sco.Reg(1, 1, 33); v != 0x83 {
 		t.Errorf("EVENT_DELAYTIME register = %02x, want 83", v)

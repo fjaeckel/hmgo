@@ -106,11 +106,19 @@ func aesRejection(d *device, pkt *bidcos.Packet, central [3]byte) string {
 	if pkt.Auth() == bidcos.AuthFailed {
 		return aesRejectFailed
 	}
+	// DEVICE_INFO carries no state and is never trusted (pairing checks
+	// it separately); a config button press sends it as a broadcast
+	// (flags 0x84 to 000000, seen on a real HM-Sec-SCo), so it must pass
+	// for broadcasts too, or settings for sleeping AES devices could
+	// never be delivered.
+	if pkt.Cmd == bidcos.DeviceInfo && (pkt.Dest == central || pkt.Dest == ([3]byte{})) {
+		return ""
+	}
 	if pkt.Dest != central {
 		return aesRejectNotToCentral
 	}
 	switch pkt.Cmd {
-	case bidcos.DeviceInfo, bidcos.Timestamp:
+	case bidcos.Timestamp:
 		return ""
 	case bidcos.Ack:
 		return aesRejectAck
