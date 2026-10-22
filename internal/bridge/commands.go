@@ -31,11 +31,12 @@ const (
 	jobClimate jobKind = iota
 	jobTimeResponse
 	jobSetTime
-	jobLevel  // switch / dimmer level
-	jobLED    // HM-OU-LED16 LED color
-	jobStatus // status request to an actuator (never retried)
-	jobPair   // configure a device that announced itself in pairing mode
-	jobUnpair // unpair a device (radio part; it is removed already)
+	jobLevel    // switch / dimmer level
+	jobLED      // HM-OU-LED16 LED color
+	jobStatus   // status request to an actuator (never retried)
+	jobPair     // configure a device that announced itself in pairing mode
+	jobUnpair   // unpair a device (radio part; it is removed already)
+	jobSettings // read and/or write device settings (settings.go)
 )
 
 type climateAction string
@@ -76,8 +77,9 @@ type job struct {
 	led   int     // jobLED: 1 … 16
 	color string  // jobLED
 
-	pair   *pairJob   // jobPair
-	unpair *unpairJob // jobUnpair
+	pair     *pairJob     // jobPair
+	unpair   *unpairJob   // jobUnpair
+	settings *settingsJob // jobSettings
 }
 
 type jobResult struct {
@@ -210,6 +212,14 @@ func (q *jobQueue) pop() (job, bool) {
 	return j, true
 }
 
+// has reports whether a job with key is queued.
+func (q *jobQueue) has(key string) bool {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	_, ok := q.jobs[key]
+	return ok
+}
+
 func (q *jobQueue) len() int {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -228,7 +238,11 @@ func (b *Bridge) worker(ctx context.Context) {
 				continue
 			}
 		}
-		jctx, cancel := context.WithTimeout(ctx, jobTimeout)
+		timeout := jobTimeout
+		if j.kind == jobSettings {
+			timeout = settingsJobTimeout
+		}
+		jctx, cancel := context.WithTimeout(ctx, timeout)
 		ev, err := b.execute(jctx, j)
 		cancel()
 		select {
@@ -263,6 +277,9 @@ func (b *Bridge) execute(ctx context.Context, j job) (any, error) {
 
 	case jobUnpair:
 		return nil, b.executeUnpair(ctx, j.unpair)
+
+	case jobSettings:
+		return b.executeSettings(ctx, j.settings)
 
 	case jobClimate:
 		switch dev := j.dev.dev.(type) {
@@ -325,6 +342,10 @@ func (b *Bridge) handleCommand(cmd ha.Command) {
 		return
 	case ha.Unpair:
 		b.unpairDevice(cmd.Addr)
+		b.saveSettings() // its cached settings are gone
+		return
+	case ha.SetSetting, ha.RefreshSettings:
+		b.handleSettingsCommand(cmd)
 		return
 	case ha.Rename:
 		b.renameDevice(cmd.Addr, cmd.Name)
@@ -459,6 +480,9 @@ func (b *Bridge) handleResult(res jobResult) {
 		return
 	case jobUnpair:
 		b.handleUnpairResult(j.unpair, res.err)
+		return
+	case jobSettings:
+		b.handleSettingsResult(res)
 		return
 	}
 	if j.dev != nil && j.dev.removed {

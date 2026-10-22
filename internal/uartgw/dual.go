@@ -192,6 +192,16 @@ const (
 	// AES-verified final ACKs are not limited (they cannot be forged).
 	ackBurst  = 10
 	ackRefill = time.Second
+	// A register read (CONFIG_PARAM_REQ, cmd 0x01 subtype 0x04) is
+	// answered with a series of INFO_PARAM_RESPONSE frames (cmd 0x10
+	// subtype 0x02/0x03), each waiting for our ACK; a thermostat's list
+	// 7 takes about 26. For regReadWindow after the request, at most
+	// regReadFrames such frames of that peer are acknowledged outside
+	// the ACK budget and delivered without an AES challenge (whose rate
+	// limit they would exceed); the bridge only uses them while it
+	// waits for the read (see bridge/settings.go).
+	regReadWindow = 30 * time.Second
+	regReadFrames = 64
 )
 
 // AESSigner implements the BidCoS AES computations (software AES; see
@@ -442,6 +452,7 @@ type DualConn struct {
 	authed       map[aesKey]aesDone      // recently authenticated messages
 	challenges   map[[3]byte][]time.Time // recent challenges per peer (rate limit)
 	acks         map[[3]byte]tokenBucket // software ACK budget per peer
+	regReads     map[[3]byte]regRead     // register reads in progress (regReadWindow)
 	seen         map[aesKey]rxSeen       // recent messages to us, by sender and message counter
 	peers        map[[3]byte]Peer
 	// removedKeys keeps the key index of removed peers: unpairing
@@ -533,6 +544,7 @@ func openDual(rw io.ReadWriter, cfg Config, p *framePump, d detection) (*DualCon
 		authed:       make(map[aesKey]aesDone),
 		challenges:   make(map[[3]byte][]time.Time),
 		acks:         make(map[[3]byte]tokenBucket),
+		regReads:     make(map[[3]byte]regRead),
 		seen:         make(map[aesKey]rxSeen),
 		peers:        make(map[[3]byte]Peer),
 		removedKeys:  make(map[[3]byte]byte),
@@ -1286,6 +1298,40 @@ func aesRequired(peer Peer, cmd byte, payload []byte) bool {
 	return false
 }
 
+// regRead is a register read in progress.
+type regRead struct {
+	until time.Time
+	left  int
+}
+
+// isParamResponse reports whether a message is a register read answer
+// (INFO 0x10, subtype 0x02 pairs or 0x03 sequence).
+func isParamResponse(cmd byte, payload []byte) bool {
+	return cmd == 0x10 && len(payload) >= 1 && (payload[0] == 0x02 || payload[0] == 0x03)
+}
+
+// isParamRequest reports whether msg (cnt flags cmd src dst payload) is
+// a CONFIG_PARAM_REQ (cmd 0x01, payload ch 04 …).
+func isParamRequest(msg []byte) bool {
+	return len(msg) > minMsgLen+1 && msg[2] == 0x01 && msg[minMsgLen+1] == 0x04
+}
+
+// regReadFrameLocked counts a frame of a register read of dev and
+// reports whether it belongs to one in progress. c.mu must be held.
+func (c *DualConn) regReadFrameLocked(dev [3]byte, now time.Time) bool {
+	r, ok := c.regReads[dev]
+	if !ok {
+		return false
+	}
+	if !now.Before(r.until) || r.left <= 0 {
+		delete(c.regReads, dev)
+		return false
+	}
+	r.left--
+	c.regReads[dev] = r
+	return true
+}
+
 // ackExempt lists commands which are not acknowledged: ACKs, time
 // requests, which are answered with the time instead (capture, lines
 // 1322-1324: no ACK, only the 0x3f answer), and AES answers, which are
@@ -1454,6 +1500,18 @@ func (c *DualConn) handleRecv(f frame) {
 		// requires AES authentication where it matters, e.g. for the
 		// ACK of a command on an AES channel, see hm.CheckReplyAuth).
 		ack := wantAck && c.ackAllowedLocked(src, now)
+		c.mu.Unlock()
+		if ack {
+			c.sendReply(c.ackMsg(msgcnt, src, nil), ts, "software_ack")
+		}
+		return
+	}
+
+	// 2b. The further frames of a register read we requested (see
+	// regReadWindow).
+	if toUs && isPeer && isParamResponse(cmd, msg[minMsgLen:]) && c.regReadFrameLocked(src, now) {
+		c.deliverLocked(recvFrame(recvResp, info, rssi, msg))
+		ack := c.softAck && bidi
 		c.mu.Unlock()
 		if ack {
 			c.sendReply(c.ackMsg(msgcnt, src, nil), ts, "software_ack")
@@ -2067,6 +2125,14 @@ func (c *DualConn) Send(ctx context.Context, encoded []byte) ([]byte, error) {
 		if s, ok := c.seen[aesKey{dev, msg[0]}]; ok && c.now().Sub(s.at) <= replyWindow {
 			opts = c.replyOptsLocked(s.ts, msg[1])
 		}
+		c.mu.Unlock()
+	}
+
+	if isParamRequest(msg) {
+		var dev [3]byte
+		copy(dev[:], msg[6:9])
+		c.mu.Lock()
+		c.regReads[dev] = regRead{until: c.now().Add(regReadWindow), left: regReadFrames}
 		c.mu.Unlock()
 	}
 

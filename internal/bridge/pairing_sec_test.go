@@ -293,7 +293,7 @@ func TestPairAlreadyPairedToCentralNotConfigured(t *testing.T) {
 		!strings.Contains(res, "AES on channels [1] with key index 2") {
 		t.Errorf("result %q", res)
 	}
-	if got := e.payloadsSent(newSCo, 0x01); fmt.Sprint(got) != "[00050000000000 000802010a1a0b2b0c3c 0006 01050000000001 01080801 0106]" {
+	if got := withoutReads(e.payloadsSent(newSCo, 0x01)); fmt.Sprint(got) != "[00050000000000 000802010a1a0b2b0c3c 0006 01050000000001 01080801 0106]" {
 		t.Errorf("config messages %v", got)
 	}
 	devs := e.waitDevices(file, "stored", func(d []store.Device) bool { return len(d) == 1 })

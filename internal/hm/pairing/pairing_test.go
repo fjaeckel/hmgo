@@ -113,3 +113,28 @@ func TestConfigMessages(t *testing.T) {
 	}()
 	ConfigWriteIndex(0, make([]Reg, 8)...)
 }
+
+func TestConfigParamReqAndWriteListSequence(t *testing.T) {
+	// FHEM CUL_HM_getConfig: <chn>04 00000000 <list>.
+	if got := ConfigParamReq(0, 7); !bytes.Equal(got, []byte{0x00, 0x04, 0, 0, 0, 0, 0x07}) {
+		t.Errorf("ConfigParamReq = %x", got)
+	}
+	var regs []Reg
+	for a := byte(1); a <= 15; a++ {
+		regs = append(regs, Reg{a, a})
+	}
+	msgs := WriteListSequence(1, 1, regs)
+	if len(msgs) != 5 {
+		t.Fatalf("%d messages", len(msgs))
+	}
+	if !bytes.Equal(msgs[0].Payload, ConfigStart(1, 1)) || !bytes.Equal(msgs[4].Payload, ConfigEnd(1)) {
+		t.Errorf("start/end %x %x", msgs[0].Payload, msgs[4].Payload)
+	}
+	// 7 + 7 + 1 pairs.
+	for i, n := range []int{7, 7, 1} {
+		p := msgs[1+i].Payload
+		if p[0] != 1 || p[1] != SubConfigWriteIndex || len(p) != 2+2*n {
+			t.Errorf("write %d: %x", i, p)
+		}
+	}
+}

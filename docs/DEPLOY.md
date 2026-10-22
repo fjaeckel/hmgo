@@ -12,7 +12,8 @@ There are two ways to set up hmbridge:
   an existing OpenCCU installation's radio address, key and devices, so
   nothing has to be paired again.
 
-Sections 4 (Home Assistant) and 5 (Adding devices) apply to both.
+Sections 4 (Home Assistant), 5 (Adding devices) and 6 (Device settings)
+apply to both.
 
 ## Fresh installation (no OpenCCU)
 
@@ -540,7 +541,9 @@ All devices also have the diagnostic sensors last seen, RSSI and messages
 received (the last two disabled by default) and, except the weather sensors,
 AES authentication.
 Devices paired with hmbridge (section 5) additionally have a "Name" text
-entity and an "Unpair" button (disabled by default). hmbridge itself appears
+entity and an "Unpair" button (disabled by default). Devices with settings
+(section 6) have configuration entities, a "Settings" status sensor and a
+"Refresh settings" button. hmbridge itself appears
 as the device "hmbridge" with the "Pair new device" button and the pairing
 sensors.
 
@@ -588,6 +591,7 @@ it with `StateDirectory=hmbridge`, mode 0700; on OpenCCU use
 |---|---|---|
 | `state.json` | last known device state, the fallback when the broker is unreachable at startup | after significant changes (mode, target temperature, window, battery, fault, switch/dimmer level, LED colors), at most every `state_save_interval` (15 min), and on shutdown; ordinary temperature reports never cause a write |
 | `devices.json` | devices paired with hmbridge (section 5) | on pair, unpair and rename |
+| `settings.json` | the device settings last read from the devices (section 6); losing it only means reading them again | when the settings read from a device change |
 
 To spare the SD card, a file is never rewritten with unchanged content.
 Writes are atomic (a power cut leaves the old or the new version), files are
@@ -597,7 +601,7 @@ followed. If a file is damaged, hmbridge renames it to
 without it; for `devices.json` the status page shows a warning — repair the
 copy and put it back while hmbridge is stopped. A `devices.json` written by a
 newer hmbridge (after a downgrade) is left untouched and pairing is disabled
-until you upgrade again or remove it. `"state_dir": ""` disables both files
+until you upgrade again or remove it. `"state_dir": ""` disables all files
 (and pairing). Back up `devices.json` together with `config.json`.
 
 *Upgrading:* the older options `state_file` and `devices_file` still work
@@ -715,6 +719,102 @@ developers) check every step:
    the key bytes of the key exchange, also not with `-no-redact`.
 3. Do the same with `hmbridge -debug` pairing a similar device, and compare.
    Please report differences.
+
+## 6. Device settings
+
+The settings you would otherwise change in OpenCCU's WebUI ("Settings →
+Devices → Settings" of a device: its MASTER parameters) appear in Home
+Assistant on the device page under **Configuration**: numbers, selects,
+switches and, for the thermostats, one text entity per weekday with the
+week profile. Settings that belong to direct links between devices (e.g. a
+dimmer's ramp times, which are link parameters) are not covered.
+
+| model | settings (★ = enabled by default; the others are disabled, enable them in Home Assistant if you need them) |
+|---|---|
+| HM-CC-RT-DN | ★ comfort, eco, minimum and maximum temperature, ★ temperature offset (-3.5 … 3.5 K), ★ window open temperature and duration, ★ boost duration, ★ button lock, ★ week profile Monday … Sunday; window open detection, decalcification day and time, boost valve position, valve offset, maximum valve position, adaptive regulation, daylight saving time, boost after window open, display time or date, backlight on time, low battery limit |
+| HM-TC-IT-WM-W-EU | ★ comfort, eco, minimum and maximum temperature, ★ temperature offset, ★ boost duration, ★ button lock, ★ display temperature (actual/set), ★ display humidity, ★ week profile (program 1); heating or cooling, daylight saving time, boost after window open, display time or date, low battery limit |
+| HM-Sec-SCo | ★ event delay (0 … 127 s, above that whole minutes up to 7620 s), ★ cyclic status messages; sabotage message |
+| HM-PB-2-WM55, HM-RC-8 | per button: long press time (0.3 … 1.8 s), double press time (0 … 1.5 s; 0 = off) |
+| HM-LC-Sw1-Pl-DN-R1 | ★ power-on action (off / on: after a power failure the plug simulates a press of its own button) |
+| HM-LC-Dim1L-Pl-3 | ★ power-on action; behaviour when the load reappears |
+| HM-OU-LED16 | ★ display brightness (0 … 15) |
+
+The weather sensors, the other contacts and window handles have no settings
+worth exposing. Not exposed on purpose (the sources disagree on how they are
+stored; see docs/DESIGN.md): global and mode button lock, local reset
+disable, the LED display's energy option, the contacts' message for position
+A/B. The wall thermostat's week programs 2 and 3 are not exposed.
+
+**Reading.** hmbridge reads the settings from the device when it was just
+paired, when you press **Refresh settings**, and when a change needs a value
+it does not know yet — never periodically. The values are kept in
+`settings.json` in `state_dir` (written only when they change), so after a
+restart Home Assistant shows them at once. Until a device was read, its
+settings are unknown: press "Refresh settings" once per device after
+upgrading. If you change a setting in the device's own menu, press "Refresh
+settings" (if the device reports the change itself, hmbridge takes it over).
+
+**Changing.** A change is checked first: a value outside the device's range
+or between its steps (e.g. 21.3 °C, a temperature offset of 4 K) is rejected
+without any radio traffic. Otherwise hmbridge writes only the registers that
+change, reads the list back and compares. The **Settings** sensor (diagnostic)
+shows the outcome: `ok`, `writing`, `reading`, `pending: …` or
+`failed: <setting> (see attributes)`; its attributes list the status per
+changed setting (`ok`, `pending`, `writing`, `failed: <reason>`) and when the
+settings were read. "Last command" shows the outcome too. Changes to devices
+with AES use the same authenticated path as commands: the device's
+acknowledgement must be authenticated.
+
+**Battery devices.**
+
+* Thermostats get the change at once, woken up with a burst like the climate
+  commands (each message costs about 0.36 s of the 1 % airtime; a full week
+  profile day is about seven messages).
+* Window contacts and push buttons only listen right after their config
+  button was pressed. A change shows `pending` until you **press the device's
+  config button** (or the device signals that it listens); then hmbridge sends
+  everything that waits, at once, and reads the settings back. "Refresh
+  settings" waits for the config button as well. Pending changes are lost when
+  hmbridge restarts.
+
+**Week profile.** Each weekday is a text entity, e.g. "Week profile Monday",
+with up to 13 entries `HH:MM temperature`, separated by commas: each entry is
+the time up to which the temperature applies, the last one must be 24:00.
+Times are multiples of 5 minutes, temperatures 5 … 30 °C in 0.5 steps:
+
+```
+06:00 17.0, 08:30 21.0, 16:00 17.0, 22:00 21.0, 24:00 17.0
+```
+
+means 17 °C until 06:00, 21 °C until 08:30, 17 °C until 16:00, 21 °C until
+22:00 and 17 °C for the rest of the day. Several days at once (e.g. from an
+automation or script) go to `hmbridge/<address>/set/setting_week_profile` as
+JSON:
+
+```yaml
+action: mqtt.publish
+data:
+  topic: hmbridge/38f59c/set/setting_week_profile
+  payload: '{"monday": "06:00 17, 22:00 21, 24:00 17", "tuesday": "06:00 17, 22:00 21, 24:00 17"}'
+```
+
+Either all days are valid and written, or none. The wall thermostat's
+entities edit week program 1, the one it uses unless you selected another on
+the device.
+
+**MQTT.** Values and status are on `hmbridge/<address>/settings` (retained
+JSON: `current`, `status`, `detail`, `read_at`); a change goes to
+`hmbridge/<address>/set/setting_<key>`, a refresh to
+`hmbridge/<address>/set/settings_refresh`.
+
+**Please check on your devices** (the register layouts come from eQ-3's
+device descriptions and FHEM, but have not been tried on real devices with
+hmbridge yet): read a thermostat and compare the values with the device's
+menu or OpenCCU; change the temperature offset and the week profile of one
+day and check them on the device; on a window contact change the event delay
+and press its config button; on a switch plug set the power-on action and
+unplug it briefly. With an RPI-RF-MOD, check that reading a thermostat
+completes (its list 7 is about 26 radio frames). Please report differences.
 
 ## Module firmware
 

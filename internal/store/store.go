@@ -8,7 +8,9 @@
 //     MQTT broker's retained messages are not available at startup
 //     (written by the bridge's saver goroutine, throttled);
 //   - devices.json: the devices paired with hmbridge (written on pair,
-//     unpair and rename).
+//     unpair and rename);
+//   - settings.json: the device settings (configuration registers) last
+//     read from the devices (written when they change).
 //
 // Further data (e.g. HmIP keys) becomes another file (Store.File).
 //
@@ -64,11 +66,12 @@ type Options struct {
 
 // Store is hmbridge's state directory.
 type Store struct {
-	dir     string
-	logf    func(string, ...any)
-	now     func() time.Time
-	state   *File
-	devices *File
+	dir      string
+	logf     func(string, ...any)
+	now      func() time.Time
+	state    *File
+	devices  *File
+	settings *File // nil without a state directory
 }
 
 // Open sets up the store and copies files from their legacy locations
@@ -85,6 +88,7 @@ func Open(o Options) *Store {
 	}
 	s.state = s.file(FileSpec{Name: StateFileName, Version: StateVersion, Legacy: o.LegacyStatePath}, o.StatePath)
 	s.devices = s.file(FileSpec{Name: DevicesFileName, Version: DevicesVersion, Indent: true, Legacy: o.LegacyDevicesPath}, o.DevicesPath)
+	s.settings = s.File(FileSpec{Name: SettingsFileName, Version: SettingsVersion})
 	return s
 }
 

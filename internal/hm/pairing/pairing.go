@@ -163,6 +163,28 @@ func AESActiveSequence(ch byte, on bool) []Message {
 	}
 }
 
+// ConfigParamReq returns the payload of CONFIG_PARAM_REQ, the request to
+// read list of channel ch (peer 000000:00): ch 04 00 00 00 00 list
+// (FHEM CUL_HM_getConfig: “01…<chn>0400000000<list>”). The device
+// answers with one or more INFO_PARAM_RESPONSE frames (cmd 0x10, see
+// package params), each acknowledged by the central.
+func ConfigParamReq(ch, list byte) []byte {
+	return []byte{ch, SubConfigParamReq, 0, 0, 0, 0, list}
+}
+
+// WriteListSequence returns the messages that write regs to list of
+// channel ch: CONFIG_START, CONFIG_WRITE_INDEX with at most
+// MaxRegsPerWrite pairs each, CONFIG_END (FHEM CUL_HM_pushConfig).
+func WriteListSequence(ch, list byte, regs []Reg) []Message {
+	msgs := []Message{{CmdConfig, ConfigStart(ch, list), fmt.Sprintf("CONFIG_START channel %d list %d", ch, list)}}
+	for i := 0; i < len(regs); i += MaxRegsPerWrite {
+		chunk := regs[i:min(i+MaxRegsPerWrite, len(regs))]
+		msgs = append(msgs, Message{CmdConfig, ConfigWriteIndex(ch, chunk...),
+			fmt.Sprintf("CONFIG_WRITE_INDEX channel %d list %d (%d registers)", ch, list, len(chunk))})
+	}
+	return append(msgs, Message{CmdConfig, ConfigEnd(ch), fmt.Sprintf("CONFIG_END channel %d", ch)})
+}
+
 // FactoryResetPayload is the payload of the reset command (cmd 0x11,
 // Homegear HomeMaticCentral::reset: “04 00”). hmbridge unpairs with
 // PairSequence(000000) instead, like the CCU's “delete device”; the

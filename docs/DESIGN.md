@@ -27,9 +27,9 @@ github.com/fjaeckel/hmgo).
   end-to-end test against a local mosquitto.
 
 Non-goals for the prototype: editing week programs, Homematic IP,
-HM-MOD-RPI-PCB firmware updates. (Pairing new devices and the
-dual-coprocessor firmware were added later, see “Pairing” and
-“RPI-RF-MOD”.)
+HM-MOD-RPI-PCB firmware updates. (Pairing new devices, the
+dual-coprocessor firmware and device settings including the week profile
+were added later, see “Pairing”, “RPI-RF-MOD” and “Device settings”.)
 
 ## Architecture
 
@@ -59,7 +59,8 @@ Package ownership (one owner per package while building in parallel):
 | `internal/hm/...` | device models: event decoders (existing) + command encoders |
 | `internal/hm/devices` | model name → device model, shared by hmbridge and hmsniff |
 | `internal/hm/pairing` | pairing protocol: model ID table, DEVICE_INFO, CONFIG_* encoders |
-| `internal/store` | persistence: the state directory with `state.json` and `devices.json` |
+| `internal/hm/params` | device settings: register layout, encoding and validation per model, register read answers, week profile |
+| `internal/store` | persistence: the state directory with `state.json`, `devices.json` and `settings.json` |
 | `internal/ha` | HA discovery payloads, state/command topics, MQTT client |
 | `internal/bridge` | glue: registry, event loop, command handling, status page |
 | `cmd/hmbridge` | main: flags, serial setup, GPIO reset, signal handling |
@@ -487,7 +488,8 @@ the old entry are applied to the new one by address).
 **Persistence** (`internal/store`). Everything hmbridge writes lives in
 one directory, `state_dir` (default `/var/lib/hmbridge`, absolute, `""`
 disables all files and pairing): `state.json` (device state fallback,
-compact) and `devices.json` (paired devices, indented). Further data
+compact), `devices.json` (paired devices, indented) and `settings.json`
+(device settings cache, compact, see “Device settings”). Further data
 (e.g. HmIP keys) becomes another file via `Store.File(FileSpec)`. Shared
 rules for every file:
 
@@ -546,6 +548,121 @@ never logged (DualConn debug log, hmsniff).
   INTERNAL_KEYS_VISIBLE bit (Homegear sets it, FHEM writes 0x01). An hmsniff
   capture of OpenCCU pairing a contact and a switch plug settles all of
   these (docs/DEPLOY.md “Adding devices”).
+
+## Device settings
+
+`internal/hm/params` describes the settings of the supported models (eQ-3's
+MASTER parameter set: list 0 of the device, list 1 of the channels, list 7
+of the thermostats), `internal/bridge/settings.go` reads and writes them,
+`internal/ha/settings.go` exposes them. Sources: eQ-3's device descriptions
+as shipped with Homegear (`misc/Device Description Files`: rf_cc_rt_dn.xml,
+rf_tc_it_wm-w-eu.xml, rf_sec_sco.xml, rf_pb-2-wm55_*.xml, rf_rc-4-2.xml,
+rf_s_644.xml, rf_dim_1l_644.xml, rf_ou_led16_*.xml) for register index,
+size, scaling and range, cross-checked with FHEM (HMConfig.pm
+culHmRegDefine/culHmRegModel; 10_CUL_HM.pm getConfig, pushConfig, the
+RegisterRead and ParamChange parsing). Read as references only (GPL); every
+setting names its sources in `params/models.go`.
+
+**Model.** A setting is a bit field (`index.bit`, `bytes.bits` as in eQ-3's
+notation) in a list (`params.Loc`: channel byte on the wire and list number)
+with a kind: number (`raw = round((v − offset)·scale)`, range and step from
+the description; eQ-3 enumerations of evenly spaced values such as the
+temperature offset −3.5K=0 … 3.5K=14 or the boost period 0, 5 … 30 min are
+numbers too), select (enumeration), switch (raw 1/0), or a week profile day
+(text). The contact's event delay uses eQ-3's config time with factors 1
+and 60 (bit 7 selects the factor; FHEM fltCvT60). A value is validated
+before anything is sent (range, step, representability); out-of-range values
+are rejected with the reason in the status.
+
+The thermostats' list 7 is read and written with **channel 0** (FHEM:
+shadow register “List 7 read from CH 0” for HM-CC-RT-DN and
+HM-TC-IT-WM-W-EU; eQ-3 puts these parameters into the device's MASTER set).
+**Week profile** (program 1 of the wall thermostat): registers 20 … 201,
+26 per day in the order Saturday … Friday, 13 16-bit big-endian words per
+day: bits 0-8 end time / 5 min, bits 9-14 temperature · 2. A day is
+written completely; slots after the one ending at 24:00 are filled with
+24:00 and the last temperature (the devices' defaults look like that).
+
+**Protocol.**
+
+| step | messages |
+|---|---|
+| read | CONFIG_PARAM_REQ `ch 04 00000000 list` (BiDi); the device answers with INFO_PARAM_RESPONSE `10 02 reg val …` (pairs, ended by `00 00`) or `10 03 start val …` (sequence, ended by start `00`), one frame per ≤ 8 pairs, each acknowledged by the central |
+| write | CONFIG_START `ch 05 00000000 list`, CONFIG_WRITE_INDEX `ch 08 reg val …` (≤ 7 pairs each, only the registers that change), CONFIG_END `ch 06` (pairing.WriteListSequence) |
+| verify | the list is read again and every change compared |
+| device change | INFO_PARAM_CHANGE `10 04 ch 00000000 list pairs…` / `10 05 … start values…` updates a cached list (only when authenticated, or from a device without AES) |
+
+The first answer frame is the response to the request (returned by
+`Send`); the others arrive as received frames, which the event loop hands
+to the worker waiting for them (`paramCollector`, one at a time) before the
+AES checks; they never change device state. The HM-MOD-RPI-PCB acknowledges
+them itself. `DualConn` acknowledges the INFO_PARAM_RESPONSE frames of a
+peer for 30 s after a CONFIG_PARAM_REQ to it (at most 64) outside its
+software ACK budget and without challenging them: a thermostat's list 7 is
+about 26 frames, more than the challenge rate limit (10 per 10 s) allows.
+Writes go through `hm.StandardDevice.Send`, so the ACK of a write to an AES
+channel must be authenticated (`CheckReplyAuth`), like any command's.
+
+**Jobs.** A settings job (`jobSettings`, key `settings:<addr>`, coalesced:
+the queued job always carries all pending changes) reads the lists it needs
+(all of the model's on refresh; otherwise only when a change shares a
+register whose other bits are not cached), writes, reads back. The first
+radio failure ends the job; retryable failures are retried twice like
+commands. The worker's timeout for these jobs is 2 minutes. Pending changes
+are kept per setting until the device confirmed them (`detail`: pending →
+writing → ok / failed).
+
+**Battery devices.** Thermostats (wake-on-radio): every message with the
+burst flag (0xB0), like the climate commands and the unpairing. Contacts and
+buttons (config-only): changes and refreshes wait; a DEVICE_INFO (config
+button) or any message with the WAKEMEUP flag (0x02; FHEM processes its
+command stack then) from the device queues them as a priority job without
+burst. A failure that looks like “device asleep” keeps them pending. Pending
+changes are not persisted.
+
+**Cache.** `settings.json` (store, version 1): per device its model, the
+time of the last change and the lists as hex address/value pairs. Written
+only when the registers read differ from the cache (and on unpairing). A
+cache of another model at the same address is ignored. Settings are never
+read periodically: after pairing (while the device is still in config mode),
+on “Refresh settings”, and before a write that needs unknown bits.
+
+**Home Assistant.** Per setting a `number`/`select`/`switch`/`text` entity
+(entity_category config; rarely used ones disabled by default) reading
+`<base>/<addr>/settings` (`current.<key>`), commanding
+`<base>/<addr>/set/setting_<key>`; a “Settings” sensor (status, attributes
+`detail` and `read_at`) and a “Refresh settings” button. These entities use
+the bridge's availability only, so changes can be queued for a sleeping
+device. `set/setting_week_profile` takes several days as JSON. Entities of
+settings a device does not have are removed once per start
+(AllStaleDiscoveryMessages with `DeviceDesc.AllSettings`) and on unpairing.
+
+**Verified vs. assumed.**
+
+* Verified against two sources (eQ-3/Homegear and FHEM agree on index,
+  size, scaling and range): every exposed setting; the tests use the values
+  from eQ-3's descriptions (defaults, enumeration indexes).
+* Left out because the sources disagree: GLOBAL_BUTTON_LOCK and
+  MODUS_BUTTON_LOCK (Homegear writes 1, FHEM 200), LOCAL_RESET_DISABLE
+  (Homegear bit 0 of register 24, FHEM the register with 200), the LED
+  display's DISPLAY_ENERGYOPTIONS (0 … 255 vs. 0 … 127 with 0 = permanent),
+  the contact's MSG_FOR_POS_A/B (positions 32.4/32.6 swapped). Not in the
+  MASTER set: the radiator thermostat's display mode, the wall thermostat's
+  window and decalcification settings, LED/status settings of the plugs,
+  contacts and buttons, the dimmer's ramp times and levels (link
+  parameters). The weather sensors only have BURST_RX.
+* Assumed, not yet seen on the air: that the devices answer register reads
+  with the frames above (FHEM's parsing); that a thermostat stays awake for
+  the messages of a write when each carries the burst flag; whether devices
+  sign INFO_PARAM_RESPONSE frames. hmbridge takes them unauthenticated (not
+  failed) while it waits for them, from the device's address, to the
+  central: someone who forges them in time can make hmbridge show wrong
+  values or, for a register shared by several settings, write wrong values
+  of the *other* bits along with an authenticated change. Read-back
+  verification does not detect that (it reads the same way).
+* The switch's POWERUP_ACTION “on” simulates a press of the device's
+  internal button after power-up (FHEM: “simulate short press of peer
+  self01”), so its effect depends on that button's (default) link.
 
 ## Running alongside OpenCCU
 

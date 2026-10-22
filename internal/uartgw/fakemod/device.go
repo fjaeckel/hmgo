@@ -5,9 +5,11 @@ package fakemod
 
 import (
 	"sync"
+	"time"
 
 	bidcosaes "github.com/fjaeckel/hmgo/internal/bidcos/aes"
 	"github.com/fjaeckel/hmgo/internal/hm/pairing"
+	"github.com/fjaeckel/hmgo/internal/hm/params"
 	"github.com/fjaeckel/hmgo/internal/hmkey"
 )
 
@@ -40,6 +42,9 @@ type Device struct {
 	sent    map[byte][]byte
 	nacks   bool
 	configs int
+	asleep  bool
+	reads   int
+	inject  func(msg []byte)
 }
 
 // NewDevice returns a device with the eQ-3 default key (factory state).
@@ -96,6 +101,63 @@ func (d *Device) ConfigMessages() int {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return d.configs
+}
+
+// SetReg sets a register of a channel's list (the device's current
+// configuration).
+func (d *Device) SetReg(ch, list, reg, val byte) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	regs := d.regs[[2]byte{ch, list}]
+	if regs == nil {
+		regs = make(map[byte]byte)
+		d.regs[[2]byte{ch, list}] = regs
+	}
+	regs[reg] = val
+}
+
+// SetInject sets where HandleClassic sends the further frames of a
+// register read (INFO_PARAM_RESPONSE) after the first, which is the
+// response to the request; typically a call of Module.InjectRecv (the
+// real HM-MOD-RPI-PCB acknowledges them itself).
+func (d *Device) SetInject(f func(msg []byte)) {
+	d.mu.Lock()
+	d.inject = f
+	d.mu.Unlock()
+}
+
+// SetAsleep makes the device ignore everything (a battery device that
+// is not in config mode).
+func (d *Device) SetAsleep(on bool) {
+	d.mu.Lock()
+	d.asleep = on
+	d.mu.Unlock()
+}
+
+// ParamReads returns the number of register reads (CONFIG_PARAM_REQ)
+// answered.
+func (d *Device) ParamReads() int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.reads
+}
+
+// paramResponse returns the INFO_PARAM_RESPONSE messages answering the
+// register read req (pairs format, the first with the request's message
+// counter, flags BIDI|RPTEN like a device's), or nil if p is not a
+// register read. Caller holds d.mu.
+func (d *Device) paramResponse(req, p []byte) [][]byte {
+	if len(p) < 7 || p[1] != pairing.SubConfigParamReq {
+		return nil
+	}
+	d.reads++
+	var msgs [][]byte
+	for i, pl := range params.EncodeResponse(d.regs[[2]byte{p[0], p[6]}]) {
+		m := d.reply(req, 0x10, 0xa0, pl...)
+		m[0] = req[0] + byte(i)
+		msgs = append(msgs, m)
+	}
+	return msgs
 }
 
 // SetNACK makes the device refuse configuration messages.
@@ -159,9 +221,15 @@ func (d *Device) Handle(msg []byte) [][]byte {
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	if d.asleep {
+		return nil
+	}
 	cmd, p := msg[2], msg[9:]
 	switch cmd {
 	case pairing.CmdConfig:
+		if r := d.paramResponse(msg, p); r != nil {
+			return r
+		}
 		if !d.config(p) {
 			return [][]byte{d.reply(msg, 0x02, 0x80, 0x80)}
 		}
@@ -220,9 +288,23 @@ func (d *Device) HandleClassic(msg []byte) (byte, []byte) {
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	if d.asleep {
+		return AckEUnknown, nil // the module: no answer from the device
+	}
 	cmd, p := msg[2], msg[9:]
 	switch {
 	case cmd == pairing.CmdConfig:
+		if r := d.paramResponse(msg, p); r != nil {
+			if inject := d.inject; inject != nil && len(r) > 1 {
+				go func() {
+					for _, m := range r[1:] {
+						time.Sleep(2 * time.Millisecond)
+						inject(m)
+					}
+				}()
+			}
+			return AckWithResponse, r[0]
+		}
 		if !d.config(p) {
 			return AckWithResponse, d.reply(msg, 0x02, 0x80, 0x80)
 		}

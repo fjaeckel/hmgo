@@ -133,9 +133,15 @@ func TestPairNewContact(t *testing.T) {
 	// templates: the HM-MOD-RPI-PCB encrypts itself), AES_ACTIVE on
 	// channel 1.
 	want := []string{"00050000000000", "000802010a1a0b2b0c3c", "0006", "01050000000001", "01080801", "0106"}
-	if got := e.payloadsSent(newSCo, 0x01); fmt.Sprint(got) != fmt.Sprint(want) {
+	if got := withoutReads(e.payloadsSent(newSCo, 0x01)); fmt.Sprint(got) != fmt.Sprint(want) {
 		t.Errorf("config messages %v, want %v", got, want)
 	}
+	// Then its settings are read while it is in config mode (list 0
+	// first; this emulated device answers with a plain ACK).
+	e.waitFor("settings read", func() bool {
+		got := e.payloadsSent(newSCo, 0x01)
+		return len(got) > len(want) && got[len(want)] == "00040000000000"
+	})
 	if got := e.payloadsSent(newSCo, 0x04); fmt.Sprint(got) != "[0100 0101]" {
 		t.Errorf("key exchange %v", got)
 	}

@@ -29,6 +29,7 @@ import (
 	"github.com/fjaeckel/hmgo/internal/ha"
 	"github.com/fjaeckel/hmgo/internal/hm"
 	"github.com/fjaeckel/hmgo/internal/hm/devices"
+	"github.com/fjaeckel/hmgo/internal/hm/params"
 	"github.com/fjaeckel/hmgo/internal/hm/power"
 	"github.com/fjaeckel/hmgo/internal/hm/remote"
 	"github.com/fjaeckel/hmgo/internal/ratelog"
@@ -164,6 +165,14 @@ type Bridge struct {
 	allStaleSent bool
 	// pair is the pairing mode state (see pairing.go).
 	pair pairingMode
+
+	// paramCol receives the frames of the register read the worker is
+	// doing (settings.go); guarded by paramMu.
+	paramMu  sync.Mutex
+	paramCol *paramCollector
+	// paramTimeout is the longest gap between two frames of a register
+	// read (paramFrameTimeout; tests shorten it).
+	paramTimeout time.Duration
 }
 
 type device struct {
@@ -205,6 +214,8 @@ type device struct {
 	// or replaced (renamed); results of its pending jobs then go to the
 	// device now registered at its address, if any.
 	removed bool
+	// settings are the device's settings (nil for models without any).
+	settings *deviceSettings
 }
 
 type group struct {
@@ -268,6 +279,7 @@ func New(opts Options) (*Bridge, error) {
 		unknown:      make(map[[3]byte]*UnknownSender),
 		hmip:         opts.HMIP,
 		floodLog:     newFloodLog(),
+		paramTimeout: paramFrameTimeout,
 	}
 	if b.clockSync == nil {
 		b.clockSync = SystemClockSynced
@@ -322,6 +334,7 @@ func New(opts Options) (*Bridge, error) {
 	if b.store.PairingEnabled() {
 		b.loadStore()
 	}
+	b.loadSettings()
 
 	for _, rg := range b.cfg.ResolvedGroups() {
 		slug := ha.Slugify(rg.Name)
@@ -386,6 +399,11 @@ func (b *Bridge) newDevice(dc *config.Device, stored *store.Device) (*device, er
 		},
 		available: true,
 		stored:    stored,
+		settings:  newDeviceSettings(dc.Model),
+	}
+	if d.settings != nil {
+		d.desc.Settings = settingDescs(d.settings.model.Settings)
+		d.desc.AllSettings = allSettingDescs
 	}
 	if kind == ha.Remote {
 		d.tracker = &remote.Tracker{}
@@ -475,6 +493,11 @@ func (b *Bridge) PublishAll() {
 		// right after a restart without a state file).
 		if !d.state.LastSeen.IsZero() {
 			if m, err := ha.StateMessage(topics, d.desc.Addr, d.state); err == nil {
+				msgs = append(msgs, m)
+			}
+		}
+		if d.settings != nil {
+			if m, err := ha.SettingsMessage(topics, d.desc.Addr, b.settingsStateLocked(d)); err == nil {
 				msgs = append(msgs, m)
 			}
 		}
@@ -702,6 +725,17 @@ func (b *Bridge) handleFrame(frame []byte) {
 		b.floodLog.Logf(b.logf, floodKeyAESFailed, "%s (%s): message failed AES authentication, ignoring it (cmd %02x). If the key is right, the device may use another key index than %d: set key_index for this device", d.cfg.Name, d.desc.Addr, pkt.Cmd, d.cfg.KeyIndex())
 		return
 	}
+	// The further frames of a register read go to the worker that asked
+	// for them (settings.go). They never change the state. Like the
+	// first frame (the answer to the request), they are taken without
+	// AES authentication: whether a device signs them is not known, see
+	// docs/DESIGN.md “Device settings”.
+	if pkt.Cmd == bidcos.Info && params.IsParamResponse(pkt.Payload) && pkt.Dest == central && b.forwardParamResponse(pkt) {
+		return
+	}
+	// A battery device that only listens in config mode signals that it
+	// listens: send the settings changes waiting for it.
+	b.settingsWake(d, pkt)
 	// For an AES device, a frame that was not authenticated could have
 	// been forged by anyone in radio range (whatever its destination,
 	// flags or command): it must not change any state (eQ-3:
@@ -713,6 +747,12 @@ func (b *Bridge) handleFrame(frame []byte) {
 			b.debugf("%s (%s): ignoring unauthenticated cmd %02x (flags %02x, to %x) payload %x: %s", d.cfg.Name, d.desc.Addr, pkt.Cmd, pkt.Flags, pkt.Dest[:], pkt.Payload, reason)
 			return
 		}
+	}
+
+	// A setting changed on the device itself (authenticated, or a device
+	// without AES: the checks above).
+	if pkt.Cmd == bidcos.Info && params.IsParamChange(pkt.Payload) {
+		b.applyParamChange(d, pkt.Payload)
 	}
 
 	ev, err := d.dev.Decode(pkt)
@@ -976,6 +1016,9 @@ type DeviceSnapshot struct {
 	// remote state for the status page.
 	Summary string   `json:"summary,omitempty"`
 	State   ha.State `json:"state"`
+	// Settings is the status of the device's settings (see the
+	// “Settings” sensor), for models with settings.
+	Settings string `json:"settings,omitempty"`
 }
 
 type GroupSnapshot struct {
@@ -1006,6 +1049,9 @@ func (b *Bridge) Snapshot() Snapshot {
 		}
 		if d.group != nil {
 			ds.Group = d.group.name
+		}
+		if d.settings != nil {
+			ds.Settings = settingsSummary(d.settings)
 		}
 		s.Devices = append(s.Devices, ds)
 	}

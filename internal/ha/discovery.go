@@ -48,6 +48,13 @@ type entity struct {
 	stateSuffix string
 	// noState: the entity has no state topic (buttons).
 	noState bool
+	// attrSuffix, if set, makes the entity read its attributes from
+	// <base>/<addr>/<suffix> (json_attributes_topic).
+	attrSuffix string
+	// bridgeOnly: available while the bridge is (not only while the
+	// device is), like last_seen: settings can be read and queued for a
+	// device that is asleep.
+	bridgeOnly bool
 }
 
 func kinds(ks ...Kind) func(DeviceDesc) bool {
@@ -196,6 +203,7 @@ func entities() []entity {
 		})},
 	}
 	list = append(list, pairedEntities()...)
+	list = append(list, settingsEntities()...)
 	list = append(list, actuatorEntities()...)
 	list = append(list, buttonEntities()...)
 	return append(list, ledEntities()...)
@@ -399,8 +407,9 @@ func entityTopic(cfg TopicConfig, component, id, key string) string {
 var bridgeAvailabilityOnly = map[string]bool{"last_seen": true, "auth_status": true, "unpair": true, "name": true}
 
 // common sets keys shared by all entities of a node. key is the entity
-// key ("" for the climate entity).
-func common(cfg TopicConfig, n node, component, uid, key string, m map[string]any) {
+// key ("" for the climate entity). bridgeOnly makes the entity
+// available whenever the bridge is (see bridgeAvailabilityOnly).
+func common(cfg TopicConfig, n node, component, uid, key string, m map[string]any, bridgeOnly bool) {
 	m["unique_id"] = uid
 	// default_entity_id is honoured since HA 2025.10. object_id is not
 	// sent: it raises a deprecation repair on 2025.10 – 2026.3 and is
@@ -413,7 +422,7 @@ func common(cfg TopicConfig, n node, component, uid, key string, m map[string]an
 	}
 	m["payload_available"] = PayloadOnline
 	m["payload_not_available"] = PayloadOffline
-	if n.deviceAvail == "" || bridgeAvailabilityOnly[key] {
+	if n.deviceAvail == "" || bridgeOnly || bridgeAvailabilityOnly[key] {
 		m["availability_topic"] = cfg.AvailabilityTopic()
 		return
 	}
@@ -456,7 +465,7 @@ func climateConfig(cfg TopicConfig, n node) map[string]any {
 		m["current_humidity_topic"] = st
 		m["current_humidity_template"] = numTemplate("humidity")
 	}
-	common(cfg, n, "climate", n.id, "", m)
+	common(cfg, n, "climate", n.id, "", m, false)
 	return m
 }
 
@@ -490,10 +499,13 @@ func entityMessage(cfg TopicConfig, n node, e entity) Message {
 	default:
 		m["state_topic"] = n.stateTopic
 	}
+	if e.attrSuffix != "" && n.topic != nil {
+		m["json_attributes_topic"] = n.topic(e.attrSuffix)
+	}
 	if e.command != "" {
 		m["command_topic"] = n.cmdTopic(e.command)
 	}
-	common(cfg, n, e.component, n.id+"_"+e.key, e.key, m)
+	common(cfg, n, e.component, n.id+"_"+e.key, e.key, m, e.bridgeOnly)
 	return retained(topic, mustJSON(m))
 }
 
@@ -512,12 +524,16 @@ func DiscoveryMessages(cfg TopicConfig, d DeviceDesc) []Message {
 			msgs = append(msgs, entityMessage(cfg, n, e))
 		}
 	}
+	for _, s := range d.Settings {
+		msgs = append(msgs, entityMessage(cfg, n, settingEntity(s)))
+	}
 	return msgs
 }
 
 // RemovalMessages returns empty retained messages that remove all
 // discovery configs (for any Kind) and the retained state of the device at
-// addr, e.g. for devices that were removed from the configuration.
+// addr, e.g. for devices that were removed from the configuration. The
+// setting entities are removed by SettingsRemovalMessages.
 func RemovalMessages(cfg TopicConfig, addr string) []Message {
 	id := nodeID(addr)
 	msgs := []Message{retained(climateTopic(cfg, id), nil)}
@@ -525,7 +541,7 @@ func RemovalMessages(cfg TopicConfig, addr string) []Message {
 		msgs = append(msgs, retained(entityTopic(cfg, e.component, id, e.key), nil))
 	}
 	return append(msgs, retained(cfg.StateTopic(addr), nil), retained(cfg.DeviceAvailabilityTopic(addr), nil),
-		retained(cfg.NameTopic(addr), nil))
+		retained(cfg.NameTopic(addr), nil), retained(cfg.SettingsTopic(addr), nil))
 }
 
 // StaleDiscoveryMessages returns removal messages for the entities that
@@ -555,6 +571,22 @@ func staleMessages(cfg TopicConfig, d DeviceDesc, scoped bool) []Message {
 	for _, e := range entities() {
 		if !e.match(d) && (!scoped || e.staleScope == nil || e.staleScope(d)) {
 			msgs = append(msgs, retained(entityTopic(cfg, e.component, id, e.key), nil))
+		}
+	}
+	if !scoped {
+		// Settings of other models (e.g. after the model of an address
+		// was corrected): once per start, like the per-button entities.
+		own := map[string]bool{}
+		for _, s := range d.Settings {
+			e := settingEntity(s)
+			own[entityTopic(cfg, e.component, id, e.key)] = true
+		}
+		for _, s := range d.AllSettings {
+			e := settingEntity(s)
+			if t := entityTopic(cfg, e.component, id, e.key); !own[t] {
+				own[t] = true
+				msgs = append(msgs, retained(t, nil))
+			}
 		}
 	}
 	return msgs

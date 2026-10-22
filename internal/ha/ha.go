@@ -26,6 +26,9 @@
 //	hmbridge/<addr>/set/unpair          any payload: unpair a device paired with hmbridge
 //	hmbridge/<addr>/set/name            new name of a device paired with hmbridge
 //	hmbridge/<addr>/name                retained name of a device paired with hmbridge
+//	hmbridge/<addr>/settings            retained JSON SettingsState (device settings)
+//	hmbridge/<addr>/set/setting_<key>   new value of a device setting
+//	hmbridge/<addr>/set/settings_refresh any payload: read the device's settings again
 //	hmbridge/bridge/set/pair            "PRESS" (or seconds, 10 … 600): start pairing mode
 //	hmbridge/bridge/pairing             retained JSON PairingState
 //	hmbridge/group/<slug>/state         retained JSON State of a heating group
@@ -46,6 +49,7 @@
 //	homeassistant/select/hmbridge_<addr>/led_<n>/config  (LED display)
 //	homeassistant/event/hmbridge_<addr>/button_<n>/config
 //	homeassistant/device_automation/hmbridge_<addr>/button_<n>_<press type>/config
+//	homeassistant/{number,select,switch,text}/hmbridge_<addr>/setting_<key>/config (device settings)
 //
 // GroupDiscoveryMessages does the same for a heating group, with node id
 // "hmbridge_group_<slug>": a climate entity and a window binary sensor on
@@ -217,6 +221,13 @@ type DeviceDesc struct {
 	// file): it gets an “Unpair” button (disabled by default) and a
 	// “Name” text entity.
 	Paired bool
+	// Settings are the device's settings (config entities, see
+	// SettingDesc), with a “Settings” status sensor and a “Refresh
+	// settings” button.
+	Settings []SettingDesc
+	// AllSettings are the settings of all models: AllStaleDiscoveryMessages
+	// and SettingsRemovalMessages remove those the device does not have.
+	AllSettings []SettingDesc
 }
 
 // GroupDesc describes a heating group for discovery. Group topics live
@@ -800,6 +811,13 @@ const (
 	// Rename renames a device paired with hmbridge: topic set/name,
 	// payload the new name (1 … 64 characters).
 	Rename
+	// SetSetting changes a device setting: topic set/setting_<key>,
+	// payload the new value (validated by the bridge, which knows the
+	// device's settings).
+	SetSetting
+	// RefreshSettings reads a device's settings again: topic
+	// set/settings_refresh, any payload.
+	RefreshSettings
 )
 
 func (k CommandKind) String() string {
@@ -822,6 +840,10 @@ func (k CommandKind) String() string {
 		return "Unpair"
 	case Rename:
 		return "Rename"
+	case SetSetting:
+		return "SetSetting"
+	case RefreshSettings:
+		return "RefreshSettings"
 	}
 	return fmt.Sprintf("CommandKind(%d)", int(k))
 }
@@ -844,6 +866,9 @@ type Command struct {
 
 	Duration time.Duration // StartPairing: 0 = default
 	Name     string        // Rename
+
+	Setting string // SetSetting: key, see ValidSettingKey
+	Value   string // SetSetting: the new value as sent (trimmed)
 }
 
 // ErrNotCommandTopic is returned by ParseCommand for topics that are not
@@ -909,6 +934,11 @@ func ParseCommand(cfg TopicConfig, topic string, payload []byte) (Command, error
 			return Command{}, fmt.Errorf("ha: invalid preset %q", p)
 		}
 		cmd.Kind, cmd.Preset = SetPreset, m
+	case "settings_refresh":
+		if cmd.Group != "" {
+			return Command{}, fmt.Errorf("ha: command %q is not supported for groups", what)
+		}
+		cmd.Kind = RefreshSettings
 	case "unpair", "name":
 		if cmd.Group != "" {
 			return Command{}, fmt.Errorf("ha: command %q is not supported for groups", what)
@@ -923,6 +953,19 @@ func ParseCommand(cfg TopicConfig, topic string, payload []byte) (Command, error
 		}
 		cmd.Kind, cmd.Name = Rename, name
 	default:
+		if key, ok := strings.CutPrefix(what, "setting_"); ok {
+			if cmd.Group != "" {
+				return Command{}, fmt.Errorf("ha: command %q is not supported for groups", what)
+			}
+			if !ValidSettingKey(key) {
+				return Command{}, fmt.Errorf("ha: invalid setting %q", key)
+			}
+			if len(p) > MaxSettingValue || !utf8.ValidString(p) {
+				return Command{}, fmt.Errorf("ha: invalid value for setting %s", key)
+			}
+			cmd.Kind, cmd.Setting, cmd.Value = SetSetting, key, p
+			return cmd, nil
+		}
 		if what != "switch" && what != "light" && !strings.HasPrefix(what, "led_") {
 			return Command{}, fmt.Errorf("ha: unknown command %q", what)
 		}

@@ -34,6 +34,9 @@ type aesDevices struct {
 	// plainSwitch: the switch answers LEVEL_SET with an unauthenticated
 	// ACK_STATUS (as a forger would).
 	plainSwitch bool
+	// device, if set, answers first (an emulated device, e.g.
+	// fakemod.Device.Handle; nil answers fall through).
+	device func(m []byte) [][]byte
 }
 
 func (a *aesDevices) onLLMACSend(m []byte) [][]byte {
@@ -52,6 +55,11 @@ func (a *aesDevices) onLLMACSend(m []byte) [][]byte {
 			return nil
 		}
 		return [][]byte{msg(m[0], 0xa0, 0x03, [3]byte(m[6:9]), central, r[:]...)}
+	}
+	if a.device != nil {
+		if r := a.device(m); r != nil {
+			return r
+		}
 	}
 	if a.plainSwitch && len(m) >= 12 && m[2] == 0x11 && bytes.Equal(m[6:9], plug[:]) {
 		return [][]byte{msg(m[0], 0x80, 0x02, plug, central, 0x01, m[10], m[11], 0x00, 0x41)}
@@ -299,17 +307,24 @@ func TestUnknownSenderLogRateLimited(t *testing.T) {
 			mu.Unlock()
 		}
 	})
-	for i := 0; i < 300; i++ {
-		e.inject(0x01, msg(0x01, 0x84, 0x41, [3]byte{0x55, byte(i >> 8), byte(i)}, central, 0x01, 0x01, 0x00))
-	}
-	e.waitFor("all processed", func() bool {
+	seen := func(addr string) bool {
 		for _, u := range e.b.Snapshot().Unknown {
-			if u.Address == "55012b" { // the last one
+			if u.Address == addr {
 				return true
 			}
 		}
 		return false
-	})
+	}
+	for i := 0; i < 300; i++ {
+		e.inject(0x01, msg(0x01, 0x84, 0x41, [3]byte{0x55, byte(i >> 8), byte(i)}, central, 0x01, 0x01, 0x00))
+		if i%32 == 31 {
+			// Stay below the radio layer's receive buffer (64 frames): a
+			// slow (race-instrumented) event loop must not lose frames.
+			addr := fmt.Sprintf("55%04x", i)
+			e.waitFor("batch processed", func() bool { return seen(addr) })
+		}
+	}
+	e.waitFor("all processed", func() bool { return seen("55012b") }) // the last one
 	mu.Lock()
 	defer mu.Unlock()
 	n := 0

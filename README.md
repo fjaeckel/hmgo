@@ -39,6 +39,17 @@ heating groups.
   * **Radio:** signal strength, last seen, message count, AES result.
   * **Commands:** outcome of the last command (e.g. "failed: boost (no
     response from device)").
+  * **Settings:** status of reading and writing the device settings.
+* **Device settings** in Home Assistant (configuration entities): the
+  thermostats' temperatures, offset, window and boost settings, button lock,
+  decalcification, valve settings and week profile (one text entity per
+  day), the window contact's event delay, the buttons' long and double press
+  times, the plugs' power-on action, the LED display's brightness. Read when
+  needed (after pairing, on "Refresh settings") and kept in `settings.json`;
+  every value is range-checked before it is sent and read back after
+  writing. Thermostats get changes at once with a wake-up burst; contacts and
+  buttons show them as pending until their config button is pressed. See
+  [docs/DEPLOY.md](docs/DEPLOY.md#6-device-settings).
 * **Heating groups**, like the CCU's: one climate entity per group that
   controls all its thermostats (or only the wall thermostat, which forwards to
   its valves, with `via_wall_thermostat`), with temperature from the wall
@@ -51,7 +62,8 @@ heating groups.
   to the central but are not configured (handy for finding device addresses).
 * **Survives restarts:** the last known state is read back from the MQTT
   broker, with a small state file as fallback that is written rarely to
-  spare the SD card. Paired devices and that state are kept as JSON files
+  spare the SD card. Paired devices, that state and the device settings
+  last read are kept as JSON files
   in one directory (`state_dir`, default `/var/lib/hmbridge`), written
   atomically; a damaged file is set aside, never blocking startup.
 * **Robust:** a slow or unreachable MQTT broker never stalls the radio side.
@@ -199,6 +211,9 @@ once the MQTT integration is set up. Topics, with base topic `hmbridge`:
 | `hmbridge/bridge/set/pair` | `PRESS` (or seconds, 10 … 600): start pairing mode |
 | `hmbridge/bridge/pairing` | JSON pairing state: `status`, `active`, `remaining`, `last_result` |
 | `hmbridge/<address>/set/unpair`, `…/set/name` | unpair / rename a device paired with hmbridge |
+| `hmbridge/<address>/settings` | JSON device settings: `current` values, `status`, `detail` per setting, `read_at` |
+| `hmbridge/<address>/set/setting_<key>` | change a setting, e.g. `setting_temperature_offset` `1.5`, `setting_week_profile_monday` `06:00 17, 22:00 21, 24:00 17` |
+| `hmbridge/<address>/set/settings_refresh` | read the device's settings again |
 | `hmbridge/group/<name>/…` | the same for heating groups |
 
 HomeMatic modes map to Home Assistant like this:
@@ -224,6 +239,7 @@ Everything is under `/metrics` on the status port (default `:8013`):
 | `hmbridge_mqtt_*` | MQTT: connection state, publishes, commands, Home Assistant restarts. |
 | `hmbridge_commands_total`, `hmbridge_command_queue_length` | Commands from Home Assistant. |
 | `hmbridge_pairing_*` | Pairing: attempts by result, unpairings, pairing mode active, number of paired devices. |
+| `hmbridge_settings_operations_total` | Device settings: reads and writes by result (ok, failed, pending, rejected). |
 | `hmheating_*`, `hmthermal_*`, `hmcontact_*` | Raw decoded device events, kept compatible with hmgo. |
 
 Example alerting rules are in
@@ -231,9 +247,13 @@ Example alerting rules are in
 
 ## Limitations
 
-* No editing of week programs, device settings or direct links (peerings)
-  yet. Use the CCU for that, then switch back. Pairing with hmbridge sets up
-  the device for hmbridge only, without direct links between devices.
+* No editing of direct links (peerings) and their parameters (e.g. a
+  dimmer's ramp times). Use the CCU for that, then switch back. Pairing with
+  hmbridge sets up the device for hmbridge only, without direct links
+  between devices. The device settings follow eQ-3's device descriptions and
+  FHEM but have not been tried on every model yet (see
+  [docs/DEPLOY.md](docs/DEPLOY.md#6-device-settings)); a few settings whose
+  sources disagree are not exposed.
 * Pairing follows FHEM's and Homegear's description of the CCU's pairing; the
   AES key exchange is verified against FHEM's code but not yet against a real
   device or an OpenCCU capture (see [docs/DESIGN.md](docs/DESIGN.md#pairing)).

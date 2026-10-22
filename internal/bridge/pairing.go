@@ -751,6 +751,12 @@ func (b *Bridge) handlePairResult(p *pairJob, ev any, err error) {
 	if isActuatorKind(d.desc.Kind) {
 		b.queue.push(statusJob(d))
 	}
+	// Read its settings while it is still in config mode.
+	if d.settings != nil {
+		d.settings.refresh = true
+		b.scheduleSettingsLocked(d, true)
+		b.publishSettingsLocked(d)
+	}
 }
 
 func isActuatorKind(k ha.Kind) bool { return k == ha.Switch || k == ha.Dimmer || k == ha.LEDDisplay }
@@ -769,6 +775,11 @@ func (b *Bridge) publishNewDeviceLocked(d *device) {
 	}
 	if !d.state.LastSeen.IsZero() {
 		if m, err := ha.StateMessage(topics, d.desc.Addr, d.state); err == nil {
+			msgs = append(msgs, m)
+		}
+	}
+	if d.settings != nil {
+		if m, err := ha.SettingsMessage(topics, d.desc.Addr, b.settingsStateLocked(d)); err == nil {
 			msgs = append(msgs, m)
 		}
 	}
@@ -865,8 +876,10 @@ func (b *Bridge) removeDeviceLocked(d *device) {
 		}
 	}
 	delete(b.byAddr, d.cfg.Addr())
+	b.queue.remove(settingsJobKey(d)) // nothing more for it
 	if b.pub != nil {
 		b.outbox.put(ha.RemovalMessages(b.pub.Topics(), d.desc.Addr)...)
+		b.outbox.put(ha.SettingsRemovalMessages(b.pub.Topics(), d.desc)...)
 	}
 	deleteDeviceMetrics(d.desc.Addr)
 	b.stateDirty, b.significantDirty = true, true
