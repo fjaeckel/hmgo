@@ -239,6 +239,9 @@ type group struct {
 	state                     ha.State
 	// desc is the group's discovery description (members included).
 	desc ha.GroupDesc
+	// settings are the group settings (groupsettings.go; nil if no
+	// thermostat of the group has settings).
+	settings *groupSettings
 }
 
 // maxUnknownSenders bounds the list of unconfigured senders.
@@ -370,6 +373,7 @@ func New(opts Options) (*Bridge, error) {
 		for _, dc := range rg.CommandTargets {
 			g.targets = append(g.targets, b.byAddr[dc.Addr()])
 		}
+		g.settings = newGroupSettings(g)
 		g.desc = b.groupDesc(g)
 		b.groups = append(b.groups, g)
 		b.bySlug[slug] = g
@@ -401,6 +405,9 @@ func (b *Bridge) groupDesc(g *group) ha.GroupDesc {
 	}
 	if g.climate != nil {
 		desc.Climate = g.climate.desc.Addr
+	}
+	if g.settings != nil {
+		desc.Settings = groupSettingDescs(g.settings.list)
 	}
 	return desc
 }
@@ -547,6 +554,11 @@ func (b *Bridge) PublishAll() {
 		g.availPublished = true
 		if !g.state.LastSeen.IsZero() {
 			if m, err := ha.GroupStateMessage(topics, g.slug, g.state); err == nil {
+				msgs = append(msgs, m)
+			}
+		}
+		if g.settings != nil {
+			if m, err := ha.GroupSettingsMessage(topics, g.slug, b.groupSettingsStateLocked(g)); err == nil {
 				msgs = append(msgs, m)
 			}
 		}

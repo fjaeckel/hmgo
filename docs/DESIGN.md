@@ -748,6 +748,67 @@ settings a device does not have are removed once per start
   internal button after power-up (FHEM: “simulate short press of peer
   self01”), so its effect depends on that button's (default) link.
 
+### Group settings
+
+Like OpenCCU's heating group parameters (`internal/hm/params/group.go`,
+`internal/bridge/groupsettings.go`, `internal/ha/groupsettings.go`): a
+heating group offers the settings its thermostats share with the same
+meaning, `params.ForGroup` over the members' models: comfort and eco
+temperature, window open temperature and duration, boost duration, minimum
+and maximum temperature, and the week profile days (program 1 of the wall
+thermostat, as for the device). A key is offered when at least one model
+has it and all models that have it agree on kind and unit; number ranges
+are intersected (the larger step). Today both thermostat models describe
+these settings with the same registers and ranges, except the window open
+settings, which the wall thermostat lacks: they apply to the radiator
+thermostats only, and their name says so when the group has a wall
+thermostat. Device-specific settings (offset, valve, display, lock, window
+detection mode, …) are not group settings.
+
+**Writes.** One HA command (`group/<slug>/set/setting_<key>`, also
+`setting_week_profile` with JSON days) is validated against the merged
+range and then, per member that has the setting, parsed with that member's
+own model (`parseSettingChanges`: each member converts the value with its
+own description); if any member rejects it, nothing is sent. Each member
+then gets an ordinary device settings change (pending change, settings job
+with burst, read before a write to shared registers, read-back
+verification), queued in member order: wall thermostats first, then the
+radiator thermostats. `groupWrite` records the change per member; the
+results of the members' settings jobs update it when they carry the same
+value (`noteGroupSettingLocked`). Group status: `ok` when all members
+confirmed, `pending` while any job is outstanding (“n of m confirmed”),
+`failed` when all failed, `partial` otherwise; per member name the status
+in `detail`. `group/<slug>/set/settings_refresh` refreshes every member.
+
+**Concurrency.** A per-device change and a group change of the same setting
+are independent writes and the last one written wins. A device change made
+while the group change still waits for that device replaces the pending
+change there (the device job carries the newer value) and marks the
+member `superseded` in the group status; a later group change replaces
+the group's record (results of the older one no longer match).
+
+**Reads.** Nothing is read for the group itself: its values are derived
+from the members' cached settings (`groupSettingsStateLocked`), published
+retained on `group/<slug>/settings` whenever a member's settings are
+published. Per setting: `consistent` (all members that have it hold the
+same value: shown in `current`), `mixed` (two known values differ) or
+`unknown` (a member's value is not known and the known ones agree).
+Number entities render a missing value as `None` (unknown in HA), text
+entities render `mixed`; the members' values are in the entity's
+attributes. The diagnostic “Settings consistency” sensor summarises (mixed
+over unknown over consistent) and lists the mixed and unknown keys.
+
+**Membership.** Groups and their members come from `config.json` only (a
+configured device cannot be unpaired at runtime), so the set of group
+settings is fixed per start. Stale entities: the group's settings topic is
+read back at startup with the member lists (`RetainedSubscriptions`); a
+group that published settings before and no longer has some (a model left
+the group) loses those entities, and one without settings (not possible
+with today's configuration rules, which require a thermostat per group)
+all settings entities and its settings topic (`StaleGroupMessages` with all settings any
+group can have, `params.GroupCatalog`); a removed group loses all of them
+with its other entities.
+
 ## Running alongside OpenCCU
 
 The module can only be owned by one process. During development the

@@ -161,7 +161,7 @@ func TestGroupMembersMessage(t *testing.T) {
 			t.Errorf("ParseGroupMembersTopic(%s) accepted", bad)
 		}
 	}
-	if subs := cfg.RetainedSubscriptions(); !reflect.DeepEqual(subs, []string{"hmbridge/+/state", "hmbridge/group/+/state", "hmbridge/group/+/members"}) {
+	if subs := cfg.RetainedSubscriptions(); !reflect.DeepEqual(subs, []string{"hmbridge/+/state", "hmbridge/group/+/state", "hmbridge/group/+/members", "hmbridge/group/+/settings"}) {
 		t.Errorf("RetainedSubscriptions = %v", subs)
 	}
 }

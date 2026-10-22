@@ -77,9 +77,10 @@ func (c TopicConfig) ParseGroupMembersTopic(topic string) (slug string, ok bool)
 
 // RetainedSubscriptions returns the topic filters hmbridge reads back at
 // startup (ReadRetained): StateSubscriptions plus the groups' member
-// lists.
+// lists and settings (whose presence shows that a group had settings
+// entities).
 func (c TopicConfig) RetainedSubscriptions() []string {
-	return append(c.StateSubscriptions(), c.base()+"/group/+/members")
+	return append(c.StateSubscriptions(), c.base()+"/group/+/members", c.base()+"/group/+/"+SettingsTopicSuffix)
 }
 
 // Attributes returns the group's climate entity attributes.
@@ -128,6 +129,7 @@ func groupNode(cfg TopicConfig, g GroupDesc) node {
 		humidity:    true, // harmless when the group has no humidity
 		deviceAvail: cfg.GroupAvailabilityTopic(g.Slug),
 		attrTopic:   cfg.GroupMembersTopic(g.Slug),
+		topic:       func(suffix string) string { return cfg.base() + "/group/" + g.Slug + "/" + suffix },
 	}
 }
 
@@ -225,7 +227,11 @@ func memberMessage(cfg TopicConfig, n node, addr string, e memberEntity) Message
 //	window contact       binary_sensor "<name> window" (device_class window)
 //	every member         binary_sensor "<name> available" (connectivity, diagnostic)
 //
-// Publish GroupMembersMessage along with them.
+// A group with settings (GroupDesc.Settings) also gets their config
+// entities, a “Settings” and a “Settings consistency” sensor and a
+// “Refresh settings” button (see GroupSettingsState).
+//
+// Publish GroupMembersMessage (and GroupSettingsMessage) along with them.
 func GroupDiscoveryMessages(cfg TopicConfig, g GroupDesc) []Message {
 	n := groupNode(cfg, g)
 	msgs := []Message{
@@ -237,7 +243,7 @@ func GroupDiscoveryMessages(cfg TopicConfig, g GroupDesc) []Message {
 			msgs = append(msgs, memberMessage(cfg, n, strings.ToLower(m.Address), e))
 		}
 	}
-	return msgs
+	return append(msgs, groupSettingsDiscovery(cfg, n, g)...)
 }
 
 // groupMemberRemovalTopics returns the discovery topics of member m's
@@ -251,9 +257,10 @@ func groupMemberRemovalTopics(cfg TopicConfig, slug string, m GroupMember) []str
 }
 
 // GroupRemovalMessages removes a heating group's discovery configs
-// (including those of the given members' entities), its member list and
-// its retained state.
-func GroupRemovalMessages(cfg TopicConfig, slug string, members []GroupMember) []Message {
+// (including those of the given members' entities, the settings
+// entities and those of the given settings), its member list, its
+// settings and its retained state.
+func GroupRemovalMessages(cfg TopicConfig, slug string, members []GroupMember, settings ...SettingDesc) []Message {
 	id := groupNodeID(slug)
 	e := groupWindowEntity()
 	msgs := []Message{
@@ -264,6 +271,9 @@ func GroupRemovalMessages(cfg TopicConfig, slug string, members []GroupMember) [
 		for _, t := range groupMemberRemovalTopics(cfg, slug, m) {
 			msgs = append(msgs, retained(t, nil))
 		}
+	}
+	for _, t := range groupSettingsRemovalTopics(cfg, slug, settings) {
+		msgs = append(msgs, retained(t, nil))
 	}
 	return append(msgs,
 		retained(cfg.GroupMembersTopic(slug), nil),
@@ -281,14 +291,21 @@ func GroupRemovalMessages(cfg TopicConfig, slug string, members []GroupMember) [
 //     also one from before member lists existed (found by its state
 //     topic);
 //   - a configured group loses the entities of members that left it (or
-//     whose role changed).
+//     whose role changed);
+//   - a configured group that published settings before (its settings
+//     topic is retained) loses the entities of settings it no longer has
+//     (allSettings are all settings a group can have), and all settings
+//     entities and the settings topic when it has no settings any more
+//     (no thermostat with settings left).
 //
 // The result never touches a topic of the configured groups.
-func StaleGroupMessages(cfg TopicConfig, groups []GroupDesc, retainedMsgs map[string][]byte) []Message {
+func StaleGroupMessages(cfg TopicConfig, groups []GroupDesc, retainedMsgs map[string][]byte, allSettings ...SettingDesc) []Message {
 	current := map[string]bool{}
 	live := map[string]bool{}
+	hasSettings := map[string]bool{}
 	for _, g := range groups {
 		current[g.Slug] = true
+		hasSettings[g.Slug] = len(g.Settings) > 0
 		for _, m := range GroupDiscoveryMessages(cfg, g) {
 			live[m.Topic] = true
 		}
@@ -309,7 +326,7 @@ func StaleGroupMessages(cfg TopicConfig, groups []GroupDesc, retainedMsgs map[st
 			var old GroupAttributes
 			_ = json.Unmarshal(payload, &old) // junk: remove the group's fixed entities at least
 			if !current[slug] {
-				add(GroupRemovalMessages(cfg, slug, old.Members)...)
+				add(GroupRemovalMessages(cfg, slug, old.Members, allSettings...)...)
 				continue
 			}
 			for _, m := range old.Members {
@@ -319,8 +336,21 @@ func StaleGroupMessages(cfg TopicConfig, groups []GroupDesc, retainedMsgs map[st
 			}
 			continue
 		}
+		if slug, ok := cfg.ParseGroupSettingsTopic(topic); ok {
+			if !current[slug] {
+				add(GroupRemovalMessages(cfg, slug, nil, allSettings...)...)
+				continue
+			}
+			for _, t := range groupSettingsRemovalTopics(cfg, slug, allSettings) {
+				if t == cfg.GroupSettingsTopic(slug) && hasSettings[slug] {
+					continue // live state topic
+				}
+				add(retained(t, nil))
+			}
+			continue
+		}
 		if _, slug, ok := cfg.ParseStateTopic(topic); ok && slug != "" && ValidSlug(slug) && !current[slug] {
-			add(GroupRemovalMessages(cfg, slug, nil)...)
+			add(GroupRemovalMessages(cfg, slug, nil, allSettings...)...)
 		}
 	}
 	msgs := make([]Message, 0, len(out))

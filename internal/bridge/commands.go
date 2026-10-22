@@ -345,6 +345,10 @@ func (b *Bridge) handleCommand(cmd ha.Command) {
 		b.saveSettings() // its cached settings are gone
 		return
 	case ha.SetSetting, ha.RefreshSettings:
+		if cmd.Group != "" {
+			b.handleGroupSettingsCommand(cmd)
+			return
+		}
 		b.handleSettingsCommand(cmd)
 		return
 	case ha.Rename:

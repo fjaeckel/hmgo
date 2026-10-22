@@ -33,7 +33,8 @@
 //	hmbridge/bridge/pairing             retained JSON PairingState
 //	hmbridge/group/<slug>/state         retained JSON State of a heating group
 //	hmbridge/group/<slug>/members       retained JSON GroupAttributes (member list)
-//	hmbridge/group/<slug>/set/...       as for devices
+//	hmbridge/group/<slug>/settings      retained JSON GroupSettingsState (group settings)
+//	hmbridge/group/<slug>/set/...       as for devices (climate, setting_<key>, settings_refresh)
 //	homeassistant/status                HA birth/will message ("online")
 //
 // <addr> is the BidCoS address as 6 lowercase hex digits, e.g. "38f59c".
@@ -52,7 +53,8 @@
 //	homeassistant/device_automation/hmbridge_<addr>/button_<n>_<press type>/config
 //	homeassistant/{number,select,switch,text}/hmbridge_<addr>/setting_<key>/config (device settings)
 //
-// GroupDiscoveryMessages does the same for a heating group, with node id
+// GroupDiscoveryMessages does the same for a heating group (group
+// settings: homeassistant/{number,text}/hmbridge_group_<slug>/setting_<key>/config), with node id
 // "hmbridge_group_<slug>": a climate entity, a window binary sensor and
 // per member a few entities that mirror the member's state (see
 // GroupDiscoveryMessages) on an HA device "<name> (group)", model
@@ -255,6 +257,12 @@ type GroupDesc struct {
 	// SuggestArea sends the group name as suggested_area of the group's
 	// HA device (HA applies it only when it creates the device).
 	SuggestArea bool
+	// Settings are the group settings (see GroupSettingsState): config
+	// entities on the group's HA device, written to every thermostat
+	// member that has them, with a “Settings” status sensor, a
+	// “Settings consistency” sensor and a “Refresh settings” button.
+	// Empty for a group without thermostats with settings.
+	Settings []SettingDesc
 }
 
 // ValidSlug reports whether s can be used as a GroupDesc.Slug.
@@ -833,10 +841,12 @@ const (
 	Rename
 	// SetSetting changes a device setting: topic set/setting_<key>,
 	// payload the new value (validated by the bridge, which knows the
-	// device's settings).
+	// device's settings). For a group: a group setting, written to
+	// every thermostat member that has it.
 	SetSetting
 	// RefreshSettings reads a device's settings again: topic
-	// set/settings_refresh, any payload.
+	// set/settings_refresh, any payload. For a group: the settings of
+	// all its thermostats.
 	RefreshSettings
 )
 
@@ -955,9 +965,6 @@ func ParseCommand(cfg TopicConfig, topic string, payload []byte) (Command, error
 		}
 		cmd.Kind, cmd.Preset = SetPreset, m
 	case "settings_refresh":
-		if cmd.Group != "" {
-			return Command{}, fmt.Errorf("ha: command %q is not supported for groups", what)
-		}
 		cmd.Kind = RefreshSettings
 	case "unpair", "name":
 		if cmd.Group != "" {
@@ -974,9 +981,6 @@ func ParseCommand(cfg TopicConfig, topic string, payload []byte) (Command, error
 		cmd.Kind, cmd.Name = Rename, name
 	default:
 		if key, ok := strings.CutPrefix(what, "setting_"); ok {
-			if cmd.Group != "" {
-				return Command{}, fmt.Errorf("ha: command %q is not supported for groups", what)
-			}
 			if !ValidSettingKey(key) {
 				return Command{}, fmt.Errorf("ha: invalid setting %q", key)
 			}

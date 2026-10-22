@@ -186,7 +186,7 @@ func (b *Bridge) SeedFromRetained(topics ha.TopicConfig, msgs map[string][]byte)
 	for i, g := range b.groups {
 		descs[i] = g.desc
 	}
-	b.staleGroups = ha.StaleGroupMessages(topics, descs, msgs)
+	b.staleGroups = ha.StaleGroupMessages(topics, descs, msgs, allGroupSettingDescs...)
 	if len(b.staleGroups) > 0 {
 		b.logf("removing %d Home Assistant discovery and state topics of former heating groups and group members", len(b.staleGroups))
 	}

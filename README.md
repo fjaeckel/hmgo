@@ -55,7 +55,11 @@ heating groups.
   its valves, with `via_wall_thermostat`), with temperature from the wall
   thermostat and window state from the contacts. The group's Home Assistant
   device also shows every member (valve positions, wall thermostat
-  temperature and humidity, each window, availability); see
+  temperature and humidity, each window, availability) and, like OpenCCU's
+  group parameters, **group settings** (comfort/eco temperature, week profile,
+  window open temperature and duration, boost duration, minimum/maximum
+  temperature) that are written to every thermostat of the group, with
+  mixed values across the members flagged; see
   [docs/DEPLOY.md](docs/DEPLOY.md#heating-groups-in-home-assistant).
 * **Prometheus metrics** at `/metrics`, covering:
   * Per-device state.
@@ -223,6 +227,8 @@ once the MQTT integration is set up. Topics, with base topic `hmbridge`:
 | `hmbridge/<address>/set/settings_refresh` | read the device's settings again |
 | `hmbridge/group/<name>/…` | the same for heating groups |
 | `hmbridge/group/<name>/members` | JSON member list of a heating group (attributes of its climate entity) |
+| `hmbridge/group/<name>/settings` | JSON group settings: values the members agree on, per-member values and consistency, status of the last group change |
+| `hmbridge/group/<name>/set/setting_<key>` | change a group setting on every thermostat of the group (`…/set/settings_refresh` reads them all) |
 
 HomeMatic modes map to Home Assistant like this:
 

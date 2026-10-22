@@ -339,7 +339,8 @@ type node struct {
 	deviceAvail string
 	// eventTopic returns a button's event topic (nil for groups).
 	eventTopic func(button int) string
-	// topic returns <base>/<addr>/<suffix> (nil for groups).
+	// topic returns <base>/<addr>/<suffix> (groups:
+	// <base>/group/<slug>/<suffix>).
 	topic func(suffix string) string
 	// attrTopic, if set, is the climate entity's json_attributes_topic
 	// (a group's member list).

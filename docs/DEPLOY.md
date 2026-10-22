@@ -362,6 +362,61 @@ overwritten. Set the area of existing devices by hand (deleting and
 rediscovering a device does not help: Home Assistant restores a recently
 deleted device with its old area).
 
+#### Group settings
+
+Like OpenCCU's heating group parameters, the group's device page has
+settings under **Configuration** that hmbridge writes to every thermostat
+of the group, so that their copies stay the same: each thermostat runs its
+own week program and reacts to an open window by itself, so a radiator
+thermostat with another week profile than its wall thermostat heats at
+other times.
+
+| group setting | written to |
+|---|---|
+| comfort temperature, eco temperature | all thermostats |
+| boost duration, minimum and maximum temperature | all thermostats |
+| week profile Monday … Sunday (wall thermostat: program 1) | all thermostats |
+| window open temperature and duration | radiator thermostats only (the wall thermostat has no such settings); the entity name says "(radiator thermostats only)" when the group has a wall thermostat |
+
+Everything else (temperature offset, valve settings, button lock, display,
+window open detection, …) describes one device and stays a **device
+setting** on the member's own device page (section 6).
+
+* **Changing.** The value is checked against the range all members accept
+  (where the models differ, the intersection) and rejected for all members
+  if one would refuse it. Otherwise each thermostat gets the change as a
+  device setting change (see section 6: read, write, read back), the wall
+  thermostat first, then the radiator thermostats. The group's
+  **Settings** sensor (diagnostic) shows the last group change: `ok: …` when
+  all members confirmed it, `pending: … (1 of 2 thermostats confirmed)`,
+  `partial: …` or `failed: …`; its attributes list each member's status
+  (`ok`, `writing`, `failed: <reason>`, `not applicable`, `superseded by a
+  change on the device`). Each member's own Settings sensor shows the
+  details as well.
+* **Values.** A group setting shows the members' value when all members
+  hold the same one. When they differ, a number shows *unknown* and a week
+  profile day shows `mixed`; the entity's attributes list every member's
+  value. Until all members were read, the value is unknown: press the
+  group's **Refresh settings** button (it reads all its thermostats). The
+  diagnostic sensor **Settings consistency** is `consistent`, `mixed` or
+  `unknown`; its attributes list the settings that are mixed and unknown.
+* **Device and group changes** of the same setting are independent writes:
+  the last one written wins. A device change made while a group change still
+  waits for that device replaces it there (the group status shows it as
+  superseded); a device change made later makes the group `mixed`. To align
+  the members again, set the value on the group.
+* **MQTT.** Values and status: `hmbridge/group/<group>/settings` (retained
+  JSON: `current`, `settings` with each setting's `consistency` and
+  `members`, `consistency`, `mixed`, `unknown`, `status`, `detail`). Changes:
+  `hmbridge/group/<group>/set/setting_<key>`; several week profile days at
+  once: `hmbridge/group/<group>/set/setting_week_profile` with the JSON of
+  section 6; refresh: `hmbridge/group/<group>/set/settings_refresh`. The
+  unique IDs are `hmbridge_group_<group>_setting_<key>`.
+* When a group is removed from `config.json`, or loses its last radiator
+  thermostat (the window open settings) or its wall thermostat (the
+  "radiator thermostats only" names change), Home Assistant is updated
+  after the restart: entities the group no longer has disappear.
+
 ## Migrating from OpenCCU
 
 hmbridge needs exclusive access to the radio module (HM-MOD-RPI-PCB or
@@ -862,6 +917,10 @@ worth exposing. Not exposed on purpose (the sources disagree on how they are
 stored; see docs/DESIGN.md): global and mode button lock, local reset
 disable, the LED display's energy option, the contacts' message for position
 A/B. The wall thermostat's week programs 2 and 3 are not exposed.
+
+For thermostats in a heating group, the settings they share (comfort and eco
+temperature, week profile, …) can also be set once on the group, which
+writes them to every member (Step 11, *Group settings*).
 
 **Reading.** hmbridge reads the settings from the device when it was just
 paired, when you press **Refresh settings**, and when a change needs a value

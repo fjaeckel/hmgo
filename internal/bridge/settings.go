@@ -293,6 +293,9 @@ func (b *Bridge) handleSettingsCommand(cmd ha.Command) {
 		for _, c := range changes {
 			ds.pending[c.Setting.Key] = c
 			ds.detail[c.Setting.Key] = ha.SettingsPending
+			// Last write wins: a group change of this setting still on its
+			// way is replaced.
+			b.supersedeGroupSettingLocked(d, c.Setting.Key)
 			b.logf("%s: setting %s to %s%s", d.cfg.Name, c.Setting.Key, c, waitNote(ds))
 		}
 		if ds.rx == pairing.ConfigOnly {
@@ -827,6 +830,7 @@ func (b *Bridge) handleSettingsResult(res jobResult) {
 			b.logf("%s: setting %s = %s failed: %v", d.cfg.Name, key, c, err)
 			last = fmt.Sprintf("failed: setting %s (%v)", key, err)
 		}
+		b.noteGroupSettingLocked(d, c, ds.detail[key])
 	}
 	if retry {
 		j := res.job
@@ -948,5 +952,8 @@ func (b *Bridge) publishSettingsLocked(d *device) {
 		b.outbox.put(m)
 	} else {
 		b.logf("encoding settings of %s: %v", d.cfg.Name, err)
+	}
+	if isGroupSettingsMember(d) {
+		b.publishGroupSettingsLocked(d.group)
 	}
 }

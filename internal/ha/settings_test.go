@@ -27,6 +27,15 @@ func TestParseSettingCommands(t *testing.T) {
 	if err != nil || cmd.Kind != RefreshSettings || cmd.Addr != "38f59c" {
 		t.Errorf("RefreshSettings: %+v, %v", cmd, err)
 	}
+	// Group settings.
+	cmd, err = ParseCommand(cfg, "hmbridge/group/bad/set/setting_comfort_temperature", []byte("21"))
+	if err != nil || cmd != (Command{Group: "bad", Kind: SetSetting, Setting: "comfort_temperature", Value: "21"}) {
+		t.Errorf("group SetSetting: %+v, %v", cmd, err)
+	}
+	cmd, err = ParseCommand(cfg, "hmbridge/group/bad/set/settings_refresh", []byte("PRESS"))
+	if err != nil || cmd != (Command{Group: "bad", Kind: RefreshSettings}) {
+		t.Errorf("group RefreshSettings: %+v, %v", cmd, err)
+	}
 	for _, c := range []struct{ topic, payload string }{
 		{"hmbridge/38f59c/set/setting_", "1"},
 		{"hmbridge/38f59c/set/setting_Temperature", "1"},
@@ -34,8 +43,8 @@ func TestParseSettingCommands(t *testing.T) {
 		{"hmbridge/38f59c/set/setting_" + strings.Repeat("x", 65), "1"},
 		{"hmbridge/38f59c/set/setting_x", strings.Repeat("1", MaxSettingValue+1)},
 		{"hmbridge/38f59c/set/setting_x", "\xff"},
-		{"hmbridge/group/bad/set/setting_x", "1"},
-		{"hmbridge/group/bad/set/settings_refresh", ""},
+		{"hmbridge/group/bad/set/setting_X", "1"},
+		{"hmbridge/group/Bad/set/settings_refresh", ""},
 	} {
 		if cmd, err := ParseCommand(cfg, c.topic, []byte(c.payload)); err == nil {
 			t.Errorf("%s accepted: %+v", c.topic, cmd)
