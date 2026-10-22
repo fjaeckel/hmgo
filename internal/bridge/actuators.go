@@ -36,15 +36,6 @@ func (b *Bridge) actuators() []*device {
 	return res
 }
 
-func (b *Bridge) hasRemotes() bool {
-	for _, d := range b.devices {
-		if d.tracker != nil {
-			return true
-		}
-	}
-	return false
-}
-
 func statusJob(d *device) job {
 	return job{key: "status:" + d.desc.Addr, kind: jobStatus, dev: d}
 }
@@ -52,8 +43,8 @@ func statusJob(d *device) job {
 // initialStatusPolls asks every actuator for its status shortly after
 // startup, one after the other, so that Home Assistant does not show
 // them as unknown until they change.
-func (b *Bridge) initialStatusPolls(ctx context.Context) {
-	for _, d := range b.actuators() {
+func (b *Bridge) initialStatusPolls(ctx context.Context, actuators []*device) {
+	for _, d := range actuators {
 		t := time.NewTimer(b.pollStagger)
 		select {
 		case <-ctx.Done():

@@ -203,6 +203,18 @@ type Config struct {
 	// They are always asked once shortly after startup.
 	StatusPollIntervalSetting Duration `json:"status_poll_interval,omitempty"`
 
+	// DevicesFile stores the devices paired with hmbridge itself (see
+	// Pairing). Default "/var/lib/hmbridge/devices.json"; "" disables
+	// pairing. It is read at startup and merged with Devices (on a
+	// conflict, Devices wins) and only written when a device is paired,
+	// unpaired or renamed.
+	DevicesFile *string `json:"devices_file,omitempty"`
+
+	// Pairing configures the teach-in of new devices.
+	Pairing *Pairing `json:"pairing,omitempty"`
+
+	// Devices are the devices defined in this file. Devices paired with
+	// hmbridge are kept in DevicesFile instead.
 	Devices []Device `json:"devices"`
 	Groups  []Group  `json:"groups,omitempty"`
 
@@ -210,6 +222,33 @@ type Config struct {
 	current     hmkey.Key
 	previous    *hmkey.Key
 }
+
+// Pairing configures how hmbridge pairs new devices.
+type Pairing struct {
+	Comment Comment `json:"_comment,omitempty"`
+	// AES selects what pairing does about AES: "system_key" switches
+	// AES-capable devices to the configured key (security) and enables
+	// AES on the channels a CCU enables it on (contacts, push buttons,
+	// remotes); "off" leaves the devices on the eQ-3 default key without
+	// AES. Default: "system_key" when a security block is configured,
+	// else "off".
+	AES string `json:"aes,omitempty"`
+	// Duration is how long pairing mode stays on (Go duration, default
+	// "60s", 10s … 10m).
+	Duration Duration `json:"duration,omitempty"`
+}
+
+// Pairing AES modes.
+const (
+	PairingAESSystemKey = "system_key"
+	PairingAESOff       = "off"
+)
+
+// DefaultDevicesFile is where paired devices are kept.
+const DefaultDevicesFile = "/var/lib/hmbridge/devices.json"
+
+// DefaultPairingDuration is how long pairing mode stays on.
+const DefaultPairingDuration = 60 * time.Second
 
 // Security configures the AES key used by the devices (the CCU's
 // “system security key”). Exactly one of Key and Passphrase may be set.
@@ -279,7 +318,12 @@ type Device struct {
 	addr         [3]byte
 	keyIndex     byte
 	staleDefault time.Duration
+	fromStore    bool
 }
+
+// FromStore reports whether the device comes from the devices file
+// (paired with hmbridge) rather than from the configuration file.
+func (d Device) FromStore() bool { return d.fromStore }
 
 // KeyIndex returns the AES key index the device uses: key_index if set,
 // otherwise the index of the current key.
@@ -631,8 +675,25 @@ func (c *Config) resolve() error {
 	if p := c.StatusPollIntervalSetting.Duration; p < 0 || p > 0 && p < 5*time.Minute {
 		return fmt.Errorf("status_poll_interval: %v is too short (minimum 5m, or \"0s\" to disable)", p)
 	}
-	if len(c.Devices) == 0 {
-		return fmt.Errorf("devices: at least one device is required")
+	if c.DevicesFile != nil && *c.DevicesFile != "" && isPlaceholder(*c.DevicesFile) {
+		return placeholderError("devices_file")
+	}
+	if len(c.Devices) == 0 && c.DevicesFilePath() == "" {
+		return fmt.Errorf("devices: at least one device is required (or keep devices_file enabled and pair devices with hmbridge)")
+	}
+	if p := c.Pairing; p != nil {
+		switch p.AES {
+		case "", PairingAESOff:
+		case PairingAESSystemKey:
+			if c.Security == nil {
+				return fmt.Errorf("pairing.aes: %q needs a security block (the key to give the devices)", PairingAESSystemKey)
+			}
+		default:
+			return fmt.Errorf("pairing.aes: %q is not one of %q, %q", p.AES, PairingAESSystemKey, PairingAESOff)
+		}
+		if d := p.Duration; d.set && (d.Duration < 10*time.Second || d.Duration > 10*time.Minute) {
+			return fmt.Errorf("pairing.duration: %v out of range 10s … 10m", d.Duration)
+		}
 	}
 	byName := make(map[string]int)
 	byAddr := make(map[[3]byte]int)
@@ -642,66 +703,17 @@ func (c *Config) resolve() error {
 		if d.Name != "" {
 			where = fmt.Sprintf("devices[%d] (%q)", i, d.Name)
 		}
-		if strings.TrimSpace(d.Name) == "" {
-			return fmt.Errorf("%s: name is required", where)
-		}
-		if _, ok := modelChannels[d.Model]; !ok {
-			return fmt.Errorf("%s: unsupported model %q (supported: %s)", where, d.Model, strings.Join(Models(), ", "))
-		}
-		if d.Address == "" {
-			return fmt.Errorf("%s: address is required", where)
-		}
-		a, err := parseAddr(d.Address)
-		if err != nil {
-			return fmt.Errorf("%s: %v", where, err)
-		}
-		if a == [3]byte{} {
-			return fmt.Errorf("%s: address must not be 000000", where)
-		}
-		if a == c.centralAddr {
-			return fmt.Errorf("%s: address equals central_address", where)
-		}
-		d.addr = a
-		if d.Serial != "" && len(d.Serial) != 10 {
-			return fmt.Errorf("%s: serial %q: want 10 characters", where, d.Serial)
-		}
-		if d.AESEnabled() && !SupportsAES(d.Model) {
-			return fmt.Errorf("%s: %s does not support AES; remove aes/aes_channels", where, d.Model)
-		}
-		for _, ch := range d.AESChannels {
-			if ch < 1 || ch > d.Channels() {
-				return fmt.Errorf("%s: aes_channels: channel %d out of range 1..%d for %s (channel 0 is the maintenance channel)", where, ch, d.Channels(), d.Model)
-			}
-		}
-		if d.StaleAfter.set && d.StaleAfter.Duration != 0 && d.StaleAfter.Duration < time.Minute {
-			return fmt.Errorf("%s: stale_after %v is too short (minimum 1m, or \"0s\" for never)", where, d.StaleAfter.Duration)
-		}
-		if poll := c.StatusPollIntervalSetting.Duration; IsActuator(d.Model) && poll > 0 &&
-			d.StaleAfter.set && d.StaleAfter.Duration != 0 && d.StaleAfter.Duration <= poll {
-			return fmt.Errorf("%s: stale_after %v must be longer than status_poll_interval %v (the actuator is only heard from when polled), or \"0s\" for never", where, d.StaleAfter.Duration, poll)
-		}
-		d.staleDefault = defaultStale(d.Model, c.StatusPollIntervalSetting.Duration)
-		d.keyIndex = c.current.Index
-		if d.KeyIndexOverride != nil {
-			ki := *d.KeyIndexOverride
-			valid := ki == int(c.current.Index) || (c.previous != nil && ki == int(c.previous.Index))
-			if !valid {
-				known := fmt.Sprintf("%d (current)", c.current.Index)
-				if c.previous != nil {
-					known += fmt.Sprintf(" or %d (previous)", c.previous.Index)
-				}
-				return fmt.Errorf("%s: key_index %d is not the index of a configured key; must be %s", where, ki, known)
-			}
-			d.keyIndex = byte(ki)
+		if err := c.resolveDevice(d, where, false); err != nil {
+			return err
 		}
 		if j, ok := byName[strings.ToLower(d.Name)]; ok {
 			return fmt.Errorf("%s: duplicate name (also used by devices[%d])", where, j)
 		}
 		byName[strings.ToLower(d.Name)] = i
-		if j, ok := byAddr[a]; ok {
+		if j, ok := byAddr[d.addr]; ok {
 			return fmt.Errorf("%s: duplicate address %s (also used by devices[%d])", where, d.AddrHex(), j)
 		}
-		byAddr[a] = i
+		byAddr[d.addr] = i
 	}
 
 	inGroup := make(map[int]string)
@@ -750,6 +762,125 @@ func (c *Config) resolve() error {
 		g.thermostats = append(tcs, rts...)
 	}
 	return nil
+}
+
+// resolveDevice validates d and fills in its parsed fields. A device
+// from the devices file may also use key index 0 (the eQ-3 default
+// key, which every device has after a factory reset).
+func (c *Config) resolveDevice(d *Device, where string, fromStore bool) error {
+	if strings.TrimSpace(d.Name) == "" {
+		return fmt.Errorf("%s: name is required", where)
+	}
+	if _, ok := modelChannels[d.Model]; !ok {
+		return fmt.Errorf("%s: unsupported model %q (supported: %s)", where, d.Model, strings.Join(Models(), ", "))
+	}
+	if d.Address == "" {
+		return fmt.Errorf("%s: address is required", where)
+	}
+	a, err := parseAddr(d.Address)
+	if err != nil {
+		return fmt.Errorf("%s: %v", where, err)
+	}
+	if a == [3]byte{} {
+		return fmt.Errorf("%s: address must not be 000000", where)
+	}
+	if a == c.centralAddr {
+		return fmt.Errorf("%s: address equals central_address", where)
+	}
+	d.addr = a
+	if d.Serial != "" && len(d.Serial) != 10 {
+		return fmt.Errorf("%s: serial %q: want 10 characters", where, d.Serial)
+	}
+	if d.AESEnabled() && !SupportsAES(d.Model) {
+		return fmt.Errorf("%s: %s does not support AES; remove aes/aes_channels", where, d.Model)
+	}
+	for _, ch := range d.AESChannels {
+		if ch < 1 || ch > d.Channels() {
+			return fmt.Errorf("%s: aes_channels: channel %d out of range 1..%d for %s (channel 0 is the maintenance channel)", where, ch, d.Channels(), d.Model)
+		}
+	}
+	if d.StaleAfter.set && d.StaleAfter.Duration != 0 && d.StaleAfter.Duration < time.Minute {
+		return fmt.Errorf("%s: stale_after %v is too short (minimum 1m, or \"0s\" for never)", where, d.StaleAfter.Duration)
+	}
+	if poll := c.StatusPollIntervalSetting.Duration; IsActuator(d.Model) && poll > 0 &&
+		d.StaleAfter.set && d.StaleAfter.Duration != 0 && d.StaleAfter.Duration <= poll {
+		return fmt.Errorf("%s: stale_after %v must be longer than status_poll_interval %v (the actuator is only heard from when polled), or \"0s\" for never", where, d.StaleAfter.Duration, poll)
+	}
+	d.staleDefault = defaultStale(d.Model, c.StatusPollIntervalSetting.Duration)
+	d.keyIndex = c.current.Index
+	if d.KeyIndexOverride != nil {
+		ki := *d.KeyIndexOverride
+		valid := ki == int(c.current.Index) || (c.previous != nil && ki == int(c.previous.Index)) || (fromStore && ki == 0)
+		if !valid {
+			known := fmt.Sprintf("%d (current)", c.current.Index)
+			if c.previous != nil {
+				known += fmt.Sprintf(" or %d (previous)", c.previous.Index)
+			}
+			return fmt.Errorf("%s: key_index %d is not the index of a configured key; must be %s", where, ki, known)
+		}
+		d.keyIndex = byte(ki)
+	}
+	d.fromStore = fromStore
+	return nil
+}
+
+// ResolveStoreDevice validates a device from the devices file (paired
+// with hmbridge) against the configuration and returns it ready for
+// use. Unlike configured devices, it may use key index 0. It does not
+// check for conflicts with other devices; see ConflictsWith.
+func (c *Config) ResolveStoreDevice(d Device) (*Device, error) {
+	where := fmt.Sprintf("device %s", d.Address)
+	if d.Name != "" {
+		where = fmt.Sprintf("device %s (%q)", d.Address, d.Name)
+	}
+	if err := c.resolveDevice(&d, where, true); err != nil {
+		return nil, err
+	}
+	return &d, nil
+}
+
+// ConfiguredDevice returns the device of the configuration file (not
+// the devices file) with the given address or, if addr matches none,
+// with the given name (case-insensitive), or nil.
+func (c *Config) ConfiguredDevice(addr [3]byte, name string) *Device {
+	if d := c.Device(addr); d != nil {
+		return d
+	}
+	for i := range c.Devices {
+		if name != "" && strings.EqualFold(c.Devices[i].Name, name) {
+			return &c.Devices[i]
+		}
+	}
+	return nil
+}
+
+// DevicesFilePath returns the resolved devices file path ("" = pairing
+// disabled).
+func (c *Config) DevicesFilePath() string {
+	if c.DevicesFile == nil {
+		return DefaultDevicesFile
+	}
+	return *c.DevicesFile
+}
+
+// PairingAES returns the resolved pairing AES mode: pairing.aes, or
+// "system_key" when a security block is configured, else "off".
+func (c *Config) PairingAES() string {
+	if c.Pairing != nil && c.Pairing.AES != "" {
+		return c.Pairing.AES
+	}
+	if c.Security != nil {
+		return PairingAESSystemKey
+	}
+	return PairingAESOff
+}
+
+// PairingDuration returns how long pairing mode stays on.
+func (c *Config) PairingDuration() time.Duration {
+	if c.Pairing != nil && c.Pairing.Duration.set {
+		return c.Pairing.Duration.Duration
+	}
+	return DefaultPairingDuration
 }
 
 // DefaultStateFile is where the last known device state is kept.

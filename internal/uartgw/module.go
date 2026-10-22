@@ -34,6 +34,12 @@ type Module interface {
 	Recv() <-chan []byte
 	Err() error
 	AddPeer(ctx context.Context, p Peer) error
+	// RemovePeer removes a device added with AddPeer.
+	RemovePeer(ctx context.Context, addr [3]byte) error
+	// HostKeyExchange reports whether AES key exchange messages must be
+	// encrypted by the host (bidcosaes.KeyExchangePayloads) rather than
+	// by the module (bidcosaes.KeyExchangeTemplates).
+	HostKeyExchange() bool
 	SetTime(ctx context.Context, t time.Time) error
 	Close() error
 	FirmwareVersion() string

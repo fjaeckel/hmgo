@@ -132,6 +132,24 @@ var (
 		Namespace: "hmbridge", Name: "command_queue_length",
 		Help: "Radio jobs waiting to be executed.",
 	})
+
+	metricPairing = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "hmbridge", Subsystem: "pairing", Name: "attempts_total",
+		Help: "Pairing attempts by result: paired, paired_with_warnings (key exchange or AES_ACTIVE failed), already_known, " +
+			"unsupported_model, other_central, address_conflict, invalid, failed, timeout (pairing mode ended without a device), disabled.",
+	}, []string{"result"})
+	metricUnpair = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "hmbridge", Subsystem: "pairing", Name: "unpair_total",
+		Help: "Unpairings by result: unpaired (device confirmed), waiting (waiting for the config button), unconfirmed, rejected (not a paired device).",
+	}, []string{"result"})
+	metricPairingActive = prometheus.NewGauge(prometheus.GaugeOpts{
+		Namespace: "hmbridge", Subsystem: "pairing", Name: "active",
+		Help: "1 while pairing mode is on.",
+	})
+	metricPairedDevices = prometheus.NewGauge(prometheus.GaugeOpts{
+		Namespace: "hmbridge", Subsystem: "pairing", Name: "paired_devices",
+		Help: "Devices paired with hmbridge (in the devices file).",
+	})
 )
 
 func init() {
@@ -144,7 +162,14 @@ func init() {
 		metricAvailable, metricUnauthenticated, metricClockSynced, metricTimeRequestsSkipped,
 		metricFrames, metricUnknownSenders, metricCommands, metricQueueLength,
 		metricLevel, metricLEDColor, metricButtonPresses, metricStatusPolls,
+		metricPairing, metricUnpair, metricPairingActive, metricPairedDevices,
 	)
+	for _, r := range []string{"paired", "paired_with_warnings", "already_known", "unsupported_model", "other_central", "address_conflict", "invalid", "failed", "timeout"} {
+		metricPairing.WithLabelValues(r)
+	}
+	for _, r := range []string{"unpaired", "waiting", "unconfirmed", "rejected"} {
+		metricUnpair.WithLabelValues(r)
+	}
 }
 
 // updateMetrics exports the device state. Caller holds b.mu.

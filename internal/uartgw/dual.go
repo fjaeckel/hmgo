@@ -136,6 +136,7 @@ const (
 	bidcosCmdDeviceInfo  = 0x00
 	bidcosCmdAck         = 0x02 // payload 0x00 ACK, 0x01 ACK_STATUS, 0x04 AES challenge, 0x80 NACK
 	bidcosCmdAESResponse = 0x03
+	bidcosCmdKeyExchange = 0x04
 	bidcosCmdTime        = 0x3f
 
 	bidcosAckChallenge = 0x04
@@ -631,9 +632,18 @@ func (c *DualConn) fail(err error) {
 }
 
 func (c *DualConn) logFrame(dir string, f frame) {
-	if c.debug {
-		log.Printf("uartgw: %s %v", dir, f)
+	if !c.debug {
+		return
 	}
+	// An AES key exchange (BidCoS cmd 0x04) carries the new key,
+	// encrypted with the device's old key, usually the publicly known
+	// eQ-3 default key: never log it. LLMAC_SEND payload (after the
+	// command byte): opts(3) cnt flags cmd src dst …
+	if f.dst == dstLLMAC && f.cmd == llmacSend && len(f.payload) >= 3+minMsgLen && f.payload[3+2] == bidcosCmdKeyExchange {
+		log.Printf("uartgw: %s dst=%s cnt=%d cmd=%02x payload=%x<AES key exchange redacted>", dir, dstName(f.dst), f.cnt, f.cmd, f.payload[:3+minMsgLen])
+		return
+	}
+	log.Printf("uartgw: %s %v", dir, f)
 }
 
 // ---- module clock and scheduling ----
@@ -1786,6 +1796,22 @@ func (c *DualConn) AddPeer(ctx context.Context, p Peer) error {
 	}
 	return nil
 }
+
+// RemovePeer forgets a peer (no more software ACKs or AES for it).
+func (c *DualConn) RemovePeer(ctx context.Context, addr [3]byte) error {
+	if err := c.Err(); err != nil {
+		return err
+	}
+	c.mu.Lock()
+	delete(c.peers, addr)
+	c.mu.Unlock()
+	return nil
+}
+
+// HostKeyExchange reports whether the host must encrypt AES key
+// exchange messages itself (bidcosaes.KeyExchangePayloads): true with
+// software AES, because the module does no AES at all.
+func (c *DualConn) HostKeyExchange() bool { return c.softAES }
 
 // SetTime does nothing: the dual-coprocessor firmware has no clock to
 // set (the host answers the devices' time requests, capture lines

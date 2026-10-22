@@ -34,6 +34,8 @@ const (
 	jobLevel  // switch / dimmer level
 	jobLED    // HM-OU-LED16 LED color
 	jobStatus // status request to an actuator (never retried)
+	jobPair   // configure a device that announced itself in pairing mode
+	jobUnpair // unpair a device (radio part; it is removed already)
 )
 
 type climateAction string
@@ -72,6 +74,9 @@ type job struct {
 	ramp  float64 // jobLevel: ramp time in seconds (dimmer)
 	led   int     // jobLED: 1 … 16
 	color string  // jobLED
+
+	pair   *pairJob   // jobPair
+	unpair *unpairJob // jobUnpair
 }
 
 type jobResult struct {
@@ -224,6 +229,12 @@ func (b *Bridge) execute(ctx context.Context, j job) (any, error) {
 	case jobLevel, jobLED, jobStatus:
 		return b.executeActuator(ctx, j)
 
+	case jobPair:
+		return b.executePair(ctx, j.pair)
+
+	case jobUnpair:
+		return nil, b.executeUnpair(ctx, j.unpair)
+
 	case jobClimate:
 		switch dev := j.dev.dev.(type) {
 		case *heating.Thermostat:
@@ -279,6 +290,15 @@ func (b *Bridge) handleCommand(cmd ha.Command) {
 	switch cmd.Kind {
 	case ha.SetSwitch, ha.SetLight, ha.SetLED:
 		b.handleActuatorCommand(cmd)
+		return
+	case ha.StartPairing:
+		b.startPairing(cmd.Duration)
+		return
+	case ha.Unpair:
+		b.unpairDevice(cmd.Addr)
+		return
+	case ha.Rename:
+		b.renameDevice(cmd.Addr, cmd.Name)
 		return
 	}
 	var targets []*device
@@ -404,6 +424,24 @@ func comfortTarget(d *device) float64 {
 // handleResult applies the outcome of a job. Runs on the event loop.
 func (b *Bridge) handleResult(res jobResult) {
 	j := res.job
+	switch j.kind {
+	case jobPair:
+		b.handlePairResult(j.pair, res.ev, res.err)
+		return
+	case jobUnpair:
+		b.handleUnpairResult(j.unpair, res.err)
+		return
+	}
+	if j.dev != nil && j.dev.removed {
+		// Unpaired or renamed while the job ran: apply the result to
+		// the device now registered at the address, if any.
+		cur := b.byAddr[j.dev.cfg.Addr()]
+		if cur == nil {
+			return
+		}
+		j.dev = cur
+		res.job = j
+	}
 	switch j.kind {
 	case jobSetTime:
 		if res.err != nil {

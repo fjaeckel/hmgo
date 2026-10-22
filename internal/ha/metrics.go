@@ -34,7 +34,7 @@ var (
 	})
 	metricCommands = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: "hmbridge", Subsystem: "mqtt", Name: "commands_received_total",
-		Help: "Valid commands received from Home Assistant, by kind (temperature, mode, preset, switch, light, led).",
+		Help: "Valid commands received from Home Assistant, by kind (temperature, mode, preset, switch, light, led, pair, unpair, name).",
 	}, []string{"kind"})
 	metricInvalidCommands = prometheus.NewCounter(prometheus.CounterOpts{
 		Namespace: "hmbridge", Subsystem: "mqtt", Name: "invalid_commands_total",
@@ -60,7 +60,7 @@ func init() {
 	for _, k := range []string{"discovery", "state", "availability", "event", "other"} {
 		metricPublished.WithLabelValues(k)
 	}
-	for _, k := range []string{"temperature", "mode", "preset", "switch", "light", "led"} {
+	for _, k := range []string{"temperature", "mode", "preset", "switch", "light", "led", "pair", "unpair", "name"} {
 		metricCommands.WithLabelValues(k)
 	}
 }
@@ -94,6 +94,12 @@ func (k CommandKind) metricLabel() string {
 		return "light"
 	case SetLED:
 		return "led"
+	case StartPairing:
+		return "pair"
+	case Unpair:
+		return "unpair"
+	case Rename:
+		return "name"
 	}
 	return "unknown"
 }

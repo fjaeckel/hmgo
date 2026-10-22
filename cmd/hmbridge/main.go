@@ -74,6 +74,9 @@ func main() {
 	}
 	if *checkConfig {
 		fmt.Printf("%s: OK (%d devices, %d groups)\n", *configPath, len(cfg.Devices), len(cfg.Groups))
+		if p := cfg.DevicesFilePath(); p != "" {
+			fmt.Printf("paired devices are read from %s (pairing AES: %s)\n", p, cfg.PairingAES())
+		}
 		return
 	}
 	log.Printf("hmbridge %s (%s) starting, %d devices, %d groups", version(), runtime.Version(), len(cfg.Devices), len(cfg.Groups))
@@ -114,7 +117,7 @@ func run(ctx context.Context, cfg *config.Config, uart io.ReadWriteCloser) error
 		log.Printf("RPI-RF-MOD support is experimental: acknowledgements and AES are done in software, and parts of the module protocol are still unverified (see docs/SNIFFING.md)")
 	}
 
-	opts := bridge.Options{Config: cfg, Radio: conn, Debugf: debugf, HMIP: hmipMon}
+	opts := bridge.Options{Config: cfg, Radio: conn, Debugf: debugf, HMIP: hmipMon, Version: version()}
 	if testBridgeOptions != nil {
 		testBridgeOptions(&opts)
 	}

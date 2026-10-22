@@ -1386,6 +1386,27 @@ func (c *Conn) AddPeer(ctx context.Context, p Peer) error {
 	return nil
 }
 
+// RemovePeer removes a device from the module's peer table (App 0x07
+// addr(3); c.f. HMUARTLGW_UpdatePeerReq in FHEM, operation “-”), e.g.
+// after unpairing it. The module then no longer acknowledges its
+// messages or does AES for it.
+func (c *Conn) RemovePeer(ctx context.Context, addr [3]byte) error {
+	if err := c.acquire(ctx); err != nil {
+		return err
+	}
+	defer c.release()
+	if _, err := c.simple(ctx, dstApp, appRemovePeer, addr[:]); err != nil {
+		return fmt.Errorf("uartgw: removing peer %X: %w", addr, err)
+	}
+	return nil
+}
+
+// HostKeyExchange reports whether the host must encrypt AES key
+// exchange messages itself: false, the HM-MOD-RPI-PCB is given the
+// 2-byte templates (bidcosaes.KeyExchangeTemplates) and fills in its
+// current key.
+func (c *Conn) HostKeyExchange() bool { return false }
+
 // Send implements bidcos.Transport: it transmits encoded (as produced
 // by bidcos.Packet.Encode) via AppSend and waits for the module’s ack.
 //

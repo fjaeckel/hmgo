@@ -21,6 +21,13 @@ heating groups.
 * **No re-pairing.** hmbridge uses your CCU's radio address and AES key, so the
   devices keep talking to "their" central. Direct links between devices (wall
   thermostat ↔ valves, window contact → valve) are left untouched.
+* **Pairing new devices** without a CCU: press "Pair new device" in Home
+  Assistant (or on the status page), then the device's config button.
+  hmbridge configures it like a CCU (central address, AES key exchange to your
+  system key, AES on contacts and buttons), keeps it in a small devices file
+  and shows it in Home Assistant at once. Devices paired with hmbridge can be
+  unpaired from Home Assistant. See
+  [docs/DEPLOY.md](docs/DEPLOY.md#5-adding-devices).
 * **AES** message authentication, handled by the radio module. Messages that
   fail authentication are dropped.
 * **Home Assistant:** each thermostat appears as a climate entity (auto, heat,
@@ -152,6 +159,9 @@ once the MQTT integration is set up. Topics, with base topic `hmbridge`:
 | `hmbridge/<address>/set/light` | `{"state": "on", "brightness": 128, "transition": 2}` (dimmer) |
 | `hmbridge/<address>/set/led_<n>` | `off`, `red`, `green`, `orange` (LED display, n = 1 … 16) |
 | `hmbridge/<address>/event/button_<n>` | `{"event_type": "press_short", "button": 1}`, not retained (remotes) |
+| `hmbridge/bridge/set/pair` | `PRESS` (or seconds, 10 … 600): start pairing mode |
+| `hmbridge/bridge/pairing` | JSON pairing state: `status`, `active`, `remaining`, `last_result` |
+| `hmbridge/<address>/set/unpair`, `…/set/name` | unpair / rename a device paired with hmbridge |
 | `hmbridge/group/<name>/…` | the same for heating groups |
 
 HomeMatic modes map to Home Assistant like this:
@@ -176,6 +186,7 @@ Everything is under `/metrics` on the status port (default `:8013`):
 | `hmbridge_uartgw_*` | Radio module: frames, acks by status, retries, send errors, request latency, duty cycle, firmware info. |
 | `hmbridge_mqtt_*` | MQTT: connection state, publishes, commands, Home Assistant restarts. |
 | `hmbridge_commands_total`, `hmbridge_command_queue_length` | Commands from Home Assistant. |
+| `hmbridge_pairing_*` | Pairing: attempts by result, unpairings, pairing mode active, number of paired devices. |
 | `hmheating_*`, `hmthermal_*`, `hmcontact_*` | Raw decoded device events, kept compatible with hmgo. |
 
 Example alerting rules are in
@@ -183,8 +194,12 @@ Example alerting rules are in
 
 ## Limitations
 
-* No pairing of new devices and no editing of week programs, device
-  settings or direct links yet. Use the CCU for that, then switch back.
+* No editing of week programs, device settings or direct links (peerings)
+  yet. Use the CCU for that, then switch back. Pairing with hmbridge sets up
+  the device for hmbridge only, without direct links between devices.
+* Pairing follows FHEM's and Homegear's description of the CCU's pairing; the
+  AES key exchange is verified against FHEM's code but not yet against a real
+  device or an OpenCCU capture (see [docs/DESIGN.md](docs/DESIGN.md#pairing)).
 * Of the dimmer plug only the physical channel 1 is exposed (2 and 3 are
   virtual channels).
 * Homematic IP is not supported yet. On the RPI-RF-MOD, hmbridge only lists

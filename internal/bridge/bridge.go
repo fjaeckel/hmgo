@@ -26,6 +26,7 @@ import (
 
 	"github.com/fjaeckel/hmgo/internal/bidcos"
 	"github.com/fjaeckel/hmgo/internal/config"
+	"github.com/fjaeckel/hmgo/internal/devstore"
 	"github.com/fjaeckel/hmgo/internal/ha"
 	"github.com/fjaeckel/hmgo/internal/hm"
 	"github.com/fjaeckel/hmgo/internal/hm/devices"
@@ -86,6 +87,15 @@ type Options struct {
 	// HMIP, if set, lists the Homematic IP devices the radio module
 	// heard on the status page.
 	HMIP *HMIPMonitor
+	// PairingDuration overrides the configured pairing mode duration
+	// (for tests). Zero means the configuration.
+	PairingDuration time.Duration
+	// PairingTick is how often pairing mode checks its timeout. Zero
+	// means 1s.
+	PairingTick time.Duration
+	// Version is shown as hmbridge's software version in Home
+	// Assistant.
+	Version string
 }
 
 // Bridge is the hmbridge core. Create it with New, then call Setup once
@@ -104,6 +114,9 @@ type Bridge struct {
 	clockSync    func() bool
 	housekeep    time.Duration
 	stateFile    string
+	devicesFile  string // "" = pairing disabled
+	pairTick     time.Duration
+	version      string
 
 	// Event-loop-only state (not guarded by mu).
 	clockWasSynced bool // result of the last clock sync check
@@ -135,6 +148,8 @@ type Bridge struct {
 	// allStaleSent: the first PublishAll removed the entities of all
 	// other kinds (AllStaleDiscoveryMessages); later ones are scoped.
 	allStaleSent bool
+	// pair is the pairing mode state (see pairing.go).
+	pair pairingMode
 }
 
 type device struct {
@@ -166,6 +181,13 @@ type device struct {
 	// lastOnLevel is the last level (percent) > 0 of a dimmer, used when
 	// Home Assistant switches it on without a brightness.
 	lastOnLevel float64
+	// stored is the devices file record of a device paired with
+	// hmbridge (nil for devices of the configuration file).
+	stored *devstore.Device
+	// removed is set (on the event loop) once the device was unpaired
+	// or replaced (renamed); results of its pending jobs then go to the
+	// device now registered at its address, if any.
+	removed bool
 }
 
 type group struct {
@@ -216,6 +238,9 @@ func New(opts Options) (*Bridge, error) {
 		clockSync:    opts.ClockSynced,
 		housekeep:    opts.HousekeepingInterval,
 		stateFile:    opts.Config.StateFilePath(),
+		devicesFile:  opts.Config.DevicesFilePath(),
+		pairTick:     opts.PairingTick,
+		version:      opts.Version,
 		saveInterval: opts.Config.StateSaveInterval(),
 		saveReq:      make(chan struct{}, 1),
 		byAddr:       make(map[[3]byte]*device),
@@ -259,36 +284,24 @@ func New(opts Options) (*Bridge, error) {
 	} else if b.retries < 0 {
 		b.retries = 0
 	}
+	if b.pairTick <= 0 {
+		b.pairTick = time.Second
+	}
 	b.bcs = bidcos.NewSender(opts.Radio, opts.Config.CentralAddr())
+	b.pair.init(opts.Config, opts.PairingDuration, b.devicesFile != "")
 
 	for i := range b.cfg.Devices {
-		dc := &b.cfg.Devices[i]
-		sd := hm.NewStandardDevice(b.bcs, dc.Addr(), dc.Name)
-		kind, ok := ha.KindForModel(dc.Model)
-		if !ok {
-			return nil, fmt.Errorf("bridge: model %q of %s not supported by the Home Assistant layer", dc.Model, dc.Name)
-		}
-		dev, err := devices.New(sd, dc.Model)
+		d, err := b.newDevice(&b.cfg.Devices[i], nil)
 		if err != nil {
-			return nil, fmt.Errorf("bridge: %s: %v", dc.Name, err)
-		}
-		d := &device{
-			cfg: dc,
-			dev: dev,
-			desc: ha.DeviceDesc{
-				Addr:   dc.AddrHex(),
-				Name:   dc.Name,
-				Model:  dc.Model,
-				Serial: dc.Serial,
-				Kind:   kind,
-			},
-			available: true,
-		}
-		if kind == ha.Remote {
-			d.tracker = &remote.Tracker{}
+			return nil, err
 		}
 		b.devices = append(b.devices, d)
-		b.byAddr[dc.Addr()] = d
+		b.byAddr[d.cfg.Addr()] = d
+	}
+	if b.devicesFile != "" {
+		if err := b.loadStore(); err != nil {
+			b.logf("devices file: %v", err)
+		}
 	}
 
 	for _, rg := range b.cfg.ResolvedGroups() {
@@ -324,20 +337,58 @@ func New(opts Options) (*Bridge, error) {
 	return b, nil
 }
 
+// newDevice builds the registry entry for dc. stored is the devices
+// file record of a device paired with hmbridge (nil otherwise).
+func (b *Bridge) newDevice(dc *config.Device, stored *devstore.Device) (*device, error) {
+	sd := hm.NewStandardDevice(b.bcs, dc.Addr(), dc.Name)
+	kind, ok := ha.KindForModel(dc.Model)
+	if !ok {
+		return nil, fmt.Errorf("bridge: model %q of %s not supported by the Home Assistant layer", dc.Model, dc.Name)
+	}
+	dev, err := devices.New(sd, dc.Model)
+	if err != nil {
+		return nil, fmt.Errorf("bridge: %s: %v", dc.Name, err)
+	}
+	d := &device{
+		cfg: dc,
+		dev: dev,
+		desc: ha.DeviceDesc{
+			Addr:   dc.AddrHex(),
+			Name:   dc.Name,
+			Model:  dc.Model,
+			Serial: dc.Serial,
+			Kind:   kind,
+			Paired: stored != nil,
+		},
+		available: true,
+		stored:    stored,
+	}
+	if kind == ha.Remote {
+		d.tracker = &remote.Tracker{}
+	}
+	return d, nil
+}
+
+// peerOf returns the radio module peer entry of a device.
+func peerOf(dc *config.Device) uartgw.Peer {
+	p := uartgw.Peer{
+		Addr: dc.Addr(),
+		// config counts the highest channel number; the module
+		// wants the number of channels including channel 0.
+		Channels: dc.Channels() + 1,
+		KeyIndex: dc.KeyIndex(),
+	}
+	if dc.AESEnabled() {
+		p.AESChannels = dc.AESChannelList()
+	}
+	return p
+}
+
 // Setup registers all configured devices as peers of the radio module,
 // so that it acknowledges their messages and handles AES for them.
 func (b *Bridge) Setup(ctx context.Context) error {
 	for _, d := range b.devices {
-		p := uartgw.Peer{
-			Addr: d.cfg.Addr(),
-			// config counts the highest channel number; the module
-			// wants the number of channels including channel 0.
-			Channels: d.cfg.Channels() + 1,
-		}
-		p.KeyIndex = d.cfg.KeyIndex()
-		if d.cfg.AESEnabled() {
-			p.AESChannels = d.cfg.AESChannelList()
-		}
+		p := peerOf(d.cfg)
 		if err := b.radio.AddPeer(ctx, p); err != nil {
 			return fmt.Errorf("adding peer %s (%s): %w", d.cfg.Name, d.desc.Addr, err)
 		}
@@ -388,9 +439,14 @@ func (b *Bridge) PublishAll() {
 		// entities (button events/triggers, LED selects included).
 		stale, b.allStaleSent = ha.AllStaleDiscoveryMessages, true
 	}
+	msgs = append(msgs, ha.BridgeDiscoveryMessages(topics, b.version, b.pair.enabled)...)
+	msgs = append(msgs, ha.PairingStateMessage(topics, b.pairingStateLocked(b.now())))
 	for _, d := range b.devices {
 		msgs = append(msgs, ha.DiscoveryMessages(topics, d.desc)...)
 		msgs = append(msgs, stale(topics, d.desc)...)
+		if d.stored != nil {
+			msgs = append(msgs, ha.NameMessage(topics, d.desc.Addr, d.cfg.Name))
+		}
 		// Never overwrite the retained state with an empty one (e.g.
 		// right after a restart without a state file).
 		if !d.state.LastSeen.IsZero() {
@@ -423,9 +479,10 @@ func (b *Bridge) Run(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	var wg sync.WaitGroup
 	wg.Add(4)
+	initialPolls := b.actuators() // b.devices is only read on the event loop (or under b.mu)
 	go func() {
 		defer wg.Done()
-		b.initialStatusPolls(ctx)
+		b.initialStatusPolls(ctx, initialPolls)
 	}()
 	go func() {
 		defer wg.Done()
@@ -465,17 +522,19 @@ func (b *Bridge) Run(ctx context.Context) error {
 	defer timeSync.Stop()
 	housekeeping := time.NewTicker(b.housekeep)
 	defer housekeeping.Stop()
-	var pollC, releaseC <-chan time.Time
-	if p := b.cfg.StatusPollInterval(); p > 0 && len(b.actuators()) > 0 {
+	// Devices may be paired at runtime, so the status polls and the
+	// long press check run even if no such device exists yet.
+	var pollC <-chan time.Time
+	if p := b.cfg.StatusPollInterval(); p > 0 {
 		poll := time.NewTicker(p)
 		defer poll.Stop()
 		pollC = poll.C
 	}
-	if b.hasRemotes() {
-		rel := time.NewTicker(b.releaseCheck)
-		defer rel.Stop()
-		releaseC = rel.C
-	}
+	rel := time.NewTicker(b.releaseCheck)
+	defer rel.Stop()
+	releaseC := rel.C
+	pairTick := time.NewTicker(b.pairTick)
+	defer pairTick.Stop()
 	b.lastSave = b.now()
 	b.checkClock()
 	// Set the module's clock now if possible: Open skips it while the
@@ -521,6 +580,9 @@ func (b *Bridge) Run(ctx context.Context) error {
 
 		case <-releaseC:
 			b.expireLongPresses()
+
+		case <-pairTick.C:
+			b.pairingTick()
 		}
 	}
 }
@@ -581,6 +643,11 @@ func (b *Bridge) handleFrame(frame []byte) {
 	central := b.cfg.CentralAddr()
 
 	d, ok := b.byAddr[pkt.Source]
+	if pkt.Cmd == bidcos.DeviceInfo {
+		// A device's config button was pressed: pairing (or the
+		// confirmation of an unpairing) may be waiting for it.
+		b.handleDeviceInfo(pkt, d)
+	}
 	if !ok {
 		metricFrames.WithLabelValues("unknown").Inc()
 		b.recordUnknown(pkt)
@@ -735,6 +802,9 @@ func (b *Bridge) recordUnknown(pkt *bidcos.Packet) {
 func (b *Bridge) publishDevice(d *device) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if d.removed {
+		return // unpaired: its retained topics were cleared
+	}
 	if g := d.group; g != nil {
 		g.state = groupState(g)
 	}
@@ -848,6 +918,7 @@ func (o *outbox) take() []ha.Message {
 // and the JSON API.
 type Snapshot struct {
 	Started time.Time         `json:"started"`
+	Pairing PairingSnapshot   `json:"pairing"`
 	Devices []DeviceSnapshot  `json:"devices"`
 	Groups  []GroupSnapshot   `json:"groups"`
 	Unknown []UnknownSender   `json:"unknown_senders"`
@@ -857,12 +928,14 @@ type Snapshot struct {
 }
 
 type DeviceSnapshot struct {
-	Name      string `json:"name"`
-	Model     string `json:"model"`
-	Address   string `json:"address"`
-	Serial    string `json:"serial,omitempty"`
-	Group     string `json:"group,omitempty"`
-	AES       bool   `json:"aes"`
+	Name    string `json:"name"`
+	Model   string `json:"model"`
+	Address string `json:"address"`
+	Serial  string `json:"serial,omitempty"`
+	Group   string `json:"group,omitempty"`
+	AES     bool   `json:"aes"`
+	// Paired is set for devices paired with hmbridge (devices file).
+	Paired    bool   `json:"paired,omitempty"`
 	LastEvent string `json:"last_event,omitempty"`
 	// Summary is a short rendering of a switch, dimmer, LED display or
 	// remote state for the status page.
@@ -881,7 +954,7 @@ type GroupSnapshot struct {
 func (b *Bridge) Snapshot() Snapshot {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	s := Snapshot{Started: b.started, Queue: b.queue.len()}
+	s := Snapshot{Started: b.started, Queue: b.queue.len(), Pairing: b.pairingSnapshotLocked(b.now())}
 	for _, d := range b.devices {
 		var st ha.State
 		st.Merge(d.state)
@@ -891,6 +964,7 @@ func (b *Bridge) Snapshot() Snapshot {
 			Address:   d.desc.Addr,
 			Serial:    d.cfg.Serial,
 			AES:       d.cfg.AESEnabled(),
+			Paired:    d.stored != nil,
 			LastEvent: d.lastEvent,
 			Summary:   summary(d.desc.Kind, &st, d.lastEvent),
 			State:     st,

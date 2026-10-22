@@ -13,6 +13,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	bidcosaes "github.com/fjaeckel/hmgo/internal/bidcos/aes"
+	"github.com/fjaeckel/hmgo/internal/hmkey"
 )
 
 // encodeFrame builds an escaped module frame.
@@ -434,5 +437,44 @@ func TestRunRestoresDumpBeforeSummary(t *testing.T) {
 	restore()
 	if b, _ := os.ReadFile(ctl); string(b) != "1" {
 		t.Errorf("second restore wrote %q", b)
+	}
+}
+
+// Pairing as a CCU does it (layouts from internal/hm/pairing): the
+// device's DEVICE_INFO, the configuration of list 0 and list 1, and the
+// AES key exchange, whose key bytes are never shown.
+func TestDescribePairing(t *testing.T) {
+	d := testDecoder()
+	d.RedactAES = false
+	dev := [3]byte{0x4C, 0x5D, 0x70}
+	info := append([]byte{0x14, 0x00, 0xC7}, []byte("NEQ0000002")...)
+	info = append(info, 0x80, 0x01, 0x01, 0x00)
+	newKey := hmkey.FromPassphrase("geheim", 2)
+	enc, err := bidcosaes.KeyExchangePayloads(hmkey.EQ3Default.Bytes, newKey, bytes.NewReader(make([]byte, 4)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		msg  []byte
+		want string
+	}{
+		{msgBytes(0x01, 0x84, 0x00, dev, [3]byte{}, info...), "| DEVICE_INFO fw 1.4 model 00C7 (HM-Sec-SCo) serial NEQ0000002 class 80 peer channels/info 010100, broadcast (not paired)"},
+		{msgBytes(0x02, 0xA0, 0x01, central, dev, 0x00, 0x05, 0, 0, 0, 0, 0x00), "| CONFIG_START ch 0 peer 000000:0 list 0"},
+		{msgBytes(0x03, 0xA0, 0x01, central, dev, 0x00, 0x08, 0x02, 0x01, 0x0A, central[0], 0x0B, central[1], 0x0C, central[2]),
+			fmt.Sprintf("| CONFIG_WRITE_INDEX ch 0 list 0 02=01 0A=%02X 0B=%02X 0C=%02X (central %X, reg 02 paired=1 internal_keys_visible=0)", central[0], central[1], central[2], central[:])},
+		{msgBytes(0x04, 0xA0, 0x01, central, dev, 0x00, 0x06), "| CONFIG_END ch 0"},
+		{msgBytes(0x05, 0xA0, 0x04, central, dev, enc[1][:]...), "AES_KEY_EXCHANGE " + d.name(central) + " → " + d.name(dev) + " <16 bytes redacted> | AES key exchange (encrypted with the eQ-3 default key): new key index 2, part 2 of 2"},
+		{msgBytes(0x05, 0xA0, 0x04, central, dev, 0x01, 0x00), "| AES key exchange template (module fills in its key): old key index 0, part 1 of 2"},
+		{msgBytes(0x06, 0xA0, 0x01, central, dev, 0x01, 0x05, 0, 0, 0, 0, 0x01), "| CONFIG_START ch 1 peer 000000:0 list 1"},
+		{msgBytes(0x07, 0xA0, 0x01, central, dev, 0x01, 0x08, 0x08, 0x01), "| CONFIG_WRITE_INDEX ch 1 list 1 08=01 (AES_ACTIVE=1)"},
+		{msgBytes(0x08, 0xB0, 0x01, central, dev, 0x00, 0x08, 0x02, 0x00, 0x0A, 0, 0x0B, 0, 0x0C, 0), "(central 000000 = unpair, reg 02 paired=0 internal_keys_visible=0)"},
+	} {
+		got := d.describeMsg("TX", tc.msg, 0)
+		if !strings.HasSuffix(got, tc.want) {
+			t.Errorf("got %q\nwant suffix %q", got, tc.want)
+		}
+		if strings.Contains(got, hex.EncodeToString(newKey.Bytes[:4])) || strings.Contains(got, hex.EncodeToString(enc[1][:4])) {
+			t.Errorf("key material in %q", got)
+		}
 	}
 }

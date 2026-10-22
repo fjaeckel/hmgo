@@ -43,6 +43,11 @@ type entity struct {
 	// which it returns true (so that a thermostat does not get removal
 	// messages for 16 LEDs and 32 button triggers on every connect).
 	staleScope func(DeviceDesc) bool
+	// stateSuffix, if set, makes the entity read <base>/<addr>/<suffix>
+	// instead of the state topic.
+	stateSuffix string
+	// noState: the entity has no state topic (buttons).
+	noState bool
 }
 
 func kinds(ks ...Kind) func(DeviceDesc) bool {
@@ -190,9 +195,36 @@ func entities() []entity {
 			"value_template": numTemplate("messages_received"),
 		})},
 	}
+	list = append(list, pairedEntities()...)
 	list = append(list, actuatorEntities()...)
 	list = append(list, buttonEntities()...)
 	return append(list, ledEntities()...)
+}
+
+// pairedEntities: for devices paired with hmbridge, an “Unpair” button
+// (diagnostic, disabled by default, so that it is not pressed by
+// accident) and a “Name” text entity to rename the device.
+func pairedEntities() []entity {
+	paired := func(d DeviceDesc) bool { return d.Paired }
+	return []entity{
+		{component: "button", key: "unpair", match: paired, command: "unpair", noState: true, config: map[string]any{
+			"name":               "Unpair",
+			"icon":               "mdi:link-variant-remove",
+			"entity_category":    "diagnostic",
+			"enabled_by_default": false,
+			"payload_press":      "PRESS",
+			"qos":                1,
+		}},
+		{component: "text", key: "name", match: paired, command: "name", stateSuffix: NameTopicSuffix, config: map[string]any{
+			"name":            "Name",
+			"icon":            "mdi:rename-outline",
+			"entity_category": "config",
+			"min":             1,
+			"max":             MaxNameLength,
+			"mode":            "text",
+			"qos":             1,
+		}},
+	}
 }
 
 // actuatorEntities: the switch plug's switch and the dimmer's light.
@@ -299,6 +331,8 @@ type node struct {
 	deviceAvail string
 	// eventTopic returns a button's event topic (nil for groups).
 	eventTopic func(button int) string
+	// topic returns <base>/<addr>/<suffix> (nil for groups).
+	topic func(suffix string) string
 }
 
 func deviceNode(cfg TopicConfig, d DeviceDesc) node {
@@ -326,6 +360,7 @@ func deviceNode(cfg TopicConfig, d DeviceDesc) node {
 		humidity:    d.Kind == WallThermostat,
 		deviceAvail: cfg.DeviceAvailabilityTopic(addr),
 		eventTopic:  func(button int) string { return cfg.EventTopic(addr, button) },
+		topic:       func(suffix string) string { return cfg.base() + "/" + addr + "/" + suffix },
 	}
 }
 
@@ -361,7 +396,7 @@ func entityTopic(cfg TopicConfig, component, id, key string) string {
 
 // bridgeAvailabilityOnly lists entities that stay available while their
 // device is silent, so that one can still see when it was last heard.
-var bridgeAvailabilityOnly = map[string]bool{"last_seen": true, "auth_status": true}
+var bridgeAvailabilityOnly = map[string]bool{"last_seen": true, "auth_status": true, "unpair": true, "name": true}
 
 // common sets keys shared by all entities of a node. key is the entity
 // key ("" for the climate entity).
@@ -446,9 +481,13 @@ func entityMessage(cfg TopicConfig, n node, e entity) Message {
 		m["device"] = n.device
 		return retained(topic, mustJSON(m))
 	}
-	if e.button > 0 {
+	switch {
+	case e.noState:
+	case e.button > 0:
 		m["state_topic"] = n.eventTopic(e.button)
-	} else {
+	case e.stateSuffix != "" && n.topic != nil:
+		m["state_topic"] = n.topic(e.stateSuffix)
+	default:
 		m["state_topic"] = n.stateTopic
 	}
 	if e.command != "" {
@@ -485,7 +524,8 @@ func RemovalMessages(cfg TopicConfig, addr string) []Message {
 	for _, e := range entities() {
 		msgs = append(msgs, retained(entityTopic(cfg, e.component, id, e.key), nil))
 	}
-	return append(msgs, retained(cfg.StateTopic(addr), nil), retained(cfg.DeviceAvailabilityTopic(addr), nil))
+	return append(msgs, retained(cfg.StateTopic(addr), nil), retained(cfg.DeviceAvailabilityTopic(addr), nil),
+		retained(cfg.NameTopic(addr), nil))
 }
 
 // StaleDiscoveryMessages returns removal messages for the entities that

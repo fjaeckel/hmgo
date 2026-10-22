@@ -48,6 +48,17 @@
   "state_save_interval": "15m",
   "status_poll_interval": "1h",
 
+  "devices_file": "/var/lib/hmbridge/devices.json",
+  "pairing": {
+    "_comment": [
+      "Pairing new devices from Home Assistant (button \"Pair new device\" on the hmbridge device) or the status page. Paired devices are kept in devices_file (\"\" disables pairing), which is only written on pair, unpair and rename; on a conflict, devices below win.",
+      "aes: \"system_key\" (default when security is set) gives AES-capable devices the security key and enables AES where a CCU does (contacts, push buttons, remotes); \"off\" leaves them on the eQ-3 default key without AES.",
+      "duration: how long pairing mode stays on (10s … 10m)."
+    ],
+    "aes": "system_key",
+    "duration": "60s"
+  },
+
   "devices": [
     {
       "_comment": "Radiator thermostat. aes without aes_channels enforces AES on all channels 1..6.",

@@ -214,6 +214,10 @@ device appears as a Home Assistant device as soon as hmbridge connects:
 All devices also have the diagnostic sensors last seen, RSSI and messages
 received (the last two disabled by default) and, except the weather sensors,
 AES authentication.
+Devices paired with hmbridge (section 5) additionally have a "Name" text
+entity and an "Unpair" button (disabled by default). hmbridge itself appears
+as the device "hmbridge" with the "Pair new device" button and the pairing
+sensors.
 
 Notes per device type:
 
@@ -256,6 +260,78 @@ colors), at most every 15 minutes
 cause a write. The status page on port 8013 lists configured devices and every
 radio address that talked to the central but is not configured — handy for
 finding device addresses.
+
+## 5. Adding devices
+
+hmbridge can pair (teach in) new classic HomeMatic devices itself, so OpenCCU
+is no longer needed for that. Supported are the models in the
+[README](../README.md#supported-devices).
+
+1. In Home Assistant, open the device **hmbridge** and press **Pair new
+   device** (or press the button on the status page, port 8013). Pairing mode
+   stays on for 60 seconds (`pairing.duration`); the sensors "Pairing mode",
+   "Pairing time remaining" and "Last pairing result" show what happens.
+2. Put the device into pairing mode: press its config button (usually a short
+   press; the LED blinks), as described in its manual. Battery devices stay
+   awake while their LED blinks.
+3. hmbridge recognises the model from the device's announcement (DEVICE_INFO),
+   writes your `central_address` into the device, and, with a `security` block,
+   gives it your system security key and switches AES on where a CCU would
+   (window contacts, push buttons, remotes). "Last pairing result" then says
+   e.g. `paired HM-Sec-SCo NEQ1234567 (4c5d70, …, AES on channels [1] with key
+   index 2)`, and the device appears in Home Assistant as "HM-Sec-SCo
+   NEQ1234567". Rename it there (HA's device name) or with its "Name" entity,
+   which also renames it in hmbridge's logs and metrics.
+
+Pairing mode ends after one device (one at a time) or when the time is up.
+Messages you may see as the last result:
+
+| result | meaning |
+|---|---|
+| `already known: …` | The device is in `config.json` or was paired before (e.g. taken over from OpenCCU, which uses the same address and key). hmbridge only wrote the central address again. |
+| `… has model ID XXXX, which hmbridge does not support` | Not a supported model. |
+| `… is paired to another central (…)` | The device belongs to another CCU. Factory-reset it (see its manual) or delete it in that CCU first. |
+| `pairing … failed: … NACK` | The device refused the configuration; factory-reset it and try again. |
+| `… AES key exchange failed …` | The device was paired but keeps the eQ-3 default key, without AES. Unpair it, factory-reset it and pair it again. |
+
+Paired devices are stored in `devices_file` (default
+`/var/lib/hmbridge/devices.json`), which hmbridge reads at startup together with
+`config.json`. It is written only when a device is paired, unpaired or renamed.
+If a device is in both files, `config.json` wins (logged at startup), and the
+entry disappears from the devices file the next time it is written. To manage a
+paired device in `config.json` instead (e.g. to put it into a heating group),
+copy name, model, address, serial, `aes_channels` and `key_index` from the
+devices file to `config.json`. On OpenCCU's Pi (section 3a), set
+`devices_file` to a writable path such as `/usr/local/hmbridge/devices.json`.
+`"devices_file": ""` disables pairing.
+
+`pairing.aes`: `"system_key"` (the default when `security` is configured) or
+`"off"` (devices stay on the eQ-3 default key without AES).
+
+**Removing a device.** Devices paired with hmbridge have a button **Unpair** in
+Home Assistant (in the diagnostic section, disabled by default so that it is
+not pressed by accident: enable it first). It removes the device from hmbridge
+and Home Assistant at once and tells the device to forget its central:
+switches, dimmers and the LED display immediately, thermostats with a wake-up
+burst. Window contacts, buttons, remotes and weather sensors only listen in
+config mode: press their config button within the pairing duration after
+Unpair. Devices from `config.json` cannot be unpaired from Home Assistant;
+remove them from `config.json`.
+
+**Before relying on it: check with a capture.** hmbridge's pairing follows
+the protocol as documented by FHEM and Homegear, but has not been compared with
+OpenCCU yet. Recording OpenCCU pairing one device lets you (and the hmbridge
+developers) check every step:
+
+1. Run `hmsniff` on OpenCCU (docs/SNIFFING.md) and pair one device in the
+   WebUI (Teach-in devices → HM devices → press the config button).
+2. Look for the lines `DEVICE_INFO …`, `CONFIG_START ch 0 … list 0`,
+   `CONFIG_WRITE_INDEX ch 0 list 0 02=01 0A=… (central …)`, `CONFIG_END`,
+   `AES_KEY_EXCHANGE … new key index N, part 1 of 2` and, for contacts,
+   `CONFIG_WRITE_INDEX ch 1 list 1 08=01 (AES_ACTIVE=1)`. hmsniff never shows
+   the key bytes of the key exchange, also not with `-no-redact`.
+3. Do the same with `hmbridge -debug` pairing a similar device, and compare.
+   Please report differences.
 
 ## Module firmware
 

@@ -26,9 +26,10 @@ github.com/fjaeckel/hmgo).
 * Testable without hardware: an emulated radio module (fakemod) and an
   end-to-end test against a local mosquitto.
 
-Non-goals for the prototype: pairing new devices, editing week programs,
-Homematic IP, the dual-coprocessor firmware, HM-MOD-RPI-PCB firmware
-updates.
+Non-goals for the prototype: editing week programs, Homematic IP,
+HM-MOD-RPI-PCB firmware updates. (Pairing new devices and the
+dual-coprocessor firmware were added later, see “Pairing” and
+“RPI-RF-MOD”.)
 
 ## Architecture
 
@@ -57,6 +58,8 @@ Package ownership (one owner per package while building in parallel):
 | `internal/config` | JSON config, defaults, validation |
 | `internal/hm/...` | device models: event decoders (existing) + command encoders |
 | `internal/hm/devices` | model name → device model, shared by hmbridge and hmsniff |
+| `internal/hm/pairing` | pairing protocol: model ID table, DEVICE_INFO, CONFIG_* encoders |
+| `internal/devstore` | the devices file (devices paired with hmbridge) |
 | `internal/ha` | HA discovery payloads, state/command topics, MQTT client |
 | `internal/bridge` | glue: registry, event loop, command handling, status page |
 | `cmd/hmbridge` | main: flags, serial setup, GPIO reset, signal handling |
@@ -83,7 +86,8 @@ Commands we use: OS 0x02 get firmware, 0x06 normal mode (leave update mode), 0x0
 serial, 0x0E set time (uint32 BE unix time + int8 UTC offset in 30 min);
 App 0x00 set HMID, 0x02 send, 0x03 set current key, 0x0F set previous
 key, 0x0B set temp key (key payload: 16 key bytes + 1 index byte; 17
-zero bytes clears a slot), 0x06 add peer (`addr(3) keyIndex wakeup 00`),
+zero bytes clears a slot), 0x06 add peer (`addr(3) keyIndex wakeup 00`), 0x07 remove peer
+(`addr(3)`, after unpairing),
 0x09 peer enable AES (`addr(3)` + list of channel numbers), 0x0A peer
 disable AES (same format).
 
@@ -334,6 +338,89 @@ challenges now follow the peer's AES channels where the channel is
 unambiguous (KEY_EVENT 0x40 and SENSOR_EVENT 0x41: low 6 bits of byte 0),
 like the radio modules' per-channel AES table; other messages of AES peers
 are challenged as before.
+
+## Pairing
+
+`internal/bridge/pairing.go` pairs and unpairs devices like a CCU; the
+protocol pieces are in `internal/hm/pairing` and
+`internal/bidcos/aes/keyexchange.go`. Sources: FHEM 10_CUL_HM.pm
+(DEVICE_INFO handling with hmPairForSec, CUL_HM_pushConfig, assignHmKey),
+HMConfig.pm (model IDs, register definitions), Homegear
+HomeMaticCentral.cpp (handlePairingRequest, unpair, reset), BidCoSPeer.cpp
+(key change queue), AesHandshake.cpp (generateKeyChangePacket),
+Hm-Mod-Rpi-Pcb.cpp, and eQ-3's device descriptions as shipped with Homegear
+(model IDs, AES defaults, receive modes). All GPL: read as references
+only, no code copied.
+
+**Flow.** Pairing mode (HA button `hmbridge/bridge/set/pair`, status page
+POST `/pairing/start` with a same-origin check, default 60 s) is state of
+the event loop. A DEVICE_INFO (cmd 0x00: `fw model(2) serial(10) class
+peer-channels…`) while it is on becomes a priority radio job, so it runs
+while the device is still in config mode:
+
+| step | messages (flags 0xA0 BIDI\|RPTEN, each ACKed `02 00`) |
+|---|---|
+| register | `AddPeer` (key index 0, no AES) |
+| central address | `01 00 05 000000 00 00` (CONFIG_START ch 0 list 0), `01 00 08 02 01 0A hh 0B mm 0C ll` (WRITE_INDEX; reg 02 = 0x81 for models with INTERNAL_KEYS_VISIBLE: switch, dimmer), `01 00 06` (CONFIG_END) |
+| key exchange (pairing.aes system_key, AES-capable model, key index > 0) | `04` × 2, see below; the device answers each with an AES challenge with its old key (index 0), which the radio layer answers |
+| AES_ACTIVE (channels with aes_default in eQ-3's descriptions: contacts ch 1, PB-2-WM55 ch 1-2, RC-8 ch 1-8) | per channel `01 ch 05 000000 00 01`, `01 ch 08 08 01`, `01 ch 06` |
+| register | `AddPeer` with the new key index and AES channels |
+
+No burst: a battery device in config mode listens. The result (device with
+name "<model> <serial>", AES channels, key index, firmware, model ID) is
+written to the devices file, the device joins the registry under `b.mu`,
+its discovery, name and availability are published, and actuators get a
+status request. Pairing mode then ends (one device at a time). A DEVICE_INFO
+from a known address (config.json or devices file, same model) only gets
+the central address sequence (“already known”: devices from OpenCCU share
+our address and key); one addressed to another central, an unsupported model
+ID, or a different model at a configured address are rejected.
+
+**Unpair** (HA button `set/unpair`, only devices from the devices file):
+the device is removed from registry, devices file, HA (empty retained
+discovery/state/name) and the module (`RemovePeer`), then gets the central
+address sequence with 000000 and reg 02 = 00 (Homegear `unpair`); always
+listening devices at once, wake-on-radio thermostats with burst (flags 0xB0),
+config-only devices (contacts, buttons, remotes, weather sensors) when their
+next DEVICE_INFO arrives within the pairing duration. Homegear's factory
+reset (`11 04 00`) is not used.
+
+**Devices file** (`internal/devstore`): JSON, written atomically (temp
+file, fsync, rename, directory fsync) only on pair/unpair/rename. Read in
+`bridge.New` after config.json's devices; an address or name conflict is
+resolved in favour of config.json and logged. Store devices may use key
+index 0 (`config.ResolveStoreDevice`). Renaming replaces the device entry
+(jobs of the old entry are applied to the new one by address).
+
+**AES key exchange** (`bidcosaes.KeyExchangePayloads`): two messages, cmd
+0x04, each `AES-ECB(old key, 01 idx·2+half key[8] rnd(2) 7E296FA5)`
+(FHEM assignHmKey, Homegear generateKeyChangePacket). The RPI-RF-MOD
+driver does AES in software, so hmbridge encrypts with the eQ-3 default key
+(`Module.HostKeyExchange`). The HM-MOD-RPI-PCB gets the 2-byte templates
+`01 <old idx·2>` / `01 <old idx·2+1>` and fills in its current key itself
+(FHEM non-CUL branch, Homegear Hm_Mod_Rpi_Pcb). Key exchange payloads are
+never logged (DualConn debug log, hmsniff).
+
+**Verified vs. assumed.**
+
+* Verified against FHEM's own code: the key exchange block layout and
+  encryption (testdata/fhem_keyexchange.txt, generated by running FHEM's
+  assignHmKey byte handling with Crypt::Rijndael; the AES handshake
+  vectors as before).
+* Consistent in FHEM and Homegear, not yet seen on the air from OpenCCU:
+  the CONFIG_START/WRITE_INDEX/END layout, registers 02/0A/0B/0C, the
+  unpair sequence, DEVICE_INFO layout, model IDs (also in eQ-3's
+  descriptions).
+* Assumed: AES_ACTIVE as list 1 register 0x08 bit 0 written to the device
+  (Homegear's descriptions and FHEM's `sign` register; eQ-3's own rftypes
+  mark AES_ACTIVE of the contacts as central-internal, so OpenCCU may not
+  write it at all); writing 0x01 to the whole register (FHEM keeps the other
+  bits, none are defined); that devices challenge the key exchange with
+  their old key; that the HM-MOD-RPI-PCB moves a device from index 0
+  directly to its current index > 1 (Homegear only allows old + 1); the
+  INTERNAL_KEYS_VISIBLE bit (Homegear sets it, FHEM writes 0x01). An hmsniff
+  capture of OpenCCU pairing a contact and a switch plug settles all of
+  these (docs/DEPLOY.md “Adding devices”).
 
 ## Running alongside OpenCCU
 

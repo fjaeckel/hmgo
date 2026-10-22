@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"html/template"
 	"net/http"
+	"net/url"
 	"time"
 
 	"github.com/fjaeckel/hmgo/internal/ha"
@@ -29,6 +30,26 @@ func (b *Bridge) StatusHandler(info Info) http.Handler {
 		enc.SetIndent("", "  ")
 		enc.Encode(s)
 	})
+	mux.HandleFunc("/pairing/start", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.Header().Set("Allow", http.MethodPost)
+			http.Error(w, "use POST", http.StatusMethodNotAllowed)
+			return
+		}
+		if !sameOrigin(r) {
+			http.Error(w, "cross-origin request refused", http.StatusForbidden)
+			return
+		}
+		select {
+		case b.commands <- ha.Command{Kind: ha.StartPairing}:
+		case <-time.After(2 * time.Second):
+			http.Error(w, "hmbridge is busy, try again", http.StatusServiceUnavailable)
+			return
+		case <-r.Context().Done():
+			return
+		}
+		http.Redirect(w, r, "/#pairing", http.StatusSeeOther)
+	})
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
 			http.NotFound(w, r)
@@ -42,6 +63,26 @@ func (b *Bridge) StatusHandler(info Info) http.Handler {
 		}
 	})
 	return mux
+}
+
+// sameOrigin reports whether a state-changing request comes from a page
+// of this server (CSRF protection without tokens): browsers send Origin
+// with every POST (or at least Referer); one of them must name this
+// host. Requests without either (e.g. curl) are refused; send
+// "Origin: http://<host>" to script them.
+func sameOrigin(r *http.Request) bool {
+	if site := r.Header.Get("Sec-Fetch-Site"); site != "" && site != "same-origin" && site != "none" {
+		return false
+	}
+	for _, h := range []string{"Origin", "Referer"} {
+		v := r.Header.Get(h)
+		if v == "" {
+			continue
+		}
+		u, err := url.Parse(v)
+		return err == nil && u.Host != "" && u.Host == r.Host
+	}
+	return false
 }
 
 var statusTmpl = template.Must(template.New("status").Funcs(template.FuncMap{
@@ -100,11 +141,20 @@ th{background:#eee}.warn{color:#b00;font-weight:600}.muted{color:#888}
 <h1>hmbridge</h1>
 <p class="muted">running since {{.Started.Format "2006-01-02 15:04:05"}}{{range $k, $v := .Extra}} · {{$k}}: {{$v}}{{end}} · command queue: {{.Queue}} · <a href="/metrics">metrics</a> · <a href="/api/state">json</a></p>
 
+<h2 id="pairing">Pairing</h2>
+{{with .Pairing}}{{if .Enabled}}
+<p>Status: <b>{{.Status}}</b>{{if .Remaining}} · {{.Remaining}} s left{{end}} · AES on pairing: {{.AES}}</p>
+<form method="post" action="/pairing/start"><button type="submit">Pair new device</button>
+<span class="muted">then press the config button of the device within the pairing time</span></form>
+{{if .LastResult}}<p>Last result ({{ago .LastResultAt}}): {{.LastResult}}</p>{{end}}
+{{range .UnpairWaiting}}<p class="warn">Press the config button of {{.}} to finish its unpairing.</p>{{end}}
+{{else}}<p class="muted">Pairing is disabled (devices_file is "").</p>{{end}}{{end}}
+
 <h2>Devices</h2>
 <div class="wrap"><table>
 <tr><th>Name</th><th>Model</th><th>Address</th><th>Group</th><th>State</th><th>Last seen</th><th>RSSI</th><th>Battery</th><th>Low bat.</th><th>Temp.</th><th>Target</th><th>Mode</th><th>Valve</th><th>Hum.</th><th>Window</th><th>Fault</th><th>AES</th><th>Msgs</th></tr>
 {{range .Devices}}<tr>
-<td>{{.Name}}</td><td>{{.Model}}</td><td>{{.Address}}</td><td>{{.Group}}</td><td>{{.Summary}}</td>
+<td>{{.Name}}{{if .Paired}} <span class="muted" title="paired with hmbridge (devices file)">(paired)</span>{{end}}</td><td>{{.Model}}</td><td>{{.Address}}</td><td>{{.Group}}</td><td>{{.Summary}}</td>
 <td>{{ago .State.LastSeen}}</td><td>{{i .State.RSSI}}</td>
 <td>{{f1 .State.BatteryVoltage}}{{if .State.BatteryVoltage}} V{{end}}{{pct .State.BatteryVoltage}}</td>
 <td{{if deref .State.LowBattery}} class="warn"{{end}}>{{b .State.LowBattery}}</td>

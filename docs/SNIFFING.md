@@ -47,6 +47,12 @@ what every one of your devices reports.
 * AES responses of the devices are redacted too (with the matching challenge,
   they would allow an offline attack on a weak key passphrase). `-no-redact`
   keeps them.
+* The AES key exchange of a pairing (BidCoS cmd 0x04) is always redacted, also
+  with `-no-redact`: it carries the system security key, encrypted with the
+  device's old key, which for a new device is eQ-3's publicly known default
+  key. hmsniff only shows the new key index and which half is sent. The same
+  applies to the kernel log (next point): don't share `dmesg` from a recording
+  in which a device was paired.
 * Device types and serial numbers come from OpenCCU's `/etc/config/rfd/*.dev`;
   your device names (from the web UI) are not included.
 * The kernel's own log is **not** redacted: while the raw-uart dump is on, the

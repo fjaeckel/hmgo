@@ -467,6 +467,21 @@ func (m *Module) handle(f Frame) error {
 		// on the wire: FD00100108040701010001FFFFFFFFFFFFFFFFCAAF
 		return m.ack(f, resp...)
 
+	case 0x07: // remove peer: addr(3)
+		if len(f.Payload) != 3 {
+			return m.ack(f, AckNACK)
+		}
+		var addr [3]byte
+		copy(addr[:], f.Payload)
+		m.mu.Lock()
+		_, ok := m.peers[addr]
+		delete(m.peers, addr)
+		m.mu.Unlock()
+		if !ok {
+			return m.ack(f, AckNACK)
+		}
+		return m.ack(f, AckOK)
+
 	case 0x09, 0x0a: // peer add / remove AES
 		if len(f.Payload) < 3 {
 			return m.ack(f, AckNACK)

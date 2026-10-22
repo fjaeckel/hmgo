@@ -191,7 +191,10 @@ func TestValidationErrors(t *testing.T) {
 		{"non-hex central", `{"central_address":"1A2B3G","devices":[` + dev + `]}`, "not hexadecimal"},
 		{"zero central", `{"central_address":"000000","devices":[` + dev + `]}`, "must not be 000000"},
 		{"bad reset", wrap(`,"reset":"usb"`, dev), "reset"},
-		{"no devices", wrap(``, ``), "at least one device"},
+		{"no devices", wrap(`,"devices_file":""`, ``), "at least one device"},
+		{"pairing aes without key", wrap(`,"pairing":{"aes":"system_key"}`, dev), "needs a security block"},
+		{"pairing aes bad", wrap(`,"pairing":{"aes":"on"}`, dev), `pairing.aes: "on"`},
+		{"pairing duration", wrap(`,"pairing":{"duration":"5s"}`, dev), "pairing.duration"},
 		{"bad model", wrap(``, `{"name":"a","model":"HM-CC-TC","address":"38F59C"}`), "unsupported model"},
 		{"missing name", wrap(``, `{"model":"HM-CC-RT-DN","address":"38F59C"}`), "name is required"},
 		{"missing address", wrap(``, `{"name":"a","model":"HM-CC-RT-DN"}`), "address is required"},
@@ -414,5 +417,58 @@ func TestNewModelValidation(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), tc.want) {
 			t.Errorf("%s: got %v, want %q", tc.cfg, err, tc.want)
 		}
+	}
+}
+
+func TestPairingAndDevicesFile(t *testing.T) {
+	// No devices at all is fine while the devices file (pairing) is on.
+	cfg, err := Parse([]byte(`{"central_address":"1A2B3C"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.DevicesFilePath() != DefaultDevicesFile || cfg.PairingAES() != PairingAESOff || cfg.PairingDuration() != DefaultPairingDuration {
+		t.Errorf("defaults: %q %q %v", cfg.DevicesFilePath(), cfg.PairingAES(), cfg.PairingDuration())
+	}
+	cfg, err = Parse([]byte(`{"central_address":"1A2B3C","security":{"passphrase":"x","index":2},
+	  "devices_file":"/tmp/d.json","pairing":{"duration":"2m"},
+	  "devices":[{"name":"a","model":"HM-CC-RT-DN","address":"38F59C"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.DevicesFilePath() != "/tmp/d.json" || cfg.PairingAES() != PairingAESSystemKey || cfg.PairingDuration() != 2*time.Minute {
+		t.Errorf("got %q %q %v", cfg.DevicesFilePath(), cfg.PairingAES(), cfg.PairingDuration())
+	}
+	cfg2, err := Parse([]byte(`{"central_address":"1A2B3C","security":{"passphrase":"x","index":2},"pairing":{"aes":"off"},"devices":[]}`))
+	if err != nil || cfg2.PairingAES() != PairingAESOff {
+		t.Errorf("aes off: %v %v", err, cfg2)
+	}
+
+	// Store devices: key index 0 is allowed, other validation applies.
+	zero := 0
+	d, err := cfg.ResolveStoreDevice(Device{Name: "HM-Sec-SCo NEQ0000001", Model: ModelSCo, Address: "4C5D6E", Serial: "NEQ0000001", KeyIndexOverride: &zero})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !d.FromStore() || d.KeyIndex() != 0 || d.Addr() != [3]byte{0x4c, 0x5d, 0x6e} || d.StaleTimeout() != 6*time.Hour {
+		t.Errorf("store device %+v", d)
+	}
+	if cfg.Devices[0].FromStore() {
+		t.Error("configured device marked as from store")
+	}
+	one := 1
+	if _, err := cfg.ResolveStoreDevice(Device{Name: "x", Model: ModelSCo, Address: "4C5D6E", KeyIndexOverride: &one}); err == nil {
+		t.Error("unknown key index accepted")
+	}
+	if _, err := cfg.ResolveStoreDevice(Device{Name: "x", Model: "HM-Foo", Address: "4C5D6E"}); err == nil {
+		t.Error("unknown model accepted")
+	}
+	if _, err := cfg.ResolveStoreDevice(Device{Name: "x", Model: ModelSCo, Address: "1A2B3C"}); err == nil {
+		t.Error("central address accepted")
+	}
+	if c := cfg.ConfiguredDevice([3]byte{1, 2, 3}, "A"); c == nil || c.Name != "a" {
+		t.Errorf("ConfiguredDevice by name: %v", c)
+	}
+	if c := cfg.ConfiguredDevice([3]byte{0x38, 0xf5, 0x9c}, ""); c == nil {
+		t.Error("ConfiguredDevice by address")
 	}
 }

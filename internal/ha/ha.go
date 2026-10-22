@@ -23,6 +23,11 @@
 //	hmbridge/<addr>/set/light           {"state":"on","brightness":128,"transition":2} (dimmer)
 //	hmbridge/<addr>/set/led_<n>         "off" | "red" | "green" | "orange" (n = 1…16)
 //	hmbridge/<addr>/event/button_<n>    {"event_type":"press_short","button":n} (not retained)
+//	hmbridge/<addr>/set/unpair          any payload: unpair a device paired with hmbridge
+//	hmbridge/<addr>/set/name            new name of a device paired with hmbridge
+//	hmbridge/<addr>/name                retained name of a device paired with hmbridge
+//	hmbridge/bridge/set/pair            "PRESS" (or seconds, 10 … 600): start pairing mode
+//	hmbridge/bridge/pairing             retained JSON PairingState
 //	hmbridge/group/<slug>/state         retained JSON State of a heating group
 //	hmbridge/group/<slug>/set/...       as for devices
 //	homeassistant/status                HA birth/will message ("online")
@@ -206,6 +211,10 @@ type DeviceDesc struct {
 	Model  string // e.g. "HM-CC-RT-DN"
 	Serial string // optional
 	Kind   Kind   // e.g. RadiatorThermostat, WindowContact, Remote
+	// Paired marks a device paired with hmbridge (kept in its devices
+	// file): it gets an “Unpair” button (disabled by default) and a
+	// “Name” text entity.
+	Paired bool
 }
 
 // GroupDesc describes a heating group for discovery. Group topics live
@@ -779,6 +788,16 @@ const (
 	// SetLED sets an LED of the HM-OU-LED16: topic set/led_<n> (n =
 	// 1…16), payload one of LEDColors.
 	SetLED
+	// StartPairing starts pairing mode: topic <base>/bridge/set/pair,
+	// payload "PRESS" (HA button) or a duration in seconds (10 … 600).
+	// Addr and Group are empty.
+	StartPairing
+	// Unpair unpairs a device paired with hmbridge: topic set/unpair,
+	// any payload.
+	Unpair
+	// Rename renames a device paired with hmbridge: topic set/name,
+	// payload the new name (1 … 64 characters).
+	Rename
 )
 
 func (k CommandKind) String() string {
@@ -795,12 +814,18 @@ func (k CommandKind) String() string {
 		return "SetLight"
 	case SetLED:
 		return "SetLED"
+	case StartPairing:
+		return "StartPairing"
+	case Unpair:
+		return "Unpair"
+	case Rename:
+		return "Rename"
 	}
 	return fmt.Sprintf("CommandKind(%d)", int(k))
 }
 
 // Command is a validated command from HA. Exactly one of Addr and Group
-// is set.
+// is set, except for StartPairing (neither).
 type Command struct {
 	Addr        string // device commands: lowercase hex address
 	Group       string // group commands: group slug
@@ -814,6 +839,9 @@ type Command struct {
 	Transition *float64 // SetLight: seconds, nil = not given
 	LED        int      // SetLED: 1 … LEDCount
 	Color      string   // SetLED: one of LEDColors
+
+	Duration time.Duration // StartPairing: 0 = default
+	Name     string        // Rename
 }
 
 // ErrNotCommandTopic is returned by ParseCommand for topics that are not
@@ -832,6 +860,11 @@ func ParseCommand(cfg TopicConfig, topic string, payload []byte) (Command, error
 	var cmd Command
 	var what string
 	switch {
+	case len(parts) == 3 && parts[0] == "bridge" && parts[1] == "set":
+		if parts[2] != "pair" {
+			return Command{}, fmt.Errorf("ha: unknown bridge command %q", parts[2])
+		}
+		return parsePairCommand(strings.TrimSpace(string(payload)))
 	case len(parts) == 4 && parts[0] == "group" && parts[2] == "set":
 		if !ValidSlug(parts[1]) {
 			return Command{}, fmt.Errorf("ha: invalid group slug %q in topic %q", parts[1], topic)
@@ -874,6 +907,19 @@ func ParseCommand(cfg TopicConfig, topic string, payload []byte) (Command, error
 			return Command{}, fmt.Errorf("ha: invalid preset %q", p)
 		}
 		cmd.Kind, cmd.Preset = SetPreset, m
+	case "unpair", "name":
+		if cmd.Group != "" {
+			return Command{}, fmt.Errorf("ha: command %q is not supported for groups", what)
+		}
+		if what == "unpair" {
+			cmd.Kind = Unpair
+			return cmd, nil
+		}
+		name := strings.TrimSpace(string(payload))
+		if err := ValidDeviceName(name); err != nil {
+			return Command{}, err
+		}
+		cmd.Kind, cmd.Name = Rename, name
 	default:
 		if what != "switch" && what != "light" && !strings.HasPrefix(what, "led_") {
 			return Command{}, fmt.Errorf("ha: unknown command %q", what)
@@ -886,6 +932,45 @@ func ParseCommand(cfg TopicConfig, topic string, payload []byte) (Command, error
 		}
 	}
 	return cmd, nil
+}
+
+// Pairing durations accepted by StartPairing.
+const (
+	MinPairingDuration = 10 * time.Second
+	MaxPairingDuration = 10 * time.Minute
+)
+
+func parsePairCommand(p string) (Command, error) {
+	cmd := Command{Kind: StartPairing}
+	if p == "" || strings.EqualFold(p, "PRESS") || strings.EqualFold(p, "ON") {
+		return cmd, nil
+	}
+	secs, err := strconv.Atoi(p)
+	if err != nil {
+		return Command{}, fmt.Errorf("ha: invalid pairing payload %q (want PRESS or seconds)", p)
+	}
+	d := time.Duration(secs) * time.Second
+	if d < MinPairingDuration || d > MaxPairingDuration {
+		return Command{}, fmt.Errorf("ha: pairing duration %v out of range %v … %v", d, MinPairingDuration, MaxPairingDuration)
+	}
+	cmd.Duration = d
+	return cmd, nil
+}
+
+// MaxNameLength is the longest device name accepted by Rename.
+const MaxNameLength = 64
+
+// ValidDeviceName checks a new device name (Rename).
+func ValidDeviceName(name string) error {
+	if name == "" || len([]rune(name)) > MaxNameLength {
+		return fmt.Errorf("ha: device name must have 1 … %d characters", MaxNameLength)
+	}
+	for _, r := range name {
+		if r < 0x20 || r == 0x7f {
+			return fmt.Errorf("ha: device name %q contains control characters", name)
+		}
+	}
+	return nil
 }
 
 // parseOnOff parses ON/OFF payloads (case-insensitive; also on/off as

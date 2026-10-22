@@ -939,7 +939,15 @@ func TestRestoredStaleDeviceStartsUnavailable(t *testing.T) {
 	cfg := strings.Replace(testConfig, `"state_file": "",`, `"state_file": "`+path+`",`, 1)
 	e := newEnv(t, cfg, fakemod.Options{})
 	avail := func(topic string) string { return string(e.pub.get(topic)) }
-	e.waitFor("availability", func() bool { return avail("hmbridge/38f59c/availability") != "" })
+	// The publisher sends PublishAll's messages one by one: wait for all.
+	e.waitFor("availability", func() bool {
+		for _, a := range []string{"38f59c", "4c5d6e", "2a1b3c", "group/wohnzimmer"} {
+			if avail("hmbridge/"+a+"/availability") == "" {
+				return false
+			}
+		}
+		return true
+	})
 	if a := avail("hmbridge/38f59c/availability"); a != "offline" {
 		t.Errorf("thermostat last heard 2h ago: availability %q, want offline", a)
 	}
