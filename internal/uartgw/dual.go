@@ -7,12 +7,16 @@ package uartgw
 // “DualCoPro” dual-coprocessor firmware, e.g. 4.4.x) for classic
 // BidCoS devices.
 //
-// The protocol knowledge comes from RFNETHM
-// (https://github.com/tostmann/RFNETHM at 9092276, GPL-2.0-or-later;
-// used as a protocol reference only, no code was copied): firmware/src/hmu_frame.h (frame
-// format and destinations), source_uart.c (boot_probe, uart_frame_cb:
-// banners, IDENTIFY, CHANGE_APP) and sink_hmuartlgw_legacy.c (LLMAC
-// send/receive/ack translation).
+// The protocol knowledge comes from two sources:
+//
+//   - RFNETHM (https://github.com/tostmann/RFNETHM at 9092276,
+//     GPL-2.0-or-later; used as a protocol reference only, no code was
+//     copied): firmware/src/hmu_frame.h (frame format and destinations),
+//     source_uart.c (boot_probe, uart_frame_cb: banners, IDENTIFY,
+//     CHANGE_APP) and sink_hmuartlgw_legacy.c (LLMAC send/receive/ack).
+//   - A 30 minute hmsniff capture of OpenCCU (multimacd/rfd) talking to
+//     an RPI-RF-MOD with firmware 4.4.22 (hmsniff-20261022-094052.log,
+//     “capture” below, with line numbers).
 //
 // Frames use the same format as the classic firmware (frame.go), but
 // the packet has no separate command byte: [dst cnt payload…]. As the
@@ -21,11 +25,11 @@ package uartgw
 //
 // Unlike the classic firmware, which handles ACKs and AES for
 // registered peers by itself, the dual-coprocessor firmware only
-// offers a BidCoS MAC layer (“LLMAC”): send a frame, receive frames.
-// On a CCU, rfd implements the BidCoS logic (ACKs, AES, retries) on top
-// of it in software, and so does DualConn (Config.SoftwareAck,
-// Config.SoftwareAES). Everything marked ASSUMPTION below must be
-// verified with a capture of OpenCCU's multimacd (docs/SNIFFING.md).
+// offers a BidCoS MAC layer (“LLMAC”): send a frame at a given time,
+// receive every frame on the air. The host does the BidCoS logic: ACKs,
+// AES, retries (capture: the module never ACKs device messages, rfd
+// does, e.g. lines 1318-1320; AES lines 694-701). So does DualConn
+// (Config.SoftwareAck, Config.SoftwareAES).
 
 import (
 	"context"
@@ -47,22 +51,54 @@ const (
 	commonChangeApp = 0x03 // bootloader → app; announced ~2.2s later
 )
 
-// LLMAC (dst 0x03) commands (from RFNETHM sink_hmuartlgw_legacy.c).
+// LLMAC (dst 0x03) commands (from RFNETHM, confirmed by the capture).
 const (
-	llmacAck  = 0x01 // module → host: [0x01 status …], same frame counter as the LLMAC_SEND
+	llmacAck  = 0x01 // module → host: [0x01 status ts_hi ts_lo], same frame counter as the LLMAC_SEND
 	llmacRecv = 0x05 // module → host: [0x05 ts_hi ts_lo info rssi msg…]
-	llmacSend = 0x06 // host → module: [0x06 opts(3) msg…]
+	llmacSend = 0x06 // host → module: [0x06 t_hi t_lo mode msg…]
 
 	llmacStatusOK = 0x01 // LLMAC_ACK: transmitted
 )
 
-// llmacSendOpts are the three bytes between the LLMAC_SEND command and
-// the BidCoS message. Their meaning is unknown: RFNETHM always sends
-// 80 00 80 (from RFNETHM). The classic burst byte has no place in the
-// LLMAC_SEND (RFNETHM drops it); ASSUMPTION — verify with capture: the
-// module derives the burst preamble from the Burst flag (0x10), or one
-// of these bytes controls it.
-var llmacSendOpts = [3]byte{0x80, 0x00, 0x80}
+// TRX (dst 0x01 “APP”) commands multimacd sends while running
+// (capture).
+const (
+	trxStatus      = 0x03 // every 10s, e.g. line 30: reply [0x04 0x01 xx], xx 0x02..0x0c
+	trxUnknown0A   = 0x0a // every 5min (line 324), reply [0x04 0x01 0x03]; not used by hmbridge
+	trxReply       = 0x04
+	trxUnsolicited = 0x0b // module → host, [0x0b 14 02] (line 940), [0x0b 00 01] (line 1094); meaning unknown
+)
+
+// LLMAC_SEND options [t_hi t_lo mode] (capture):
+//
+//   - t is the absolute time of the transmission on the module's 15-bit
+//     millisecond clock, the same clock as the ts of LLMAC_RECV and
+//     LLMAC_ACK (max seen 0x7f43; 1 tick = 1ms). sendNow (t = 0x8000,
+//     i.e. bit 15 set) means “as soon as possible”.
+//   - mode is 0x80, plus 0x10 (the BidCoS Burst flag) for burst
+//     transmissions (opts 80 00 90, e.g. line 96: set temperature on an
+//     HM-CC-RT-DN; the LLMAC_ACK arrives ~380ms later, after the
+//     preamble).
+const (
+	sendNow      = 0x8000
+	modulePeriod = 0x8000 // the module clock wraps at 15 bits
+	sendModeBase = 0x80
+)
+
+// Replies to a device message are scheduled replyDelay after its
+// reception (module time). OpenCCU sends AES challenges and plain ACKs
+// at rx+106/107ms, the final ACK after an AES answer at rx+97ms and
+// time answers at rx+109ms (capture, e.g. lines 694-701, 1318-1324).
+// If the host is so slow that the module time already passed
+// t - replyLateMargin, the reply is sent at once instead.
+const (
+	replyDelay      = 100 * time.Millisecond
+	replyLateMargin = 10 * time.Millisecond
+	// replyWindow: a non-BiDi Send to a device that sent us a message
+	// with the same message counter within this window is a reply (e.g.
+	// the bridge's answer to a time request).
+	replyWindow = time.Second
+)
 
 // Application tags of the dual-coprocessor firmware (from RFNETHM).
 const (
@@ -88,10 +124,10 @@ const (
 	minMsgLen = 9 // cnt flags cmd src dst
 )
 
-// Flags of the frames DualConn sends on its own. ASSUMPTION — verify
-// with capture (OCCU's values are not known; these follow FHEM/AskSin
-// conventions): plain ACKs need no answer; challenges and our AES
-// answer expect one.
+// Flags of the frames DualConn sends on its own (capture, lines
+// 694-701, 1318-1320): ACKs 0x80 (RPTEN), AES challenges 0xa0
+// (BIDI|RPTEN). Our answer to a device's challenge (cmd 0x03) is not in
+// the capture; it expects the device's ACK, hence BIDI|RPTEN.
 const (
 	ackFlags       = bidcosFlagRepeatEnable                  // 0x80
 	challengeFlags = bidcosFlagRepeatEnable | bidcosFlagBiDi // 0xa0
@@ -100,9 +136,13 @@ const (
 
 // Defaults for the dual-coprocessor firmware.
 const (
-	defaultResponseTimeout = 1 * time.Second
-	defaultSendRetries     = 2
+	// OpenCCU retransmits an unanswered command 3 times, ~275ms apart,
+	// i.e. ~250ms after each LLMAC_ACK (capture, lines 48-82).
+	defaultResponseTimeout = 250 * time.Millisecond
+	defaultSendRetries     = 3
 	defaultChangeAppWait   = 3500 * time.Millisecond // RFNETHM boot_probe: 3500ms
+	defaultTRXPollInterval = 10 * time.Second        // like multimacd
+	minAESHoldTimeout      = time.Second
 	writeQueueSize         = 64
 	maxOneshots            = 64
 )
@@ -122,7 +162,7 @@ type AESSigner interface {
 // AESAuthVerifier is optionally implemented by an AESSigner. If it is,
 // the final ACK after a successful verification carries the 4 auth
 // bytes (cmd 0x02 payload [0x00 auth…], c.f. FHEM aesAuthBytes /
-// AESreqAck) instead of a bare 02 00.
+// AESreqAck; capture line 701: “009d20665c”) instead of a bare 02 00.
 type AESAuthVerifier interface {
 	VerifyAuth(keyIndex byte, challenge [6]byte, msg []byte, response [16]byte) (auth [4]byte, ok bool)
 }
@@ -131,7 +171,7 @@ type AESAuthVerifier interface {
 // initialization (Config.DualInit) or AddPeer (Config.DualPeerInit).
 type InitStep struct {
 	Name    string // for logs and errors
-	Dst     byte   // destination, e.g. 0x00 OS/HMSYSTEM, 0x03 LLMAC, 0xfe COMMON
+	Dst     byte   // destination, e.g. 0x00 OS/HMSYSTEM, 0x01 TRX, 0x03 LLMAC, 0xfe COMMON
 	Payload []byte // complete payload (the first byte acts as the command)
 
 	// ExpectAck makes the step wait (Config.Timeout) for the module's
@@ -149,9 +189,19 @@ var (
 			Subsystem: metricsSubsystem,
 			Name:      "dual_events_total",
 			Help: "RPI-RF-MOD software BidCoS events: software_ack, aes_challenge_sent, aes_ok, aes_failed, " +
-				"aes_timeout, aes_challenge_received, response_timeout, retransmit, oneshot_failed.",
+				"aes_timeout, aes_challenge_received, response_timeout, retransmit, oneshot_failed, " +
+				"reply_scheduled, reply_late (sent at once: the host was too slow to schedule it), hmip_ignored, trx_poll_failed.",
 		},
 		[]string{"event"})
+
+	dualTRXStatus = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Namespace: metricsNamespace,
+			Subsystem: metricsSubsystem,
+			Name:      "dual_trx_status",
+			Help: "RPI-RF-MOD: raw value of the TRX status poll (APP cmd 0x03 reply [04 01 xx]), " +
+				"probably the duty cycle or channel load; meaning unconfirmed.",
+		})
 
 	moduleInfo = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
@@ -164,7 +214,7 @@ var (
 )
 
 func init() {
-	prometheus.MustRegister(dualEvents, moduleInfo)
+	prometheus.MustRegister(dualEvents, dualTRXStatus, moduleInfo)
 }
 
 // dualReq is an outstanding request, matched by frame counter.
@@ -174,11 +224,17 @@ type dualReq struct {
 	ch   chan frame // buffered (1)
 }
 
+// rxMsg is a received message as handed to Send.
+type rxMsg struct {
+	frame []byte // receive frame: status info rssi msg…
+	ts    uint16 // module time of the reception
+}
+
 // respWaiter matches device responses to the packet Send transmits.
 type respWaiter struct {
 	dev, us [3]byte
 	msgcnt  byte
-	ch      chan []byte // receive frames (status info rssi msg…); buffered
+	ch      chan rxMsg // buffered
 }
 
 type aesKey struct {
@@ -196,6 +252,13 @@ type heldMsg struct {
 	timer      *time.Timer
 }
 
+// rxSeen records when a device's message to us was received, so that a
+// reply sent via Send can be scheduled like OpenCCU does.
+type rxSeen struct {
+	ts uint16
+	at time.Time
+}
+
 type queued struct {
 	b        []byte
 	dst, cmd byte
@@ -208,7 +271,9 @@ type queued struct {
 // Like Conn, it owns a reader goroutine; user requests (Send, AddPeer)
 // are serialized. In addition, a writer goroutine writes all frames, so
 // that the reader goroutine can queue software ACKs and AES challenges
-// without ever blocking on the serial port or on a running Send.
+// without ever blocking on the serial port or on a running Send. These
+// replies are scheduled on the module clock (replyDelay after the
+// device's message), so the host only has to queue them within ~90ms.
 type DualConn struct {
 	rw   io.ReadWriter
 	next func() (frame, error)
@@ -216,7 +281,9 @@ type DualConn struct {
 	hmid            [3]byte
 	timeout         time.Duration
 	responseTimeout time.Duration
+	aesHoldTimeout  time.Duration
 	changeAppWait   time.Duration
+	trxPollInterval time.Duration
 	retries         int
 	maxAckTimeouts  int
 	softAck         bool
@@ -237,13 +304,18 @@ type DualConn struct {
 	closeOnce sync.Once
 
 	mu           sync.Mutex
+	now          func() time.Time // local monotonic clock (tests may skew it)
 	cnt          byte
 	reqs         map[byte]*dualReq
 	oneshots     map[byte]time.Time // fire-and-forget LLMAC_SENDs (software ACKs, challenges)
 	lateIdentify map[byte]bool      // IDENTIFY requests we gave up on
 	resp         *respWaiter
 	held         map[aesKey]*heldMsg
+	seen         map[aesKey]rxSeen // recent messages to us, by sender and message counter
 	peers        map[[3]byte]Peer
+	clockTs      uint16    // module time of the last LLMAC_RECV …
+	clockAt      time.Time // … and the local time it was read
+	clockValid   bool
 	entered      bool
 	running      bool
 	err          error
@@ -297,6 +369,7 @@ func openDual(rw io.ReadWriter, cfg Config, p *framePump, d detection) (*DualCon
 		timeout:         cfg.Timeout,
 		responseTimeout: cfg.ResponseTimeout,
 		changeAppWait:   cfg.ChangeAppWait,
+		trxPollInterval: cfg.TRXPollInterval,
 		retries:         cfg.SendRetries,
 		maxAckTimeouts:  cfg.MaxAckTimeouts,
 		softAck:         boolDefault(cfg.SoftwareAck, true),
@@ -311,12 +384,14 @@ func openDual(rw io.ReadWriter, cfg Config, p *framePump, d detection) (*DualCon
 		uq:              make(chan queued, writeQueueSize),
 		announce:        make(chan string, 8),
 		done:            make(chan struct{}),
+		now:             time.Now,
 		cnt:             detectCnt,
 		reqs:            make(map[byte]*dualReq),
 		oneshots:        make(map[byte]time.Time),
 		// detect's IDENTIFY may be answered after an announcement.
 		lateIdentify: map[byte]bool{detectCnt: true},
 		held:         make(map[aesKey]*heldMsg),
+		seen:         make(map[aesKey]rxSeen),
 		peers:        make(map[[3]byte]Peer),
 		recv:         make(chan []byte, recvBufferSize),
 	}
@@ -326,8 +401,18 @@ func openDual(rw io.ReadWriter, cfg Config, p *framePump, d detection) (*DualCon
 	if c.responseTimeout <= 0 {
 		c.responseTimeout = defaultResponseTimeout
 	}
+	// The device answers our challenge only after it was transmitted
+	// (replyDelay) and it computed the answer (capture: ~150ms after the
+	// challenge, lines 696-699).
+	c.aesHoldTimeout = replyDelay + 2*c.responseTimeout
+	if c.aesHoldTimeout < minAESHoldTimeout {
+		c.aesHoldTimeout = minAESHoldTimeout
+	}
 	if c.changeAppWait <= 0 {
 		c.changeAppWait = defaultChangeAppWait
+	}
+	if c.trxPollInterval == 0 {
+		c.trxPollInterval = defaultTRXPollInterval
 	}
 	if c.retries == 0 {
 		c.retries = defaultSendRetries
@@ -373,6 +458,9 @@ func openDual(rw io.ReadWriter, cfg Config, p *framePump, d detection) (*DualCon
 	moduleInfo.WithLabelValues(KindRPIRFMod, c.tag).Set(1)
 	if c.softAES && c.signer == nil {
 		log.Printf("uartgw: no AES signer configured; messages of AES peers will fail authentication")
+	}
+	if c.trxPollInterval > 0 {
+		go c.trxPollLoop()
 	}
 	return c, nil
 }
@@ -444,10 +532,52 @@ func (c *DualConn) logFrame(dir string, f frame) {
 	}
 }
 
+// ---- module clock and scheduling ----
+
+// sendOpts returns the LLMAC_SEND options for a transmission at t
+// (sendNow: at once) of a message with flags.
+func sendOpts(t uint16, flags byte) [3]byte {
+	return [3]byte{byte(t >> 8), byte(t), sendModeBase | flags&bidcosFlagBurst}
+}
+
+// diff15 returns a - b on the 15-bit module clock, in (-0x4000, 0x4000].
+func diff15(a, b uint16) int {
+	d := (int(a) - int(b)) & (modulePeriod - 1)
+	if d > modulePeriod/2 {
+		d -= modulePeriod
+	}
+	return d
+}
+
+// moduleTimeLocked estimates the module clock from the last LLMAC_RECV.
+// LLMAC_ACK timestamps are not used: they are the transmission time,
+// which for burst sends lies ~380ms before the ack arrives. c.mu must
+// be held.
+func (c *DualConn) moduleTimeLocked() (uint16, bool) {
+	if !c.clockValid {
+		return 0, false
+	}
+	ms := c.now().Sub(c.clockAt).Milliseconds()
+	return uint16((int64(c.clockTs) + ms) & (modulePeriod - 1)), true
+}
+
+// replyOptsLocked returns the options for a reply to a message received
+// at module time rxTs: replyDelay later, or at once if the host is too
+// late for that. c.mu must be held.
+func (c *DualConn) replyOptsLocked(rxTs uint16, flags byte) [3]byte {
+	t := uint16((int(rxTs) + int(replyDelay/time.Millisecond)) & (modulePeriod - 1))
+	if now, ok := c.moduleTimeLocked(); ok && diff15(t, now) < int(replyLateMargin/time.Millisecond) {
+		dualEvents.WithLabelValues("reply_late").Inc()
+		return sendOpts(sendNow, flags)
+	}
+	dualEvents.WithLabelValues("reply_scheduled").Inc()
+	return sendOpts(t, flags)
+}
+
 // ---- writing ----
 
 // writeLoop writes queued frames, urgent ones (software ACKs, AES
-// challenges, which devices expect within ~100ms) first.
+// challenges) first.
 func (c *DualConn) writeLoop() {
 	for {
 		var q queued
@@ -511,10 +641,9 @@ func (c *DualConn) nextCnt() byte {
 	return c.cnt
 }
 
-// request sends payload (first byte = command) to dst and, if wait,
-// waits for the reply (a frame on dst or DUAL_ERR with the same
-// counter). DUAL_ERR replies are returned with an error wrapping
-// ErrNACK.
+// request sends payload (first byte = command) to dst and waits for the
+// reply (a frame on dst or DUAL_ERR with the same counter). DUAL_ERR
+// replies are returned with an error wrapping ErrNACK.
 func (c *DualConn) request(ctx context.Context, dst byte, payload []byte, timeout time.Duration) (frame, error) {
 	c.mu.Lock()
 	if c.err != nil {
@@ -582,33 +711,38 @@ func (c *DualConn) ackTimeout(err error) {
 	}
 }
 
-func llmacSendPayload(msg []byte) []byte {
+func llmacSendPayload(opts [3]byte, msg []byte) []byte {
 	p := make([]byte, 0, 4+len(msg))
 	p = append(p, llmacSend)
-	p = append(p, llmacSendOpts[:]...)
+	p = append(p, opts[:]...)
 	return append(p, msg...)
 }
 
 // llmacSend transmits msg (cnt flags cmd src dst payload) and waits for
 // the module's LLMAC_ACK.
-func (c *DualConn) llmacSend(ctx context.Context, msg []byte) error {
-	f, err := c.request(ctx, dstLLMAC, llmacSendPayload(msg), c.timeout)
+func (c *DualConn) llmacSend(ctx context.Context, msg []byte, opts [3]byte) error {
+	timeout := c.timeout
+	if opts[0]&0x80 == 0 {
+		// scheduled: the module waits up to ~replyDelay before sending
+		timeout += replyDelay
+	}
+	f, err := c.request(ctx, dstLLMAC, llmacSendPayload(opts, msg), timeout)
 	if err != nil {
 		if errors.Is(err, ErrTimeout) {
 			c.ackTimeout(err)
 		}
 		return err
 	}
-	// LLMAC_ACK: [0x01 status …]; in frame terms cmd=0x01, payload[0]=status.
+	// LLMAC_ACK: [0x01 status ts_hi ts_lo]; in frame terms cmd=0x01,
+	// payload = status ts_hi ts_lo (ts = transmission time).
 	if f.cmd != llmacAck || len(f.payload) < 1 {
 		acks.WithLabelValues("other").Inc()
 		return fmt.Errorf("uartgw: unexpected reply to LLMAC_SEND: %v", f)
 	}
 	status := f.payload[0]
 	if status != llmacStatusOK {
-		// ASSUMPTION — verify with capture: which statuses exist (duty
-		// cycle exhausted, CSMA/CA, …) and whether some should be
-		// retried.
+		// The capture only shows status 0x01 (no duty cycle or CSMA/CA
+		// failures happened); other statuses are mapped to ErrNACK.
 		acks.WithLabelValues(fmt.Sprintf("llmac_0x%02x", status)).Inc()
 		return fmt.Errorf("%w: LLMAC_ACK status 0x%02x (%x)", ErrNACK, status, f.payload)
 	}
@@ -619,7 +753,7 @@ func (c *DualConn) llmacSend(ctx context.Context, msg []byte) error {
 // sendOneshot queues an urgent LLMAC_SEND without waiting for its
 // LLMAC_ACK (the reader goroutine cannot wait for frames it reads
 // itself). The ack is matched and counted in dispatch.
-func (c *DualConn) sendOneshot(msg []byte, what string) {
+func (c *DualConn) sendOneshot(msg []byte, opts [3]byte, what string) {
 	c.mu.Lock()
 	if c.err != nil {
 		c.mu.Unlock()
@@ -636,7 +770,7 @@ func (c *DualConn) sendOneshot(msg []byte, what string) {
 	cnt := c.nextCnt()
 	c.oneshots[cnt] = now
 	c.mu.Unlock()
-	f := frame{dst: dstLLMAC, cnt: cnt, cmd: llmacSend, payload: llmacSendPayload(msg)[1:]}
+	f := frame{dst: dstLLMAC, cnt: cnt, cmd: llmacSend, payload: llmacSendPayload(opts, msg)[1:]}
 	if err := c.enqueue(context.Background(), f, true); err != nil {
 		log.Printf("uartgw: dropping %s: %v", what, err)
 		c.mu.Lock()
@@ -655,6 +789,51 @@ func (c *DualConn) ackMsg(msgcnt byte, dev [3]byte, auth []byte) []byte {
 	m = append(m, dev[:]...)
 	m = append(m, 0x00)
 	return append(m, auth...)
+}
+
+// sendReply queues msg as a reply to a message received at rxTs.
+func (c *DualConn) sendReply(msg []byte, rxTs uint16, what string) {
+	c.mu.Lock()
+	opts := c.replyOptsLocked(rxTs, msg[1])
+	c.mu.Unlock()
+	c.sendOneshot(msg, opts, what)
+}
+
+// ---- TRX status poll ----
+
+// trxPollLoop polls the TRX status like multimacd (every 10s, APP cmd
+// 0x03, capture line 30 ff.). It is the liveness check: unanswered polls
+// count towards Config.MaxAckTimeouts.
+func (c *DualConn) trxPollLoop() {
+	t := time.NewTicker(c.trxPollInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-t.C:
+		case <-c.done:
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), c.timeout+time.Second)
+		f, err := c.request(ctx, dstApp, []byte{trxStatus}, c.timeout)
+		cancel()
+		if err != nil {
+			if c.Err() != nil {
+				return
+			}
+			dualEvents.WithLabelValues("trx_poll_failed").Inc()
+			log.Printf("uartgw: polling the TRX status: %v", err)
+			if errors.Is(err, ErrTimeout) {
+				c.ackTimeout(err)
+			}
+			continue
+		}
+		// [0x04 0x01 xx]
+		if f.cmd == trxReply && len(f.payload) >= 2 && f.payload[0] == 0x01 {
+			dualTRXStatus.Set(float64(f.payload[1]))
+		} else {
+			log.Printf("uartgw: unexpected TRX status reply: %v", f)
+		}
+	}
 }
 
 // ---- reading ----
@@ -741,6 +920,20 @@ func (c *DualConn) dispatch(f frame) {
 			log.Printf("uartgw: module did not transmit our ACK/challenge: %v", f)
 		}
 
+	case f.dst == dstHMIP:
+		// Homematic IP traffic (OpenCCU's HMIPServer); not ours.
+		dualEvents.WithLabelValues("hmip_ignored").Inc()
+
+	case f.dst == dstApp && f.cmd == trxUnsolicited:
+		if c.debug {
+			log.Printf("uartgw: unsolicited TRX frame (meaning unknown): %v", f)
+		}
+
+	case f.dst == dstApp && f.cmd != trxReply:
+		// Only replies (cmd 0x04) answer our requests; the counter of
+		// other module-initiated frames may collide with ours.
+		log.Printf("uartgw: ignoring unexpected frame: %v", f)
+
 	default:
 		if c.deliverReq(f) {
 			return
@@ -779,14 +972,22 @@ func aesExempt(cmd byte) bool {
 	return false
 }
 
+// ackExempt lists commands which are not acknowledged: ACKs, and time
+// requests, which are answered with the time instead (capture, lines
+// 1322-1324: no ACK, only the 0x3f answer).
+func ackExempt(cmd byte) bool {
+	return cmd == bidcosCmdAck || cmd == bidcosCmdTime
+}
+
 func (c *DualConn) handleRecv(f frame) {
 	// LLMAC_RECV payload after the command: ts_hi ts_lo info rssi msg…
-	// (from RFNETHM route_llmac_recv_to_fhem)
+	// (from RFNETHM route_llmac_recv_to_fhem; capture)
 	p := f.payload
 	if len(p) < 4+minMsgLen {
 		log.Printf("uartgw: dropping short LLMAC_RECV: %v", f)
 		return
 	}
+	ts := uint16(p[0])<<8 | uint16(p[1])
 	info, rssi := p[2], p[3]
 	msg := append([]byte(nil), p[4:]...)
 	msgcnt, flags, cmd := msg[0], msg[1], msg[2]
@@ -801,20 +1002,32 @@ func (c *DualConn) handleRecv(f frame) {
 		c.mu.Unlock()
 		return
 	}
+	now := c.now()
+	c.clockTs, c.clockAt, c.clockValid = ts&(modulePeriod-1), now, true
+	if toUs {
+		if len(c.seen) >= 32 {
+			for k, s := range c.seen {
+				if now.Sub(s.at) > replyWindow {
+					delete(c.seen, k)
+				}
+			}
+		}
+		c.seen[aesKey{src, msgcnt}] = rxSeen{ts: ts, at: now}
+	}
 	peer, isPeer := c.peers[src]
-	wantAck := c.softAck && toUs && bidi && isPeer && cmd != bidcosCmdAck
+	wantAck := c.softAck && toUs && bidi && isPeer && !ackExempt(cmd)
 
 	// 1. Response to the packet Send is transmitting: consumed by Send.
 	if w := c.resp; w != nil && src == w.dev && dst == w.us && msgcnt == w.msgcnt {
 		select {
-		case w.ch <- recvFrame(recvResp, info, rssi, msg):
+		case w.ch <- rxMsg{frame: recvFrame(recvResp, info, rssi, msg), ts: ts}:
 		default:
 		}
 		c.mu.Unlock()
 		// e.g. a BiDi config read response (INFO 0x10) needs our ACK;
 		// it is not challenged (Send's caller asked for it).
 		if wantAck && cmd != bidcosCmdAESResponse {
-			c.sendOneshot(c.ackMsg(msgcnt, src, nil), "software_ack")
+			c.sendReply(c.ackMsg(msgcnt, src, nil), ts, "software_ack")
 		}
 		return
 	}
@@ -826,7 +1039,7 @@ func (c *DualConn) handleRecv(f frame) {
 			delete(c.held, k)
 			h.timer.Stop()
 			c.mu.Unlock()
-			c.finishAES(src, h, msg[minMsgLen:])
+			c.finishAES(src, h, msg[minMsgLen:], ts)
 			return
 		}
 	}
@@ -859,17 +1072,18 @@ func (c *DualConn) handleRecv(f frame) {
 			return
 		}
 		c.held[k] = h
-		h.timer = time.AfterFunc(c.responseTimeout, func() { c.aesTimeout(k, h) })
+		h.timer = time.AfterFunc(c.aesHoldTimeout, func() { c.aesTimeout(k, h) })
 		c.mu.Unlock()
 
-		// cnt flags 0x02 us dev 04 challenge(6) keyIndex*2
+		// cnt flags 0x02 us dev 04 challenge(6) keyIndex*2 (capture
+		// line 694: key index 2 → 04)
 		ch := []byte{msgcnt, challengeFlags, bidcosCmdAck}
 		ch = append(ch, c.hmid[:]...)
 		ch = append(ch, src[:]...)
 		ch = append(ch, bidcosAckChallenge)
 		ch = append(ch, h.challenge[:]...)
 		ch = append(ch, h.keyIndex*2)
-		c.sendOneshot(ch, "aes_challenge_sent")
+		c.sendReply(ch, ts, "aes_challenge_sent")
 		return
 	}
 
@@ -877,12 +1091,13 @@ func (c *DualConn) handleRecv(f frame) {
 	c.deliverLocked(recvFrame(recvResp, info, rssi, msg))
 	c.mu.Unlock()
 	if wantAck {
-		c.sendOneshot(c.ackMsg(msgcnt, src, nil), "software_ack")
+		c.sendReply(c.ackMsg(msgcnt, src, nil), ts, "software_ack")
 	}
 }
 
-// finishAES verifies the device's answer to our challenge.
-func (c *DualConn) finishAES(src [3]byte, h *heldMsg, payload []byte) {
+// finishAES verifies the device's answer (received at ts) to our
+// challenge.
+func (c *DualConn) finishAES(src [3]byte, h *heldMsg, payload []byte, ts uint16) {
 	var ok bool
 	var auth []byte
 	if len(payload) >= 16 {
@@ -899,7 +1114,7 @@ func (c *DualConn) finishAES(src [3]byte, h *heldMsg, payload []byte) {
 	status := byte(recvRespWithAESKO)
 	if ok {
 		status = recvRespWithAESOK
-		c.sendOneshot(c.ackMsg(h.msg[0], src, auth), "software_ack")
+		c.sendReply(c.ackMsg(h.msg[0], src, auth), ts, "software_ack")
 		dualEvents.WithLabelValues("aes_ok").Inc()
 	} else {
 		dualEvents.WithLabelValues("aes_failed").Inc()
@@ -946,10 +1161,10 @@ func (c *DualConn) init(cfg Config, d detection) error {
 	} else if !isAppTag(tag) {
 		return fmt.Errorf("%w: unknown application %q", ErrUnknownModule, tag)
 	}
-	// ASSUMPTION — verify with capture: the module keeps no BidCoS state
-	// (address, peers) worth resetting when it already ran its
-	// application. The classic Conn reboots into the bootloader in that
-	// case; it is not known whether CHANGE_APP toggles back here.
+	// The module keeps no BidCoS state worth resetting: it has no
+	// address or peer configuration (capture: it receives everything,
+	// including device-to-device traffic, line ~180). So unlike Conn, a
+	// running application is not rebooted.
 	c.tag = tag
 
 	// Verify (non-fatal, like RFNETHM boot_probe “Verify auf
@@ -969,9 +1184,11 @@ func (c *DualConn) init(cfg Config, d detection) error {
 	c.entered = true
 	c.mu.Unlock()
 
-	// TODO(docs/SNIFFING.md): the BidCoS address, RX filtering, AES and
-	// duty cycle configuration multimacd sends are not known yet; they
-	// go into Config.DualInit once a capture shows them.
+	// No initialization is needed for receiving and sending: the
+	// capture shows no address or peer configuration, and the module
+	// receives all traffic. Config.DualInit stays as a hook (e.g. for
+	// whatever multimacd sends at its start, which the capture did not
+	// include; see docs/SNIFFING.md).
 	for _, s := range cfg.DualInit {
 		if err := c.runStep(s); err != nil {
 			return err
@@ -1118,8 +1335,9 @@ func (c *DualConn) acquire(ctx context.Context) error {
 func (c *DualConn) release() { <-c.sem }
 
 // AddPeer records p: software ACKs and AES (Config.SoftwareAck,
-// Config.SoftwareAES) only apply to registered peers. Config.DualPeerInit
-// may send further requests (unknown yet, see docs/SNIFFING.md).
+// Config.SoftwareAES) only apply to registered peers. The module itself
+// needs no peer configuration (capture); Config.DualPeerInit may send
+// requests anyway.
 func (c *DualConn) AddPeer(ctx context.Context, p Peer) error {
 	if err := c.Err(); err != nil {
 		return err
@@ -1140,10 +1358,9 @@ func (c *DualConn) AddPeer(ctx context.Context, p Peer) error {
 	return nil
 }
 
-// SetTime does nothing: the classic module needs its clock for AES and
-// its own time answers, but the dual-coprocessor firmware's equivalent
-// (likely an OS/HMSYSTEM command) is not known, and software AES does
-// not need it. TODO(docs/SNIFFING.md).
+// SetTime does nothing: the dual-coprocessor firmware has no clock to
+// set (the host answers the devices' time requests, capture lines
+// 1322-1324; software AES does not need it).
 func (c *DualConn) SetTime(ctx context.Context, t time.Time) error {
 	return c.Err()
 }
@@ -1155,9 +1372,15 @@ func isChallenge(resp []byte) bool {
 
 // Send implements bidcos.Transport: it transmits encoded (as produced
 // by bidcos.Packet.Encode: status info burst cnt flags cmd src dst
-// payload) via LLMAC_SEND and waits for the module's LLMAC_ACK.
+// payload) via LLMAC_SEND and waits for the module's LLMAC_ACK. Burst
+// packets (flag 0x10) are sent with the module's burst mode (preamble).
 //
-// For BiDi packets, it then waits Config.ResponseTimeout for the
+// A packet without BiDi which answers a message the device sent us
+// within the last second (same address, same message counter; e.g. a
+// time answer) is scheduled like OpenCCU does: 100ms after that
+// message on the module clock. Everything else is sent at once.
+//
+// For BiDi packets, Send then waits Config.ResponseTimeout for the
 // device's response (src/dst swapped, same message counter) and
 // retransmits up to Config.SendRetries times before failing with
 // ErrNoResponse. The response is returned as a receive frame (status
@@ -1176,9 +1399,20 @@ func (c *DualConn) Send(ctx context.Context, encoded []byte) ([]byte, error) {
 	}
 	defer c.release()
 
+	opts := sendOpts(sendNow, msg[1])
+	if !bidi {
+		var dev [3]byte
+		copy(dev[:], msg[6:9])
+		c.mu.Lock()
+		if s, ok := c.seen[aesKey{dev, msg[0]}]; ok && c.now().Sub(s.at) <= replyWindow {
+			opts = c.replyOptsLocked(s.ts, msg[1])
+		}
+		c.mu.Unlock()
+	}
+
 	var w *respWaiter
 	if bidi {
-		w = &respWaiter{msgcnt: msg[0], ch: make(chan []byte, 8)}
+		w = &respWaiter{msgcnt: msg[0], ch: make(chan rxMsg, 8)}
 		copy(w.us[:], msg[3:6])
 		copy(w.dev[:], msg[6:9])
 		c.mu.Lock()
@@ -1193,19 +1427,19 @@ func (c *DualConn) Send(ctx context.Context, encoded []byte) ([]byte, error) {
 		}()
 	}
 
-	resp, err := c.transmit(ctx, msg, w, nil)
+	resp, err := c.transmit(ctx, msg, opts, w, nil)
 	if err != nil {
 		countSendError(err)
 		return nil, err
 	}
-	if resp == nil || !isChallenge(resp) {
-		return resp, nil
+	if resp.frame == nil || !isChallenge(resp.frame) {
+		return resp.frame, nil
 	}
-	resp, err = c.answerChallenge(ctx, msg, resp, w)
+	final, err := c.answerChallenge(ctx, msg, resp, w)
 	if err != nil {
 		countSendError(err)
 	}
-	return resp, err
+	return final, err
 }
 
 func countSendError(err error) {
@@ -1223,10 +1457,10 @@ func countSendError(err error) {
 	}
 }
 
-// transmit sends msg and, if w is non-nil, waits for a response
-// accepted by accept (nil: any), retransmitting msg (same message
-// counter) on timeout.
-func (c *DualConn) transmit(ctx context.Context, msg []byte, w *respWaiter, accept func([]byte) bool) ([]byte, error) {
+// transmit sends msg (the first time with opts, retransmissions at
+// once) and, if w is non-nil, waits for a response accepted by accept
+// (nil: any), retransmitting msg (same message counter) on timeout.
+func (c *DualConn) transmit(ctx context.Context, msg []byte, opts [3]byte, w *respWaiter, accept func([]byte) bool) (rxMsg, error) {
 	attempts := 1
 	if w != nil {
 		attempts += c.retries
@@ -1234,19 +1468,22 @@ func (c *DualConn) transmit(ctx context.Context, msg []byte, w *respWaiter, acce
 	for i := 0; i < attempts; i++ {
 		if i > 0 {
 			dualEvents.WithLabelValues("retransmit").Inc()
+			opts = sendOpts(sendNow, msg[1])
 		}
-		if err := c.llmacSend(ctx, msg); err != nil {
-			return nil, err
+		if err := c.llmacSend(ctx, msg, opts); err != nil {
+			return rxMsg{}, err
 		}
 		if w == nil {
-			return nil, nil
+			return rxMsg{}, nil
 		}
+		// The timeout starts at the LLMAC_ACK, i.e. after the
+		// transmission (incl. the burst preamble).
 		t := time.NewTimer(c.responseTimeout)
 	wait:
 		for {
 			select {
 			case r := <-w.ch:
-				if accept == nil || accept(r) {
+				if accept == nil || accept(r.frame) {
 					t.Stop()
 					return r, nil
 				}
@@ -1255,19 +1492,19 @@ func (c *DualConn) transmit(ctx context.Context, msg []byte, w *respWaiter, acce
 				break wait
 			case <-ctx.Done():
 				t.Stop()
-				return nil, ctx.Err()
+				return rxMsg{}, ctx.Err()
 			case <-c.done:
 				t.Stop()
-				return nil, c.Err()
+				return rxMsg{}, c.Err()
 			}
 		}
 	}
-	return nil, fmt.Errorf("%w (%d attempts)", ErrNoResponse, attempts)
+	return rxMsg{}, fmt.Errorf("%w (%d attempts)", ErrNoResponse, attempts)
 }
 
-// answerChallenge answers a device's AES challenge (in chal) to msg and
+// answerChallenge answers a device's AES challenge (chal) to msg and
 // waits for the device's final response.
-func (c *DualConn) answerChallenge(ctx context.Context, msg, chal []byte, w *respWaiter) ([]byte, error) {
+func (c *DualConn) answerChallenge(ctx context.Context, msg []byte, chal rxMsg, w *respWaiter) ([]byte, error) {
 	dualEvents.WithLabelValues("aes_challenge_received").Inc()
 	if c.signer == nil {
 		c.mu.Lock()
@@ -1279,7 +1516,7 @@ func (c *DualConn) answerChallenge(ctx context.Context, msg, chal []byte, w *res
 		}
 		return nil, fmt.Errorf("%w: no AES signer configured", ErrAESFailed)
 	}
-	p := chal[3+minMsgLen:] // 04 c(6) k
+	p := chal.frame[3+minMsgLen:] // 04 c(6) k
 	var challenge [6]byte
 	copy(challenge[:], p[1:7])
 	keyIndex := p[7] / 2
@@ -1291,17 +1528,30 @@ func (c *DualConn) answerChallenge(ctx context.Context, msg, chal []byte, w *res
 	answer := []byte{msg[0], aesAnswerFlags, bidcosCmdAESResponse}
 	answer = append(answer, msg[3:9]...)
 	answer = append(answer, r[:]...)
-	final, err := c.transmit(ctx, answer, w, func(b []byte) bool { return !isChallenge(b) })
+	// Scheduled like our other replies (this direction is not in the
+	// capture).
+	c.mu.Lock()
+	opts := c.replyOptsLocked(chal.ts, answer[1])
+	c.mu.Unlock()
+	final, err := c.transmit(ctx, answer, opts, w, func(b []byte) bool { return !isChallenge(b) })
 	if err != nil {
 		if errors.Is(err, ErrNoResponse) {
 			return nil, fmt.Errorf("%w: no response to our AES answer: %v", ErrAESFailed, err)
 		}
 		return nil, err
 	}
-	if final[3+2] == bidcosCmdAck && len(final) > 3+minMsgLen && final[3+minMsgLen] == bidcosNACK {
-		final[0] = recvRespWithAESKO
-		return final, fmt.Errorf("%w: device NACKed our AES answer", ErrAESFailed)
+	f := final.frame
+	if f[3+2] == bidcosCmdAck && len(f) > 3+minMsgLen && f[3+minMsgLen] == bidcosNACK {
+		f[0] = recvRespWithAESKO
+		return f, fmt.Errorf("%w: device NACKed our AES answer", ErrAESFailed)
 	}
-	final[0] = recvRespWithAESOK
-	return final, nil
+	f[0] = recvRespWithAESOK
+	return f, nil
+}
+
+// setNowForTest replaces the local clock (tests only).
+func (c *DualConn) setNowForTest(now func() time.Time) {
+	c.mu.Lock()
+	c.now = now
+	c.mu.Unlock()
 }

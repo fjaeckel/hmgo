@@ -284,8 +284,8 @@ type Config struct {
 
 	// SoftwareAck makes hmbridge acknowledge BiDi messages of registered
 	// peers addressed to HMID itself (nil: true). The dual-coprocessor
-	// firmware presumably leaves this to the host (OCCU's rfd does the
-	// BidCoS logic in software). ASSUMPTION — verify with a capture.
+	// firmware leaves this to the host (OpenCCU's rfd ACKs in software,
+	// confirmed by a capture). Time requests are answered instead.
 	SoftwareAck *bool
 
 	// SoftwareAES makes hmbridge challenge BiDi messages of peers with
@@ -297,15 +297,23 @@ type Config struct {
 	Signer AESSigner
 
 	// ResponseTimeout is how long Send waits for a device's response
-	// after the module confirmed the transmission, and how long a
-	// received message is held while waiting for the answer to our AES
-	// challenge (default 1s; burst devices need ~360ms preamble).
+	// after the module confirmed the transmission (LLMAC_ACK, which for
+	// burst packets comes after the ~360ms preamble). Default 250ms,
+	// like OpenCCU. A received message is held at most
+	// max(1s, 100ms + 2*ResponseTimeout) for the answer to our AES
+	// challenge.
 	ResponseTimeout time.Duration
 
 	// SendRetries is how often an unanswered BiDi packet is retransmitted
-	// with the same message counter (default 2, like the classic
-	// module's internal retries; negative: none).
+	// with the same message counter (default 3, like OpenCCU; negative:
+	// none).
 	SendRetries int
+
+	// TRXPollInterval is how often the module's TRX status is polled
+	// (default 10s like multimacd; negative disables). It is the
+	// liveness check (unanswered polls count towards MaxAckTimeouts) and
+	// feeds the hmbridge_uartgw_dual_trx_status gauge.
+	TRXPollInterval time.Duration
 
 	// ChangeAppWait is how long to wait for the application announcement
 	// after switching from the bootloader to the application (default
@@ -313,13 +321,14 @@ type Config struct {
 	ChangeAppWait time.Duration
 
 	// DualInit is sent to the module after it entered the application.
-	// Empty by default: how OpenCCU's multimacd configures the module
-	// (BidCoS address, AES, duty cycle, …) is not known yet. TODO: fill
-	// in from an hmsniff capture, see docs/SNIFFING.md.
+	// Empty by default and not needed for receiving and sending: a
+	// capture of OpenCCU shows no address or peer configuration, and the
+	// module receives all traffic. A hook for anything multimacd sends
+	// at its start (not captured yet, see docs/SNIFFING.md).
 	DualInit []InitStep
 
 	// DualPeerInit returns steps registering a peer with the module
-	// (sent by AddPeer). nil: none (TODO, see DualInit).
+	// (sent by AddPeer). nil: none (not needed, see DualInit).
 	DualPeerInit func(p Peer) []InitStep
 
 	// DualFirmwareVersion is reported by FirmwareVersion for the

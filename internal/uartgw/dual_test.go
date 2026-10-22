@@ -15,6 +15,7 @@ import (
 
 	"github.com/fjaeckel/hmgo/internal/bidcos"
 	"github.com/fjaeckel/hmgo/internal/uartgw/fakemod"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 // fakeSigner is a stand-in for the BidCoS AES computation: the answer
@@ -271,8 +272,9 @@ func TestDualSendAck(t *testing.T) {
 	if len(sent) != 1 || !bytes.Equal(sent[0], enc[3:]) {
 		t.Errorf("module sent %x, want %x", sent, enc[3:])
 	}
-	if opts := mod.LLMACOpts(); len(opts) != 1 || !bytes.Equal(opts[0], []byte{0x80, 0x00, 0x80}) {
-		t.Errorf("LLMAC_SEND options = %x", opts)
+	// Burst packets: send now (80 00), burst mode (0x90).
+	if opts := mod.LLMACOpts(); len(opts) != 1 || !bytes.Equal(opts[0], []byte{0x80, 0x00, 0x90}) {
+		t.Errorf("LLMAC_SEND options = %x, want 800090", opts)
 	}
 	// The response is consumed by Send.
 	expectNoRecv(t, c, 100*time.Millisecond)
@@ -286,6 +288,9 @@ func TestDualSendNoBiDi(t *testing.T) {
 	}
 	if n := len(mod.Sent()); n != 1 {
 		t.Errorf("transmitted %d times", n)
+	}
+	if opts := mod.LLMACOpts(); len(opts) != 1 || !bytes.Equal(opts[0], []byte{0x80, 0x00, 0x80}) {
+		t.Errorf("LLMAC_SEND options = %x, want 800080", opts)
 	}
 }
 
@@ -349,8 +354,8 @@ func TestDualSendNoResponse(t *testing.T) {
 	if !errors.Is(err, ErrNoResponse) {
 		t.Fatalf("Send: got %v, want ErrNoResponse", err)
 	}
-	if n := len(mod.Sent()); n != 3 {
-		t.Errorf("transmitted %d times, want 3 (1 + 2 retries)", n)
+	if n := len(mod.Sent()); n != 4 {
+		t.Errorf("transmitted %d times, want 4 (1 + 3 retries)", n)
 	}
 	if d := time.Since(start); d < 300*time.Millisecond {
 		t.Errorf("gave up after %v", d)
@@ -522,18 +527,17 @@ func TestDualSoftwareAck(t *testing.T) {
 		t.Fatalf("unexpected ACKs: %x", sent)
 	}
 
-	// Acked: BiDi message from a peer to us.
+	// Acked: BiDi message from a peer to us, scheduled 100ms after its
+	// reception on the module clock.
 	m := msgBytes(0x5c, 0xa2, 0x10, testDevice, testHMID, 0x06, 0x01, 0x00, 0x00)
-	start := time.Now()
-	mod.InjectLLMACRecv(fakemod.DefaultRSSI, m)
+	ts := mod.Clock()
+	mod.InjectLLMACRecvAt(ts, fakemod.DefaultRSSI, m)
 	sent := waitSent(t, mod, 1)
-	if d := time.Since(start); d > 100*time.Millisecond {
-		t.Errorf("ACK took %v", d)
-	}
 	want := msgBytes(0x5c, 0x80, 0x02, testHMID, testDevice, 0x00)
 	if !bytes.Equal(sent[0], want) {
 		t.Errorf("ACK %x, want %x", sent[0], want)
 	}
+	checkScheduled(t, mod.LLMACSent()[0], ts)
 	if got := recvOne(t, c); got[0] != 0x01 || !bytes.Equal(got[3:], m) {
 		t.Errorf("received %x", got)
 	}
@@ -612,7 +616,14 @@ func TestDualSoftwareAES(t *testing.T) {
 			// The device's 0x03 answer is not delivered.
 			expectNoRecv(t, c, 100*time.Millisecond)
 
-			sent := m.Sent()
+			var sent [][]byte
+			switch tt.mode {
+			case "ok", "ok with auth":
+				sent = waitSent(t, m, 2) // the final ACK is scheduled 100ms after the answer
+			default:
+				time.Sleep(150 * time.Millisecond)
+				sent = m.Sent()
+			}
 			if tt.signer == nil {
 				if len(sent) != 0 {
 					t.Errorf("transmitted %x without a signer", sent)
@@ -622,6 +633,16 @@ func TestDualSoftwareAES(t *testing.T) {
 			challenge := msgBytes(0x61, 0xa0, 0x02, testHMID, testDevice, 0x04, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0x02)
 			if len(sent) < 1 || !bytes.Equal(sent[0], challenge) {
 				t.Fatalf("challenge %x, want %x", sent, challenge)
+			}
+			ls, inj := m.LLMACSent(), m.Injected()
+			ch := ls[0]
+			want := (inj[0].Ts + 100) & 0x7fff
+			if got := uint16(ch.Opts[0])<<8 | uint16(ch.Opts[1]); got != want || ch.Opts[2] != 0x80 {
+				t.Errorf("challenge options %x, want t=%04x", ch.Opts, want)
+			}
+			if len(ls) == 2 {
+				// final ACK: 100ms after the device's AES answer
+				checkScheduled(t, ls[1], inj[1].Ts)
 			}
 			switch tt.mode {
 			case "ok":
@@ -643,18 +664,170 @@ func TestDualSoftwareAES(t *testing.T) {
 	}
 }
 
-func TestDualSoftwareAESExempt(t *testing.T) {
+// checkScheduled checks that s was scheduled 100ms after rxTs and that
+// the (fake) module honoured that.
+func checkScheduled(t *testing.T, s fakemod.LLMACSent, rxTs uint16) {
+	t.Helper()
+	want := (rxTs + 100) & 0x7fff
+	if got := uint16(s.Opts[0])<<8 | uint16(s.Opts[1]); got != want || s.Opts[2] != 0x80 {
+		t.Errorf("LLMAC_SEND options %x, want t=%04x (rx %04x + 100ms), mode 80", s.Opts, want, rxTs)
+	}
+	if d := diff15(s.Ts, want); d < 0 || d > 50 {
+		t.Errorf("transmitted at %04x, scheduled for %04x", s.Ts, want)
+	}
+}
+
+func TestDiff15(t *testing.T) {
+	for _, tt := range []struct {
+		a, b uint16
+		want int
+	}{
+		{0x0010, 0x0000, 0x10},
+		{0x0000, 0x0010, -0x10},
+		{0x0034, 0x7fd0, 100},
+		{0x7fd0, 0x0034, -100},
+	} {
+		if got := diff15(tt.a, tt.b); got != tt.want {
+			t.Errorf("diff15(%04x, %04x) = %d, want %d", tt.a, tt.b, got, tt.want)
+		}
+	}
+}
+
+func TestDualSoftwareAckClockWrap(t *testing.T) {
+	c, mod := openDualTest(t, fakemod.Options{ClockOffset: 0x7f00}, Config{})
+	c.AddPeer(context.Background(), Peer{Addr: testDevice})
+	// Wait until the module clock is just before the wrap.
+	for diff15(mod.Clock(), 0x7fc0) < 0 {
+		time.Sleep(5 * time.Millisecond)
+	}
+	ts := mod.Clock()
+	mod.InjectLLMACRecvAt(ts, fakemod.DefaultRSSI, msgBytes(0x01, 0xa0, 0x10, testDevice, testHMID, 0x06, 0x01, 0x00, 0x00))
+	waitSent(t, mod, 1)
+	checkScheduled(t, mod.LLMACSent()[0], ts)
+}
+
+func TestDualReplyLate(t *testing.T) {
+	c, mod := openDualTest(t, fakemod.Options{}, Config{})
+	c.AddPeer(context.Background(), Peer{Addr: testDevice})
+	// Every reading of the local clock is 200ms later than the previous
+	// one: when the reply is scheduled, rx+100ms has passed.
+	var calls int
+	c.setNowForTest(func() time.Time {
+		calls++
+		return time.Now().Add(time.Duration(calls) * 200 * time.Millisecond)
+	})
+	mod.InjectLLMACRecv(fakemod.DefaultRSSI, msgBytes(0x02, 0xa0, 0x10, testDevice, testHMID, 0x06, 0x01, 0x00, 0x00))
+	waitSent(t, mod, 1)
+	if s := mod.LLMACSent()[0]; s.Opts != [3]byte{0x80, 0x00, 0x80} {
+		t.Errorf("late reply options %x, want 800080 (now)", s.Opts)
+	}
+}
+
+func TestDualTimeRequest(t *testing.T) {
 	c, mod := openDualTest(t, fakemod.Options{}, Config{Signer: fakeSigner{}})
 	c.AddPeer(context.Background(), Peer{Addr: testDevice, KeyIndex: 1, AESChannels: []byte{1}})
-	// Time requests are not challenged (but acked).
-	m := msgBytes(0x70, 0xa0, 0x3f, testDevice, testHMID)
-	mod.InjectLLMACRecv(fakemod.DefaultRSSI, m)
+	// Time requests are neither challenged nor acked: the bridge
+	// answers them (capture lines 1322-1324).
+	ts := mod.Clock()
+	mod.InjectLLMACRecvAt(ts, fakemod.DefaultRSSI, msgBytes(0x70, 0xa0, 0x3f, testDevice, testHMID))
 	if got := recvOne(t, c); got[0] != 0x01 {
 		t.Errorf("received %x", got)
 	}
-	sent := waitSent(t, mod, 1)
-	if sent[0][2] != 0x02 || sent[0][9] != 0x00 {
-		t.Errorf("sent %x, want a plain ACK", sent[0])
+
+	// The bridge's answer (no BiDi, same counter) is scheduled
+	// relative to the request.
+	answer := &bidcos.Packet{Msgcnt: 0x70, FixedMsgcnt: true, Flags: bidcos.RepeatEnable, Cmd: 0x3f,
+		Source: testHMID, Dest: testDevice, Payload: []byte{0x02, 0x04, 0x32, 0x6c, 0x7f, 0x6b}}
+	if _, err := c.Send(context.Background(), answer.Encode()); err != nil {
+		t.Fatal(err)
+	}
+	ls := mod.LLMACSent()
+	if len(ls) != 1 || ls[0].Msg[2] != 0x3f {
+		t.Fatalf("sent %v, want only the time answer (no ACK)", ls)
+	}
+	checkScheduled(t, ls[0], ts)
+
+	// Any other non-BiDi packet is sent at once.
+	if _, err := c.Send(context.Background(), noBiDiPacket(0x71)); err != nil {
+		t.Fatal(err)
+	}
+	if s := mod.LLMACSent()[1]; s.Opts != [3]byte{0x80, 0x00, 0x80} {
+		t.Errorf("options %x, want 800080", s.Opts)
+	}
+}
+
+func TestDualRetryDefaults(t *testing.T) {
+	mod, rw := fakemod.New(fakemod.Options{DualCoPro: true, OnLLMACSend: func([]byte) [][]byte { return nil }})
+	defer mod.Close()
+	m, err := OpenModule(rw, Config{HMID: testHMID, Timeout: time.Second, AnnounceWait: 200 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	if _, err := m.Send(context.Background(), bidiPacket(0x50).Encode()); !errors.Is(err, ErrNoResponse) {
+		t.Fatalf("Send: got %v, want ErrNoResponse", err)
+	}
+	sent := mod.LLMACSent()
+	if len(sent) != 4 {
+		t.Fatalf("transmitted %d times, want 4 (1 + 3 retries, like OpenCCU)", len(sent))
+	}
+	for i := 1; i < len(sent); i++ {
+		if d := sent[i].At.Sub(sent[i-1].At); d < 240*time.Millisecond || d > 600*time.Millisecond {
+			t.Errorf("retransmission %d after %v, want ~250ms", i, d)
+		}
+		if !bytes.Equal(sent[i].Msg, sent[0].Msg) {
+			t.Errorf("retransmission %x differs", sent[i].Msg)
+		}
+	}
+}
+
+func TestDualBurstResponseTimeoutFromAck(t *testing.T) {
+	// The LLMAC_ACK of a burst transmission comes after the preamble;
+	// the response timeout starts there.
+	c, _ := openDualTest(t, fakemod.Options{BurstDelay: 300 * time.Millisecond}, Config{})
+	pkt := bidiPacket(0x51)
+	pkt.Flags |= bidcos.Burst
+	if _, err := c.Send(context.Background(), pkt.Encode()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDualTRXPoll(t *testing.T) {
+	c, mod := openDualTest(t, fakemod.Options{TRXStatus: 0x07}, Config{TRXPollInterval: 20 * time.Millisecond})
+	deadline := time.Now().Add(2 * time.Second)
+	for testutil.ToFloat64(dualTRXStatus) != 7 || mod.TRXPolls() < 2 {
+		if time.Now().After(deadline) {
+			t.Fatalf("gauge %v after %d polls", testutil.ToFloat64(dualTRXStatus), mod.TRXPolls())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if c.Err() != nil {
+		t.Fatal(c.Err())
+	}
+
+	// Unanswered polls make the connection fail.
+	c2, _ := openDualTest(t, fakemod.Options{TRXNoReply: true}, Config{TRXPollInterval: 20 * time.Millisecond, Timeout: 50 * time.Millisecond})
+	select {
+	case <-c2.done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("connection still up")
+	}
+	if !errors.Is(c2.Err(), ErrModuleUnresponsive) {
+		t.Fatalf("Err = %v, want ErrModuleUnresponsive", c2.Err())
+	}
+}
+
+func TestDualIgnoredFrames(t *testing.T) {
+	c, mod := openDualTest(t, fakemod.Options{}, Config{})
+	// HMIP traffic and unsolicited TRX frames (capture lines 940, 1094).
+	mod.WriteRaw(fakemod.Frame{Dst: fakemod.DstHMIP, Cnt: 0x02, Cmd: 0x07, Payload: []byte{0x80, 0x10, 0x00, 0x8e}}.Encode())
+	mod.WriteRaw(fakemod.Frame{Dst: fakemod.DstApp, Cnt: 0x01, Cmd: 0x0b, Payload: []byte{0x00, 0x01}}.Encode())
+	expectNoRecv(t, c, 100*time.Millisecond)
+	if c.Err() != nil {
+		t.Fatal(c.Err())
+	}
+	if _, err := c.Send(context.Background(), bidiPacket(0x52).Encode()); err != nil {
+		t.Fatal(err)
 	}
 }
 

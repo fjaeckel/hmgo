@@ -135,6 +135,18 @@ type Options struct {
 	// transmitted BidCoS message (default 0x01 OK; NoAck: no ack).
 	LLMACAckStatus func(msg []byte) byte
 
+	// ClockOffset (DualCoPro) is the module clock at start.
+	ClockOffset uint16
+
+	// BurstDelay (DualCoPro) delays the LLMAC_ACK of burst
+	// transmissions (the real module: ~360ms preamble). Default 0.
+	BurstDelay time.Duration
+
+	// TRXStatus (DualCoPro) is the value of TRX status poll replies
+	// ([04 01 xx], default 0x02). TRXNoReply ignores the polls.
+	TRXStatus  byte
+	TRXNoReply bool
+
 	// OnLLMACSend (DualCoPro) emulates the devices: it is called for
 	// every successfully transmitted BidCoS message (cnt flags cmd src
 	// dst payload) and returns the messages the devices answer with,
@@ -186,6 +198,10 @@ type Module struct {
 	readErr error
 
 	llmacOpts  [][]byte
+	llmacSent  []LLMACSent
+	injected   []Injected
+	trxPolls   int
+	clockStart time.Time
 	changeApps int
 	identifies int
 	ts         uint16
@@ -216,6 +232,8 @@ func New(opts Options) (*Module, io.ReadWriteCloser) {
 		keys:  make(map[byte][]byte),
 		peers: make(map[[3]byte]*Peer),
 		done:  make(chan struct{}),
+
+		clockStart: time.Now(),
 	}
 	m.wg.Add(1)
 	go m.serve()
