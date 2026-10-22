@@ -86,8 +86,8 @@ The RPI-RF-MOD carries a real-time clock (Epson RX8130 at I²C address 0x32)
 and an RGB status LED. hmbridge needs neither, but the RTC keeps the time
 over a power cut without network, and with it hmbridge recognizes the
 RPI-RF-MOD without asking it. Raspberry Pi's `i2c-rtc` overlay has no RX8130
-option, so hmbridge brings its own overlay (**not verified on hardware
-yet**):
+option, so hmbridge brings its own overlay for the **Raspberry Pi 3 and 4**
+(**not verified on hardware yet**; Pi 5: see the note below):
 
 ```sh
 sudo apt install device-tree-compiler
@@ -101,7 +101,14 @@ Then `cat /sys/bus/i2c/devices/1-0032/name` shows `rx8130`, `/dev/rtc0`
 exists and `sudo hwclock -r` (package `util-linux-extra`) reads the clock.
 To have the clock set from the RTC at boot instead of from the last
 shutdown, `sudo apt purge fake-hwclock`. The LEDs appear as
-`/sys/class/leds/rpi_rf_mod:{red,green,blue}`. hmbridge still hands out the
+`/sys/class/leds/rpi_rf_mod:{red,green,blue}`.
+
+**Pi 5 (unverified):** the header's GPIOs are on the RP1 chip there
+(`&rp1_gpio`), not on the SoC's `&gpio`, which the overlay's LED part uses:
+on a Pi 5 it would drive SoC pins instead of the module's LEDs. Use the
+overlay on a Pi 5 only after replacing `&gpio` by `&rp1_gpio` in its LED
+fragment (`sed -i 's/<&gpio /<\&rp1_gpio /' hmbridge-rpi-rf-mod.dts`), or
+delete that fragment and keep the RTC part. hmbridge still hands out the
 time to the devices only once NTP has synchronised the clock
 (`require_synced_clock`).
 
@@ -188,8 +195,11 @@ The key is never printed and never written into `config.json`. **Back up
 `system.key`** (and later `devices.json`) somewhere safe: without it, every
 device that got the key while pairing must be factory-reset and paired
 again. hmbridge warns (log, `GET /api/v1/health`, `-check_config`) if the key file is
-accessible by its group or other users. `hmbridge init` never overwrites an
-existing configuration or key file.
+accessible by its group or other users or belongs to another user than root
+or `hmbridge`, and refuses a key file that is a symbolic link, FIFO or device
+(name the file itself). With `-key_file` in a directory that does not exist
+yet, `hmbridge init` creates it `root:hmbridge` 0750. `hmbridge init` never
+overwrites an existing configuration or key file.
 
 For scripts: `hmbridge init -non_interactive -mqtt_broker tcp://ha.lan:1883
 -mqtt_username hmbridge -mqtt_password_file /root/mqtt-pw` (`-` reads the
@@ -504,11 +514,16 @@ is attached first; `reset_gpio` overrides the line). The steps of the
 The [HTTP API](#http-api) and `/metrics` listen on all interfaces (`:8013`)
 so that Prometheus and monitoring can reach them. They are read-only (only
 `GET` and `HEAD`; everything else gets "405 Method Not Allowed") and contain
-no keys or passwords, but they are not harmless: they show every device's
-name, model, address, serial number, state and battery level (which windows
-are open, whether someone is home). Set `"http_listen": "127.0.0.1:8013"` to
-keep them local (and scrape through an SSH tunnel or a local Prometheus
-agent), or restrict port 8013 in your firewall.
+no keys or passwords, but they are **not authenticated** and not harmless:
+anyone who reaches the port sees every device's name, model, address,
+serial number, state and battery level (which windows are open, whether
+someone is home), the device settings, the radio module's serial number and
+SGTIN, the central address, the `state_dir` path and, in `warnings`, the
+paths of the configuration and key files (e.g. when their permissions are
+too open). Set `"http_listen": "127.0.0.1:8013"` to keep them local (and
+scrape through an SSH tunnel or a local Prometheus agent), or allow port
+8013 only from your monitoring host in the firewall, e.g.
+`nft add rule inet filter input tcp dport 8013 ip saddr != 192.168.1.10 drop`.
 
 Requests must name hmbridge in their `Host` header: an IP address,
 `localhost`, the machine's host name (also `<name>.local`), or a name listed
@@ -526,6 +541,11 @@ done in Home Assistant (MQTT) only. All responses are JSON
 RFC 3339); errors are `{"error": "…"}` with 404 (unknown path or device) or
 405 (any method but `GET`/`HEAD`, with `Allow: GET, HEAD`). No response ever
 contains key material: devices show their AES channels and key index only.
+There is no authentication: what it exposes (device serials and states, the
+module's serial and SGTIN, `state_dir`, file paths in `warnings`) is
+readable by everyone who reaches the port; restrict it as described in
+[3b](#3b-running-on-raspberry-pi-os-final-setup) (`"http_listen": "127.0.0.1:8013"` or a
+firewall rule).
 
 | endpoint | content |
 |---|---|

@@ -90,19 +90,22 @@ func TestKeyFilePermissionWarnings(t *testing.T) {
 	}
 
 	for _, tt := range []struct {
-		perm      os.FileMode
-		uid, euid int
-		n         int
+		perm              os.FileMode
+		uid, euid, svcUID int
+		n                 int
 	}{
-		{0o600, 1000, 1000, 0},
-		{0o400, 0, 1000, 0},
-		{0o600, 1000, 0, 0}, // root checking hmbridge's file
-		{0o604, 1000, 1000, 1},
-		{0o620, 1000, 1000, 1},
-		{0o600, 1001, 1000, 1},
+		{0o600, 1000, 1000, 1000, 0},
+		{0o400, 0, 1000, 1000, 0},
+		{0o600, 1000, 0, 1000, 0}, // root checking hmbridge's file
+		{0o600, 0, 0, -1, 0},      // root's own file
+		{0o600, 1001, 0, 1000, 1}, // root: another user's file
+		{0o600, 1001, 0, -1, 1},   // root, no hmbridge user
+		{0o604, 1000, 1000, 1000, 1},
+		{0o620, 1000, 1000, 1000, 1},
+		{0o600, 1001, 1000, 1000, 1},
 	} {
-		if got := checkKeyFilePermissions("k", tt.perm, tt.uid, tt.euid); len(got) != tt.n {
-			t.Errorf("%04o uid %d euid %d: %q", tt.perm, tt.uid, tt.euid, got)
+		if got := checkKeyFilePermissions("k", tt.perm, tt.uid, tt.euid, tt.svcUID); len(got) != tt.n {
+			t.Errorf("%04o uid %d euid %d service uid %d: %q", tt.perm, tt.uid, tt.euid, tt.svcUID, got)
 		}
 	}
 }

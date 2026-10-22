@@ -58,6 +58,32 @@ func (m *Model) Locs() []Loc {
 	return res
 }
 
+// OwnsRegisters reports whether the registers of s belong to s alone:
+// s uses all their bits and no other setting of m uses any of them.
+// Only such a setting can be written without first reading the current
+// values of its registers from the device.
+func (m *Model) OwnsRegisters(s *Setting) bool {
+	if !s.coversRegisters() {
+		return false
+	}
+	mine := map[byte]bool{}
+	for _, a := range s.Registers() {
+		mine[a] = true
+	}
+	for i := range m.Settings {
+		o := &m.Settings[i]
+		if o.Key == s.Key || o.Loc != s.Loc {
+			continue
+		}
+		for _, a := range o.Registers() {
+			if mine[a] {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 // ForModel returns the settings description of model (nil if hmbridge
 // exposes no settings for it).
 func ForModel(model string) *Model {

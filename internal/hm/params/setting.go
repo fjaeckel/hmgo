@@ -209,6 +209,21 @@ func (s *Setting) Value(r Regs) (any, bool) {
 	return s.valueOf(raw)
 }
 
+// Invalid reports why the value r holds for s is not one hmbridge would
+// write (nil if it is valid or not known). Value still shows such a
+// value where it can be represented: a week profile day with
+// temperatures outside 5 … 30 °C.
+func (s *Setting) Invalid(r Regs) error {
+	if s.Kind != Profile {
+		return nil
+	}
+	d, err := DecodeDay(r, s.ProfileBase, s.Day)
+	if err != nil {
+		return nil // not shown at all
+	}
+	return ValidateDay(d)
+}
+
 func (s *Setting) valueOf(raw uint32) (any, bool) {
 	switch s.Kind {
 	case Number:
@@ -274,6 +289,47 @@ func NewChange(s *Setting, value string) (Change, error) {
 		return Change{}, err
 	}
 	return Change{Setting: s, Raw: raw}, nil
+}
+
+// Registers returns the addresses of the registers s occupies (a week
+// profile day: its 26 registers).
+func (s *Setting) Registers() []byte {
+	if s.Kind == Profile {
+		start := dayStart(s.ProfileBase, s.Day)
+		res := make([]byte, dayRegs)
+		for i := range res {
+			res[i] = byte(start + i)
+		}
+		return res
+	}
+	res := make([]byte, s.Field.Bytes)
+	for i := range res {
+		res[i] = s.Field.Index + byte(i)
+	}
+	return res
+}
+
+// coversRegisters reports whether s uses every bit of its registers.
+func (s *Setting) coversRegisters() bool { return s.Kind == Profile || s.Field.full() }
+
+// VerifyRegisters checks that r (read back from the device) holds every
+// register c touches exactly as in want (the registers written,
+// including the bits of other settings sharing them), not only the
+// bits of c.
+func (c Change) VerifyRegisters(want, r Regs) error {
+	if err := c.Verify(r); err != nil {
+		return err
+	}
+	for _, a := range c.Setting.Registers() {
+		w, ok := want[a]
+		if !ok {
+			continue
+		}
+		if got, ok := r[a]; !ok || got != w {
+			return fmt.Errorf("read back register %d = %s, wrote %02x (bits of settings sharing it differ)", a, regString(r, a), w)
+		}
+	}
+	return nil
 }
 
 // Known reports whether r holds the registers needed to apply c (the

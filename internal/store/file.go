@@ -427,15 +427,40 @@ func syncDir(dir string) {
 	}
 }
 
-// WriteFileNew creates path with data (mode 0600) only if nothing
-// exists at path yet; otherwise it fails with an error matching
-// fs.ErrExist and leaves the existing file alone. Like WriteFileAtomic,
-// the content is written to a temporary file in the same directory and
-// fsynced first, so that path never exists with partial content; the
-// temporary file is then hard-linked to path, which fails atomically if
-// path exists (also as a symbolic link). The directory is created (mode
-// 0700) if missing.
-func WriteFileNew(path string, data []byte) error {
+// NewFileOption is an option of WriteFileNew.
+type NewFileOption func(*newFileOptions)
+
+type newFileOptions struct {
+	uid, gid int
+	mode     os.FileMode
+}
+
+// WithOwner makes WriteFileNew give the file the owner uid and group
+// gid (-1 keeps one), set on the temporary file before it gets its
+// name (fchown: no path is followed).
+func WithOwner(uid, gid int) NewFileOption {
+	return func(o *newFileOptions) { o.uid, o.gid = uid, gid }
+}
+
+// WithMode makes WriteFileNew create the file with mode instead of
+// FileMode.
+func WithMode(mode os.FileMode) NewFileOption {
+	return func(o *newFileOptions) { o.mode = mode }
+}
+
+// WriteFileNew creates path with data (mode 0600, see WithMode and
+// WithOwner) only if nothing exists at path yet; otherwise it fails with
+// an error matching fs.ErrExist and leaves the existing file alone. Like
+// WriteFileAtomic, the content is written to a temporary file in the
+// same directory and fsynced first, so that path never exists with
+// partial content; the temporary file gets its owner and mode before it
+// is hard-linked to path, which fails atomically if path exists (also
+// as a symbolic link). The directory is created (mode 0700) if missing.
+func WriteFileNew(path string, data []byte, opts ...NewFileOption) error {
+	o := newFileOptions{uid: -1, gid: -1, mode: FileMode}
+	for _, opt := range opts {
+		opt(&o)
+	}
 	if _, err := os.Lstat(path); err == nil {
 		return &os.PathError{Op: "create", Path: path, Err: fs.ErrExist}
 	}
@@ -448,7 +473,12 @@ func WriteFileNew(path string, data []byte) error {
 		return err
 	}
 	defer os.Remove(tmp.Name())
-	err = tmp.Chmod(FileMode)
+	if o.uid >= 0 || o.gid >= 0 {
+		err = tmp.Chown(o.uid, o.gid)
+	}
+	if err == nil {
+		err = tmp.Chmod(o.mode)
+	}
 	if err == nil {
 		_, err = tmp.Write(data)
 	}

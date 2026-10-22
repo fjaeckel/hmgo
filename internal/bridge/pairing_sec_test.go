@@ -483,3 +483,35 @@ func TestUnpairDropsPendingPair(t *testing.T) {
 	}
 	e.waitFor("peer removed", func() bool { _, ok := e.mod.Peers()[newPlug]; return !ok })
 }
+
+// Re-pairing a device that kept the system key: in the retry with the
+// system key as the old key, a plain (unauthenticated) ACK to part 1
+// does not prove that the device holds the key (anyone could have sent
+// it); without part 2 the outcome stays unknown and AES is not enabled.
+func TestRepairKeyExchangePart1NeedsAuthenticatedACK(t *testing.T) {
+	hook := &onSendHook{}
+	file := filepath.Join(t.TempDir(), "devices.json")
+	e := newEnvWith(t, pairingConfig(filepath.Dir(file)), fakemod.Options{OnSend: hook.onSend}, fastPairing)
+	hook.set(func(msg []byte) (byte, []byte) {
+		if to(msg, newSCo) && msg[2] == 0x04 {
+			switch msg[len(msg)-1] {
+			case 0x04: // part 1 from key index 2: a forged plain ACK
+				return fakemod.AckWithResponse, fakemod.DeviceAck(msg)
+			default: // from the default key, and part 2: no answer
+				return fakemod.AckEUnknown, nil
+			}
+		}
+		return fakemod.DefaultOnSend(msg)
+	})
+	e.b.Commands() <- ha.Command{Kind: ha.StartPairing}
+	e.waitFor("pairing mode", func() bool { return e.pairingState()["active"] == true })
+	e.inject(0x01, deviceInfo(newSCo, [3]byte{}, 0x00c7, "NEQ0000002"))
+	e.waitFor("paired", func() bool { return strings.HasPrefix(e.lastResult(), "paired HM-Sec-SCo NEQ0000002") })
+	if res := e.lastResult(); strings.Contains(res, "AES on channels") || !strings.Contains(res, "part 2") {
+		t.Errorf("result %q", res)
+	}
+	devs := e.waitDevices(file, "stored", func(d []store.Device) bool { return len(d) == 1 })
+	if devs[0].KeyIndex == 2 || len(devs[0].AESChannels) != 0 {
+		t.Errorf("stored %+v", devs[0])
+	}
+}

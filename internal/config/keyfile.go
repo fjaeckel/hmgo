@@ -24,7 +24,7 @@ func readKeyFile(path string) (string, []string, error) {
 	if !filepath.IsAbs(path) {
 		return "", nil, fmt.Errorf("%q must be an absolute path", path)
 	}
-	f, err := os.Open(path)
+	f, fi, err := openKeyFile(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return "", nil, fmt.Errorf("%s does not exist (hmbridge init creates it)", path)
@@ -32,13 +32,6 @@ func readKeyFile(path string) (string, []string, error) {
 		return "", nil, err
 	}
 	defer f.Close()
-	fi, err := f.Stat()
-	if err != nil {
-		return "", nil, err
-	}
-	if !fi.Mode().IsRegular() {
-		return "", nil, fmt.Errorf("%s is not a regular file", path)
-	}
 	b, err := io.ReadAll(io.LimitReader(f, maxKeyFileSize+1))
 	if err != nil {
 		return "", nil, fmt.Errorf("reading %s: %w", path, err)

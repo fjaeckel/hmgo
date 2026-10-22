@@ -288,15 +288,32 @@ func runInit(args []string, env initEnv) int {
 	}
 
 	// Write the key, check the whole configuration, then write it.
-	if err := os.MkdirAll(*stateDir, store.DirMode); err != nil {
+	// Owners are set on open files and directories (fchown), never by
+	// path: the state directory belongs to hmbridge, and a path in it
+	// could be replaced by a symbolic link meanwhile.
+	//
+	// The state directory: 0700, owned by hmbridge.
+	if err := mkdirOwned(*stateDir, store.DirMode, uid, gid); err != nil {
 		return fail("%v", err)
 	}
 	if uid >= 0 {
-		if err := os.Chown(*stateDir, uid, gid); err != nil {
+		if err := chownDir(*stateDir, uid, gid, 0); err != nil {
 			return fail("%v", err)
 		}
 	}
-	if err := store.WriteFileNew(*keyFile, keyHex); err != nil {
+	// A key file elsewhere (-key_file): its missing directory is created
+	// 0750 root:hmbridge (hmbridge can read the key, not replace it), or
+	// 0700 when not run as root.
+	if keyDir := filepath.Dir(*keyFile); keyDir != *stateDir {
+		mode, kuid := os.FileMode(0o700), -1
+		if uid >= 0 {
+			mode, kuid = 0o750, 0
+		}
+		if err := mkdirOwned(keyDir, mode, kuid, gid); err != nil {
+			return fail("%v", err)
+		}
+	}
+	if err := store.WriteFileNew(*keyFile, keyHex, store.WithOwner(uid, gid)); err != nil {
 		return fail("writing the key file: %v", err)
 	}
 	removeKey := func() {
@@ -304,31 +321,22 @@ func runInit(args []string, env initEnv) int {
 			fmt.Fprintf(env.errOut, "hmbridge init: removing %s again: %v\n", *keyFile, err)
 		}
 	}
-	if uid >= 0 {
-		if err := os.Chown(*keyFile, uid, gid); err != nil {
-			removeKey()
-			return fail("%v", err)
-		}
-	}
 	if _, err := config.Parse(cfgJSON); err != nil {
 		removeKey()
 		return fail("the generated configuration is invalid: %v", err)
 	}
-	if err := os.MkdirAll(filepath.Dir(*cfgPath), 0o755); err != nil {
+	if err := mkdirOwned(filepath.Dir(*cfgPath), 0o755, -1, -1); err != nil {
 		removeKey()
 		return fail("%v", err)
 	}
-	if err := store.WriteFileNew(*cfgPath, cfgJSON); err != nil {
+	// Readable by hmbridge's group (it holds the MQTT password).
+	cfgOpts := []store.NewFileOption{}
+	if uid >= 0 {
+		cfgOpts = append(cfgOpts, store.WithOwner(0, gid), store.WithMode(0o640))
+	}
+	if err := store.WriteFileNew(*cfgPath, cfgJSON, cfgOpts...); err != nil {
 		removeKey()
 		return fail("writing the configuration: %v", err)
-	}
-	// Readable by hmbridge's group (it holds the MQTT password).
-	if uid >= 0 {
-		if err := os.Chown(*cfgPath, 0, gid); err != nil {
-			fmt.Fprintf(env.errOut, "warning: %v\n", err)
-		} else if err := os.Chmod(*cfgPath, 0o640); err != nil {
-			fmt.Fprintf(env.errOut, "warning: %v\n", err)
-		}
 	}
 
 	fmt.Fprintf(env.out, "created %s (central address %06X, %s)\n", *cfgPath, addr[:], describeMQTT(gen.MQTT))
@@ -338,6 +346,48 @@ func runInit(args []string, env initEnv) int {
 	}
 	fmt.Fprintf(env.out, "next: sudo -u %s hmbridge -check_config -config %s, then systemctl enable --now hmbridge\n", ownerOr(*owner), *cfgPath)
 	return 0
+}
+
+// mkdirOwned creates path and its missing parents. Parents get mode
+// 0755 and the caller's owner; path itself gets mode and, where uid or
+// gid is >= 0, that owner. An existing path is left alone.
+func mkdirOwned(path string, mode os.FileMode, uid, gid int) error {
+	path = filepath.Clean(path)
+	if fi, err := os.Stat(path); err == nil {
+		if !fi.IsDir() {
+			return fmt.Errorf("%s is not a directory", path)
+		}
+		return nil
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	if err := mkdirOwned(filepath.Dir(path), 0o755, -1, -1); err != nil {
+		return err
+	}
+	if err := os.Mkdir(path, mode); err != nil {
+		return err
+	}
+	return chownDir(path, uid, gid, mode)
+}
+
+// chownDir sets the owner (uid, gid; -1 keeps one) and, unless mode is
+// 0, the mode (not limited by the umask) of the directory path, on the
+// opened directory: a symbolic link at path is refused, never followed.
+func chownDir(path string, uid, gid int, mode os.FileMode) error {
+	f, err := os.OpenFile(path, os.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if uid >= 0 || gid >= 0 {
+		if err := f.Chown(uid, gid); err != nil {
+			return err
+		}
+	}
+	if mode != 0 {
+		return f.Chmod(mode)
+	}
+	return nil
 }
 
 func ownerOr(u string) string {

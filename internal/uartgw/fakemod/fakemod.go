@@ -106,9 +106,11 @@ type Options struct {
 
 	// ChallengeAES emulates AES devices: a response (ack status 0x03) to
 	// a command for a channel on which AES is enabled for the peer
-	// (SET 0x11: payload byte 1, CONFIG 0x01: byte 0; other commands
-	// are not challenged) is reported as authenticated (0x0c), as if the
-	// device had challenged the command and the module had answered.
+	// (SET 0x11: payload byte 1, CONFIG 0x01: byte 0; CONFIG_START and
+	// CONFIG_WRITE_INDEX of channel 0 if any channel uses AES; other
+	// commands are not challenged) is reported as authenticated (0x0c),
+	// as if the device had challenged the command and the module had
+	// answered.
 	ChallengeAES bool
 
 	// OnOS, if non-nil, is called for every request on DstOS before the
@@ -556,6 +558,16 @@ func (m *Module) aesCommand(msg []byte) bool {
 	switch {
 	case msg[2] == 0x11 && len(msg) >= 11:
 		return p.AES[msg[10]]
+	case msg[2] == 0x01 && len(msg) >= 11 && msg[9] == 0 && (msg[10] == 0x05 || msg[10] == 0x08):
+		// CONFIG_START and CONFIG_WRITE_INDEX of channel 0 (list 0, the
+		// thermostats' list 7) are challenged as soon as any channel
+		// uses AES (AskSinPP validSignature(0)).
+		for _, on := range p.AES {
+			if on {
+				return true
+			}
+		}
+		return false
 	case msg[2] == 0x01 && len(msg) >= 10:
 		return p.AES[msg[9]]
 	}

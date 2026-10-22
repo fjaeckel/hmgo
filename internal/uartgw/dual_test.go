@@ -1729,3 +1729,142 @@ func TestDualSoftwareAESCounterReuse(t *testing.T) {
 	}
 	expectNoRecv(t, c, 100*time.Millisecond)
 }
+
+// regReadEnv is a DualConn with an AES peer that answers a register
+// read (CONFIG_PARAM_REQ, sent with burst so that its LLMAC_ACK comes
+// late) with frames; onRequest runs when the module got the request,
+// before its LLMAC_ACK.
+func regReadEnv(t *testing.T, frames int, end bool, onRequest func(mod *fakemod.Module)) (*DualConn, *fakemod.Module) {
+	t.Helper()
+	var mod *fakemod.Module
+	var modMu sync.Mutex
+	isReq := func(m []byte) bool { return len(m) >= 11 && m[2] == 0x01 && m[10] == 0x04 }
+	opts := fakemod.Options{
+		BurstDelay: 200 * time.Millisecond,
+		LLMACAckStatus: func(m []byte) byte {
+			if isReq(m) && onRequest != nil {
+				modMu.Lock()
+				md := mod
+				modMu.Unlock()
+				go onRequest(md)
+			}
+			return fakemod.LLMACStatusOK
+		},
+		OnLLMACSend: func(m []byte) [][]byte {
+			if !isReq(m) {
+				return nil
+			}
+			var res [][]byte
+			for i := 0; i < frames; i++ {
+				p := []byte{0x02, byte(2*i + 1), 0x11}
+				if end && i == frames-1 {
+					p = append(p, 0, 0)
+				}
+				res = append(res, msgBytes(m[0]+byte(i), 0xa0, 0x10, testDevice, testHMID, p...))
+			}
+			return res
+		},
+	}
+	c, md := openDualTest(t, opts, Config{Signer: fakeSigner{}, Rand: bytes.NewReader(bytes.Repeat([]byte{0xa5}, 1024))})
+	modMu.Lock()
+	mod = md
+	modMu.Unlock()
+	if err := c.AddPeer(context.Background(), Peer{Addr: testDevice, KeyIndex: 1, Channels: 2, AESChannels: []byte{1}}); err != nil {
+		t.Fatal(err)
+	}
+	return c, md
+}
+
+func readRequest(cnt byte) []byte {
+	p := &bidcos.Packet{Msgcnt: cnt, Flags: 0xb0, Cmd: 0x01, Source: testHMID, Dest: testDevice, Payload: []byte{0x00, 0x04, 0, 0, 0, 0, 0x07}}
+	return p.Encode()
+}
+
+// answersTo returns how the frame with counter cnt from testDevice was
+// answered: "ack" (plain software ACK), "challenge" or "".
+func answersTo(mod *fakemod.Module, cnt byte) string {
+	for _, m := range mod.Sent() {
+		if len(m) >= 10 && m[0] == cnt && m[2] == 0x02 && [3]byte(m[6:9]) == testDevice {
+			if m[9] == 0x04 {
+				return "challenge"
+			}
+			return "ack"
+		}
+	}
+	return ""
+}
+
+// The register read window opens with the request's LLMAC_ACK: a
+// forged answer frame that arrives while the request is still being
+// transmitted is challenged like any frame of an AES peer, not taken
+// as part of the read.
+func TestDualRegReadWindowOpensAfterLLMACAck(t *testing.T) {
+	c, mod := regReadEnv(t, 2, true, func(mod *fakemod.Module) {
+		time.Sleep(50 * time.Millisecond)
+		mod.InjectLLMACRecv(fakemod.DefaultRSSI, msgBytes(0x70, 0xa0, 0x10, testDevice, testHMID, 0x02, 0x09, 0xff, 0, 0))
+	})
+	if _, err := c.Send(context.Background(), readRequest(0x40)); err != nil {
+		t.Fatal(err)
+	}
+	waitSent(t, mod, 3)
+	time.Sleep(50 * time.Millisecond)
+	if got := answersTo(mod, 0x70); got != "challenge" {
+		t.Errorf("early forged frame answered with %q, want a challenge", got)
+	}
+	if got := answersTo(mod, 0x41); got != "ack" {
+		t.Errorf("the read's second frame answered with %q", got)
+	}
+}
+
+// The window closes with the end marker: a forged answer frame after
+// the read is challenged.
+func TestDualRegReadWindowClosesAtEnd(t *testing.T) {
+	c, mod := regReadEnv(t, 3, true, nil)
+	if _, err := c.Send(context.Background(), readRequest(0x40)); err != nil {
+		t.Fatal(err)
+	}
+	waitSent(t, mod, 4) // request, ACKs of three frames
+	for i := 0; i < 2; i++ {
+		recvOne(t, c) // the further frames are delivered
+	}
+	mod.InjectLLMACRecv(fakemod.DefaultRSSI, msgBytes(0x71, 0xa0, 0x10, testDevice, testHMID, 0x02, 0x09, 0xff, 0, 0))
+	waitSent(t, mod, 5)
+	if got := answersTo(mod, 0x71); got != "challenge" {
+		t.Errorf("forged frame after the end answered with %q, want a challenge", got)
+	}
+	c.mu.Lock()
+	n := len(c.regReads)
+	c.mu.Unlock()
+	if n != 0 {
+		t.Errorf("%d register reads still open", n)
+	}
+}
+
+// At most regReadFrames frames after the first are taken.
+func TestDualRegReadFrameCap(t *testing.T) {
+	c, mod := regReadEnv(t, regReadFrames+4, false, nil)
+	if _, err := c.Send(context.Background(), readRequest(0x00)); err != nil {
+		t.Fatal(err)
+	}
+	var acks, challenges int
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		acks, challenges = 0, 0
+		for _, m := range mod.Sent() {
+			if len(m) >= 10 && m[2] == 0x02 && [3]byte(m[6:9]) == testDevice {
+				if m[9] == 0x04 {
+					challenges++
+				} else {
+					acks++
+				}
+			}
+		}
+		if acks+challenges == regReadFrames+4 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if acks != 1+regReadFrames || challenges != 3 {
+		t.Errorf("%d ACKs, %d challenges; want %d and 3", acks, challenges, 1+regReadFrames)
+	}
+}

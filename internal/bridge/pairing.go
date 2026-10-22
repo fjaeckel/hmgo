@@ -486,15 +486,21 @@ func (b *Bridge) keptRecord(addr [3]byte) *store.Device {
 // sendConfig sends one configuration message to addr and checks the
 // device's ACK.
 func (b *Bridge) sendConfig(ctx context.Context, addr [3]byte, flags byte, m pairing.Message) error {
+	_, err := b.sendConfigResp(ctx, addr, flags, m)
+	return err
+}
+
+// sendConfigResp is sendConfig returning the device's ACK.
+func (b *Bridge) sendConfigResp(ctx context.Context, addr [3]byte, flags byte, m pairing.Message) (*bidcos.Packet, error) {
 	pkt := &bidcos.Packet{Flags: flags, Cmd: m.Cmd, Dest: addr, Payload: m.Payload}
 	resp, err := b.bcs.Send(ctx, pkt)
 	if err != nil {
-		return fmt.Errorf("%s: %w", m.What, err)
+		return nil, fmt.Errorf("%s: %w", m.What, err)
 	}
 	if err := hm.CheckAck(addr, resp); err != nil {
-		return fmt.Errorf("%s: %w", m.What, err)
+		return nil, fmt.Errorf("%s: %w", m.What, err)
 	}
-	return nil
+	return resp, nil
 }
 
 // cleanupTimeout bounds clean-up radio module requests (removing a
@@ -600,12 +606,12 @@ func isNack(err error) bool {
 
 // keyExchange gives the device at addr (using old) the key newKey. On
 // failure, part is the part (1 or 2) that failed.
-func (b *Bridge) keyExchange(ctx context.Context, addr [3]byte, old, newKey hmkey.Key) (part int, err error) {
+func (b *Bridge) keyExchange(ctx context.Context, addr [3]byte, old, newKey hmkey.Key) (part int, part1 *bidcos.Packet, err error) {
 	var payloads [2][]byte
 	if hk, ok := b.radio.(interface{ HostKeyExchange() bool }); ok && hk.HostKeyExchange() {
 		enc, err := bidcosaes.KeyExchangePayloads(old.Bytes, newKey, rand.Reader)
 		if err != nil {
-			return 1, err
+			return 1, nil, err
 		}
 		payloads = [2][]byte{enc[0][:], enc[1][:]}
 	} else {
@@ -613,11 +619,15 @@ func (b *Bridge) keyExchange(ctx context.Context, addr [3]byte, old, newKey hmke
 	}
 	for i, p := range payloads {
 		m := pairing.Message{Cmd: pairing.CmdKeyExchange, Payload: p, What: fmt.Sprintf("AES key exchange part %d of 2", i+1)}
-		if err := b.sendConfig(ctx, addr, pairing.ConfigFlags, m); err != nil {
-			return i + 1, err
+		resp, err := b.sendConfigResp(ctx, addr, pairing.ConfigFlags, m)
+		if err != nil {
+			return i + 1, part1, err
+		}
+		if i == 0 {
+			part1 = resp
 		}
 	}
-	return 0, nil
+	return 0, part1, nil
 }
 
 func (b *Bridge) removePeer(ctx context.Context, addr [3]byte) {

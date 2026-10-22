@@ -9,8 +9,11 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"os"
+	"os/user"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -193,5 +196,86 @@ func TestRandomCentral(t *testing.T) {
 	// The bounds are reachable.
 	if a, _ := randomCentral(bytes.NewReader([]byte{0, 0, 0, 0})); a != [3]byte{0x10, 0, 0} {
 		t.Errorf("min %X", a)
+	}
+}
+
+// ownerOf returns the owner and group of path (not following a link).
+func ownerOf(t *testing.T, path string) (uid, gid int, perm os.FileMode) {
+	t.Helper()
+	fi, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := fi.Sys().(*syscall.Stat_t)
+	return int(st.Uid), int(st.Gid), fi.Mode().Perm()
+}
+
+// A -key_file in a directory that does not exist yet: the directory is
+// created private (0700 when not run as root).
+func TestInitKeyFileInNewDirectory(t *testing.T) {
+	dir := t.TempDir()
+	keyPath := filepath.Join(dir, "keys", "sub", "hmbridge.key")
+	r := runInitTest(t, "", false, "-config", filepath.Join(dir, "etc", "config.json"), "-state_dir", filepath.Join(dir, "state"),
+		"-key_file", keyPath, "-mqtt_broker", "none")
+	if r.code != 0 {
+		t.Fatalf("exit %d: %s", r.code, r.errOut.String())
+	}
+	if _, _, perm := ownerOf(t, filepath.Dir(keyPath)); perm != 0o700 {
+		t.Errorf("key directory mode %04o", perm)
+	}
+	if _, _, perm := ownerOf(t, keyPath); perm != 0o600 {
+		t.Errorf("key file mode %04o", perm)
+	}
+	if _, _, perm := ownerOf(t, filepath.Join(dir, "state")); perm != 0o700 {
+		t.Errorf("state dir mode %04o", perm)
+	}
+}
+
+// Run as root for another user: the owners are set on the open files
+// (before the key file gets its name) and directories.
+func TestInitOwnersAsRoot(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("needs root")
+	}
+	u, err := user.Lookup("nobody")
+	if err != nil {
+		t.Skip("no user nobody")
+	}
+	uid, _ := strconv.Atoi(u.Uid)
+	gid, _ := strconv.Atoi(u.Gid)
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	state := filepath.Join(dir, "state")
+	keyPath := filepath.Join(dir, "keys", "hmbridge.key")
+	cfgPath := filepath.Join(dir, "etc", "config.json")
+	r := runInitTest(t, "", false, "-user", "nobody", "-config", cfgPath, "-state_dir", state, "-key_file", keyPath, "-mqtt_broker", "none")
+	if r.code != 0 {
+		t.Fatalf("exit %d: %s", r.code, r.errOut.String())
+	}
+	for _, tc := range []struct {
+		path     string
+		uid, gid int
+		perm     os.FileMode
+	}{
+		{state, uid, gid, 0o700},
+		{filepath.Dir(keyPath), 0, gid, 0o750},
+		{keyPath, uid, gid, 0o600},
+		{filepath.Dir(cfgPath), 0, 0, 0o755},
+		{cfgPath, 0, gid, 0o640},
+	} {
+		if gu, gg, gp := ownerOf(t, tc.path); gu != tc.uid || gg != tc.gid || gp != tc.perm {
+			t.Errorf("%s: %d:%d %04o, want %d:%d %04o", tc.path, gu, gg, gp, tc.uid, tc.gid, tc.perm)
+		}
+	}
+	// The default key file in the state directory.
+	dir2 := t.TempDir()
+	r = runInitTest(t, "", false, "-user", "nobody", "-config", filepath.Join(dir2, "c.json"), "-state_dir", filepath.Join(dir2, "s"), "-mqtt_broker", "none")
+	if r.code != 0 {
+		t.Fatalf("exit %d: %s", r.code, r.errOut.String())
+	}
+	if gu, _, gp := ownerOf(t, filepath.Join(dir2, "s", KeyFileName)); gu != uid || gp != 0o600 {
+		t.Errorf("key file %d %04o", gu, gp)
 	}
 }

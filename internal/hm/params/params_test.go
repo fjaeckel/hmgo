@@ -507,3 +507,83 @@ func TestParseParamChange(t *testing.T) {
 		t.Error("register read answer accepted")
 	}
 }
+
+// Registers a setting shares with others (or bits no setting describes)
+// are not owned: they must be read before a write.
+func TestOwnsRegisters(t *testing.T) {
+	rt := ForModel("HM-CC-RT-DN")
+	for key, want := range map[string]bool{
+		"button_lock":          true,  // list 0 register 15, whole byte
+		"temperature_offset":   false, // bits 0-3 of register 9
+		"boost_valve_position": false, // register 10 shared with boost_duration
+		"boost_duration":       false,
+		"week_profile_monday":  true, // 26 registers written completely
+	} {
+		if got := rt.OwnsRegisters(rt.Setting(key)); got != want {
+			t.Errorf("%s: owns %v, want %v", key, got, want)
+		}
+	}
+	if got := rt.Setting("week_profile_monday").Registers(); len(got) != 26 || got[0] != 72 {
+		t.Errorf("monday registers %v", got)
+	}
+}
+
+// The read-back is compared register by register, not only the
+// changed setting's bits.
+func TestVerifyRegisters(t *testing.T) {
+	s := ForModel("HM-CC-RT-DN").Setting("boost_valve_position")
+	c, err := NewChange(s, "50")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := Regs{10: 4<<5 | 16}
+	if err := c.Apply(want); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.VerifyRegisters(want, Regs{10: want[10]}); err != nil {
+		t.Error(err)
+	}
+	if err := c.VerifyRegisters(want, Regs{10: want[10] ^ 0x20}); err == nil || !strings.Contains(err.Error(), "bits of settings sharing it differ") {
+		t.Errorf("other bits changed: %v", err)
+	}
+}
+
+func TestMergeResponseChecked(t *testing.T) {
+	r := Regs{}
+	if _, err := MergeResponseChecked(r, []byte{0x02, 1, 10, 2, 20}); err != nil {
+		t.Fatal(err)
+	}
+	// A retransmission changes nothing.
+	if _, err := MergeResponseChecked(r, []byte{0x02, 1, 10, 2, 20}); err != nil {
+		t.Error(err)
+	}
+	if _, err := MergeResponseChecked(r, []byte{0x02, 2, 21, 3, 30}); err == nil {
+		t.Error("conflicting value accepted")
+	}
+	if !reflect.DeepEqual(r, Regs{1: 10, 2: 20}) {
+		t.Errorf("registers changed by a refused frame: %v", r)
+	}
+}
+
+// A day with a temperature outside 5 … 30 °C (written by other
+// software or the device's menu): shown as stored, flagged invalid,
+// and the text is refused when written back (with the reason).
+func TestWeekProfileOutOfRangeTemperature(t *testing.T) {
+	s := ForModel("HM-CC-RT-DN").Setting("week_profile_monday")
+	day := Day{{End: 360, Temp: 31.5}, {End: EndOfDay, Temp: 4.5}}
+	r := EncodeDay(day, s.ProfileBase, s.Day)
+	v, ok := s.Value(r)
+	if !ok || v != "06:00 31.5, 24:00 4.5" {
+		t.Errorf("value %v %v", v, ok)
+	}
+	if err := s.Invalid(r); err == nil || !strings.Contains(err.Error(), "out of range") {
+		t.Errorf("invalid: %v", err)
+	}
+	if _, err := NewChange(s, v.(string)); err == nil || !strings.Contains(err.Error(), "31.5 is out of range") {
+		t.Errorf("written back: %v", err)
+	}
+	ok17 := EncodeDay(Day{{End: EndOfDay, Temp: 17}}, s.ProfileBase, s.Day)
+	if err := s.Invalid(ok17); err != nil {
+		t.Errorf("valid day flagged: %v", err)
+	}
+}

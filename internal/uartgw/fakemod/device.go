@@ -45,6 +45,9 @@ type Device struct {
 	asleep  bool
 	reads   int
 	inject  func(msg []byte)
+	// configAES: CONFIG_START and CONFIG_WRITE_INDEX are challenged
+	// (Handle).
+	configAES bool
 }
 
 // NewDevice returns a device with the eQ-3 default key (factory state).
@@ -124,6 +127,33 @@ func (d *Device) SetInject(f func(msg []byte)) {
 	d.mu.Lock()
 	d.inject = f
 	d.mu.Unlock()
+}
+
+// SetKey sets the device's current AES key (as if it had been paired
+// with it).
+func (d *Device) SetKey(k hmkey.Key) {
+	d.mu.Lock()
+	d.key = k
+	d.mu.Unlock()
+}
+
+// SetConfigAES makes Handle challenge CONFIG_START and
+// CONFIG_WRITE_INDEX with the device's current key, like a device with
+// AES active (AskSinPP validSignature), and apply them only after a
+// correct answer.
+func (d *Device) SetConfigAES(on bool) {
+	d.mu.Lock()
+	d.configAES = on
+	d.mu.Unlock()
+}
+
+// challenge holds msg until the central answers the device's AES
+// challenge, and returns the challenge. Caller holds d.mu.
+func (d *Device) challenge(msg []byte) []byte {
+	d.held = append([]byte(nil), msg...)
+	d.chal = [6]byte{0x11, 0x22, 0x33, 0x44, 0x55, byte(msg[0])}
+	pl := append([]byte{0x04}, d.chal[:]...)
+	return d.reply(msg, 0x02, 0xa0, append(pl, d.key.Index*2)...)
 }
 
 // SetAsleep makes the device ignore everything (a battery device that
@@ -230,6 +260,9 @@ func (d *Device) Handle(msg []byte) [][]byte {
 		if r := d.paramResponse(msg, p); r != nil {
 			return r
 		}
+		if d.configAES && len(p) >= 2 && (p[1] == pairing.SubConfigStart || p[1] == pairing.SubConfigWriteIndex) {
+			return [][]byte{d.challenge(msg)}
+		}
 		if !d.config(p) {
 			return [][]byte{d.reply(msg, 0x02, 0x80, 0x80)}
 		}
@@ -237,10 +270,7 @@ func (d *Device) Handle(msg []byte) [][]byte {
 	case pairing.CmdKeyExchange:
 		// A key change must be authenticated: challenge it with the
 		// current key.
-		d.held = append([]byte(nil), msg...)
-		d.chal = [6]byte{0x11, 0x22, 0x33, 0x44, 0x55, byte(msg[0])}
-		pl := append([]byte{0x04}, d.chal[:]...)
-		return [][]byte{d.reply(msg, 0x02, 0xa0, append(pl, d.key.Index*2)...)}
+		return [][]byte{d.challenge(msg)}
 	case 0x03: // our challenge answered
 		if d.held == nil || len(p) < 16 {
 			return nil
@@ -252,6 +282,12 @@ func (d *Device) Handle(msg []byte) [][]byte {
 		auth, ok := bidcosaes.NewSigner(d.key).VerifyAuth(d.key.Index, d.chal, held, r)
 		if !ok {
 			return [][]byte{d.reply(msg, 0x02, 0x80, 0x80)}
+		}
+		if held[2] == pairing.CmdConfig {
+			if !d.config(held[9:]) {
+				return [][]byte{d.reply(msg, 0x02, 0x80, 0x80)}
+			}
+			return [][]byte{d.reply(msg, 0x02, 0x80, append([]byte{0x00}, auth[:]...)...)}
 		}
 		var b [16]byte
 		copy(b[:], held[9:])

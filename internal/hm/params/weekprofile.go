@@ -94,7 +94,9 @@ func EncodeDay(d Day, base byte, day int) Regs {
 }
 
 // DecodeDay returns a day's profile from the list's registers: the
-// slots up to the first one ending at 24:00.
+// slots up to the first one ending at 24:00. Temperatures are returned
+// as stored (0 … 31.5 °C), also outside the valid 5 … 30 °C: ValidateDay
+// reports them, and ParseDay rejects them when the text is written back.
 func DecodeDay(r Regs, base byte, day int) (Day, error) {
 	start := dayStart(base, day)
 	var d Day

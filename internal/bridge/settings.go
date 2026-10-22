@@ -16,15 +16,16 @@ package bridge
 // the end marker.
 //
 // Writing: CONFIG_START, CONFIG_WRITE_INDEX (only the registers that
-// change), CONFIG_END, sent through hm.StandardDevice.Send, so that the
-// ACK of a write to an AES channel must be authenticated like any
-// command's; then the list is read back and every change verified.
+// change), CONFIG_END; for a device with AES the ACKs of CONFIG_START
+// and CONFIG_WRITE_INDEX must be authenticated (configNeedsAuth); then
+// the list is read back and every written register verified.
 //
-// Settings are read lazily: after pairing, when a change needs the
-// other bits of a register that are not cached yet, and on “Refresh
-// settings”, never periodically. The registers last read are cached
-// per device (settings.json in the state directory, written when they
-// change).
+// Settings are read: after pairing, on “Refresh settings”, and in the
+// job itself right before a write to a register that the changed
+// setting shares (the read is the write's base), never periodically.
+// The registers last read are cached per device (settings.json in the
+// state directory, written when they change) for display only: the
+// cache is never the base of a write.
 //
 // Battery devices: the thermostats (wake-on-radio) get every message
 // with the burst flag, like the climate commands. Contacts and buttons
@@ -32,6 +33,9 @@ package bridge
 // when they announce that they listen (flag WAKEMEUP 0x02 in a message;
 // FHEM CUL_HM processes its command stack then): changes wait for that
 // (“pending” in Home Assistant) and are sent at once, as a priority job.
+// Only frames to the central (or broadcast) that passed the AES checks
+// count, and after a failed job wake-ups are ignored for
+// settingsWakeRetryGap (settingsWake).
 //
 // Ownership: deviceSettings is changed on the event loop under b.mu
 // (published from it under b.mu); jobs carry snapshots of what the
@@ -68,6 +72,12 @@ const (
 	// maxParamFrames bounds the frames of one register read (a list has
 	// at most 255 registers, 8 per frame).
 	maxParamFrames = 40
+	// settingsWakeRetryGap is the least time between a failed settings
+	// job of a config-only battery device and the next job a wake-up
+	// frame triggers: anyone can send DEVICE_INFO or WAKEMEUP frames with
+	// the device's address (DEVICE_INFO is never signed), and each job
+	// sends messages to a device that may not listen.
+	settingsWakeRetryGap = time.Minute
 	// weekProfileKey is the pseudo setting that sets several days of a
 	// week profile at once: a JSON object {"monday": "06:00 17.0, …"}.
 	weekProfileKey = "week_profile"
@@ -109,6 +119,9 @@ type deviceSettings struct {
 	readErr string
 	// jobs counts the settings jobs queued or running.
 	jobs int
+	// wokeFailedAt is when the last settings job triggered by a wake-up
+	// frame failed (zero after a successful one).
+	wokeFailedAt time.Time
 }
 
 func newDeviceSettings(model string) *deviceSettings {
@@ -177,7 +190,6 @@ type settingsJob struct {
 	// woke: a battery device that only listens now (no retries).
 	woke    bool
 	changes []params.Change
-	cache   map[params.Loc]params.Regs
 }
 
 // settingsOutcome is the result of a settings job.
@@ -185,15 +197,6 @@ type settingsOutcome struct {
 	read    map[params.Loc]params.Regs // lists read from the device
 	readErr error                      // a list of the refresh could not be read
 	results map[string]error           // per change: nil = written and verified
-}
-
-// cloneCache copies a register cache.
-func cloneCache(c map[params.Loc]params.Regs) map[params.Loc]params.Regs {
-	res := make(map[params.Loc]params.Regs, len(c))
-	for l, r := range c {
-		res[l] = r.Clone()
-	}
-	return res
 }
 
 // loadSettings fills the settings cache from the settings file (New).
@@ -335,11 +338,17 @@ func parseWeekProfile(m *params.Model, value string) ([]params.Change, error) {
 		return nil, errors.New("week profile: no days given")
 	}
 	var res []params.Change
+	seen := map[string]string{}
 	for day, text := range days {
-		s := m.Setting("week_profile_" + strings.ToLower(day))
+		key := "week_profile_" + strings.ToLower(day)
+		s := m.Setting(key)
 		if s == nil || s.Kind != params.Profile {
 			return nil, fmt.Errorf("week profile: unknown day %q", day)
 		}
+		if other, dup := seen[key]; dup {
+			return nil, fmt.Errorf("week profile: %q and %q name the same day", other, day)
+		}
+		seen[key] = day
 		c, err := params.NewChange(s, text)
 		if err != nil {
 			return nil, err
@@ -368,7 +377,7 @@ func (b *Bridge) scheduleSettingsLocked(d *device, woke bool) bool {
 	}
 	sj := &settingsJob{
 		addr: d.cfg.Addr(), ds: ds, model: ds.model, aes: d.cfg.AESChannelList(),
-		refresh: ds.refresh, woke: woke, flags: pairing.ConfigFlags, cache: cloneCache(ds.cache),
+		refresh: ds.refresh, woke: woke, flags: pairing.ConfigFlags,
 	}
 	if ds.rx == pairing.WakeOnRadio {
 		// Like the climate commands: a burst wakes the thermostat.
@@ -393,16 +402,31 @@ func (b *Bridge) scheduleSettingsLocked(d *device, woke bool) bool {
 
 // settingsWake sends what waits for a battery device that only listens
 // in config mode, when it signals that it listens: DEVICE_INFO (config
-// button) or a message with the WAKEMEUP flag. Event loop.
-func (b *Bridge) settingsWake(d *device, pkt *bidcos.Packet) {
+// button) or a message with the WAKEMEUP flag, addressed to the central
+// or broadcast. The caller passes only frames that passed the AES checks.
+// After a failed job, wake-up frames are ignored for b.wakeRetryGap.
+// Event loop.
+func (b *Bridge) settingsWake(d *device, pkt *bidcos.Packet, central [3]byte) {
 	ds := d.settings
 	if ds == nil || ds.rx != pairing.ConfigOnly || pkt.Cmd != bidcos.DeviceInfo && pkt.Flags&bidcos.WakeMeUp == 0 {
+		return
+	}
+	if pkt.Dest != central && pkt.Dest != ([3]byte{}) {
 		return
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if ds.jobs > 0 {
 		return // already on its way
+	}
+	if len(ds.pending) == 0 && !ds.refresh {
+		return
+	}
+	if !ds.wokeFailedAt.IsZero() {
+		if wait := ds.wokeFailedAt.Add(b.wakeRetryGap).Sub(b.now()); wait > 0 {
+			b.debugf("%s: ignoring its wake-up (cmd %02x) for another %v: the last settings job failed", d.cfg.Name, pkt.Cmd, wait.Round(time.Second))
+			return
+		}
 	}
 	if b.scheduleSettingsLocked(d, true) {
 		what := fmt.Sprintf("sending %d settings changes", len(ds.pending))
@@ -471,7 +495,7 @@ func (b *Bridge) readList(ctx context.Context, sj *settingsJob, loc params.Loc) 
 		return nil, fmt.Errorf("reading %v: unexpected answer cmd %02x %x", loc, resp.Cmd, resp.Payload)
 	}
 	regs := params.Regs{}
-	done, err := params.MergeResponse(regs, resp.Payload)
+	done, err := params.MergeResponseChecked(regs, resp.Payload)
 	frames := 1
 	timer := time.NewTimer(b.paramTimeout)
 	defer timer.Stop()
@@ -481,7 +505,7 @@ func (b *Bridge) readList(ctx context.Context, sj *settingsJob, loc params.Loc) 
 			if frames++; frames > maxParamFrames {
 				return nil, fmt.Errorf("reading %v: more than %d frames", loc, maxParamFrames)
 			}
-			done, err = params.MergeResponse(regs, p.Payload)
+			done, err = params.MergeResponseChecked(regs, p.Payload)
 			if !timer.Stop() {
 				<-timer.C
 			}
@@ -498,28 +522,69 @@ func (b *Bridge) readList(ctx context.Context, sj *settingsJob, loc params.Loc) 
 	return regs, nil
 }
 
-// writeList writes registers to a list (worker goroutine). The ACKs go
-// through hm.StandardDevice.Send: for an AES channel they must be
-// authenticated.
+// writeList writes registers to a list (worker goroutine). The ACKs of
+// CONFIG_START and CONFIG_WRITE_INDEX must be AES-authenticated where
+// the device challenges them (configNeedsAuth).
 func (b *Bridge) writeList(ctx context.Context, sj *settingsJob, loc params.Loc, regs []params.Reg) error {
-	sd := hm.StandardDevice{BCS: b.bcs, Addr: sj.addr, AESChannels: sj.aes}
+	sd := hm.StandardDevice{BCS: b.bcs, Addr: sj.addr}
 	pr := make([]pairing.Reg, len(regs))
 	for i, r := range regs {
 		pr[i] = pairing.Reg{Addr: r.Addr, Value: r.Value}
 	}
 	for _, m := range pairing.WriteListSequence(loc.Channel, loc.List, pr) {
-		if _, err := sd.Send(ctx, &bidcos.Packet{Flags: sj.flags, Cmd: m.Cmd, Payload: m.Payload}); err != nil {
+		resp, err := sd.Send(ctx, &bidcos.Packet{Flags: sj.flags, Cmd: m.Cmd, Payload: m.Payload})
+		if err != nil {
 			return fmt.Errorf("%s: %w", m.What, err)
+		}
+		if configNeedsAuth(sj.aes, m.Payload) && resp.Auth() != bidcos.AuthOK {
+			return fmt.Errorf("%s: %v: %w", m.What, &sd, hm.ErrUnauthenticatedReply)
 		}
 	}
 	return nil
 }
 
+// configNeedsAuth reports whether the ACK to a CONFIG message (payload
+// ch subtype …) of a device with the AES channels aes must be
+// AES-authenticated: the device challenges CONFIG_START and
+// CONFIG_WRITE_INDEX for one of its AES channels, and for channel 0 (the
+// device's list 0, the thermostats' list 7) as soon as any channel uses
+// AES; it does not challenge CONFIG_END and register reads. That is
+// AskSinPP's implementation of the protocol (MultiChannelDevice.h:
+// validSignature(pm.channel()) for CONFIG_START, CONFIG_WRITE_INDEX,
+// CONFIG_PEER_ADD/REMOVE; validSignature(0) requires a signature when
+// list 0 or any channel has AES active). Without the challenge, a plain
+// ACK could have been sent by anyone in radio range who saw the request.
+func configNeedsAuth(aes []byte, payload []byte) bool {
+	if len(aes) == 0 || len(payload) < 2 {
+		return false
+	}
+	if payload[1] != pairing.SubConfigStart && payload[1] != pairing.SubConfigWriteIndex {
+		return false
+	}
+	if payload[0] == 0 {
+		return true
+	}
+	for _, c := range aes {
+		if c == payload[0] {
+			return true
+		}
+	}
+	return false
+}
+
 // executeSettings runs a settings job (worker goroutine): per list,
-// read it if needed (refresh, or a change needs the other bits of a
-// shared register), write what changes, read it back and verify every
+// read it if needed, write what changes, read it back and verify every
 // change. The first communication failure ends the job; its error is
 // returned (and decides about a retry).
+//
+// The base of a write is never the cache (it may be stale, or come from
+// settings.json): a list with a change to a register that the changed
+// setting does not own completely (other settings, or bits no setting
+// describes, share it; params.Model.OwnsRegisters) is read from the
+// device in this job, right before the write. A change to registers it
+// owns is written completely without reading. The read-back must hold
+// every written register exactly (all bits), not only the changed
+// setting's bits.
 func (b *Bridge) executeSettings(ctx context.Context, sj *settingsJob) (any, error) {
 	out := &settingsOutcome{read: map[params.Loc]params.Regs{}, results: map[string]error{}}
 	byLoc := map[params.Loc][]params.Change{}
@@ -555,11 +620,13 @@ func (b *Bridge) executeSettings(ctx context.Context, sj *settingsJob) (any, err
 			}
 			continue
 		}
-		regs := sj.cache[loc].Clone()
 		need := sj.refresh
 		for _, c := range chs {
-			need = need || !c.Known(regs)
+			need = need || !sj.model.OwnsRegisters(c.Setting)
 		}
+		// regs: what the device holds (read just now), or nothing if
+		// only owned registers change (they are all written).
+		regs := params.Regs{}
 		if need {
 			r, err := b.readList(ctx, sj, loc)
 			if err != nil {
@@ -575,9 +642,6 @@ func (b *Bridge) executeSettings(ctx context.Context, sj *settingsJob) (any, err
 		}
 		if len(chs) == 0 {
 			continue
-		}
-		if regs == nil {
-			regs = params.Regs{}
 		}
 		want := regs.Clone()
 		var applied []params.Change
@@ -606,7 +670,7 @@ func (b *Bridge) executeSettings(ctx context.Context, sj *settingsJob) (any, err
 		}
 		out.read[loc] = back
 		for _, c := range applied {
-			out.results[c.Setting.Key] = c.Verify(back)
+			out.results[c.Setting.Key] = c.VerifyRegisters(want, back)
 		}
 	}
 	return out, commErr
@@ -698,6 +762,16 @@ func (b *Bridge) handleSettingsResult(res jobResult) {
 		ds.readAt = b.now()
 	}
 	retry := res.err != nil && isRetryable(res.err) && ds.rx != pairing.ConfigOnly && res.job.attempt < b.retries
+	if sj.woke {
+		ds.wokeFailedAt = time.Time{}
+		failed := res.err != nil || out.readErr != nil
+		for _, err := range out.results {
+			failed = failed || err != nil
+		}
+		if failed {
+			ds.wokeFailedAt = b.now()
+		}
+	}
 	if sj.refresh {
 		switch {
 		case out.readErr == nil && res.err == nil:
@@ -761,6 +835,12 @@ func (b *Bridge) handleSettingsResult(res jobResult) {
 		time.AfterFunc(b.retryDelay, func() {
 			b.mu.Lock()
 			defer b.mu.Unlock()
+			// Unpaired or re-paired meanwhile: the retry is for a device
+			// that no longer exists (the queue drops a superseded job,
+			// not one for a device registered again at the address).
+			if cur := b.byAddr[sj.addr]; cur == nil || cur.settings != ds {
+				return
+			}
 			if b.queue.retry(j) {
 				ds.jobs++
 			}
@@ -801,16 +881,22 @@ func truncate(s string) string {
 func (b *Bridge) settingsStateLocked(d *device) ha.SettingsState {
 	ds := d.settings
 	st := ha.SettingsState{Current: map[string]any{}, Detail: map[string]string{}, ReadAt: ds.readAt}
+	for k, v := range ds.detail {
+		st.Detail[k] = v
+	}
 	for i := range ds.model.Settings {
 		s := &ds.model.Settings[i]
 		if r := ds.cache[s.Loc]; r != nil {
 			if v, ok := s.Value(r); ok {
 				st.Current[s.Key] = v
 			}
+			// A value the device holds but hmbridge would never write
+			// (e.g. a week profile temperature outside 5 … 30 °C) is
+			// shown as it is, and flagged.
+			if err := s.Invalid(r); err != nil && st.Detail[s.Key] == "" {
+				st.Detail[s.Key] = fmt.Sprintf("%s: %v (shown as stored on the device; writing it back is rejected, set a valid value)", ha.SettingsInvalid, err)
+			}
 		}
-	}
-	for k, v := range ds.detail {
-		st.Detail[k] = v
 	}
 	st.Status = truncate(settingsSummary(ds))
 	return st

@@ -110,14 +110,16 @@ func TestEndToEndSettings(t *testing.T) {
 		return st == "ok" && cur["comfort_temperature"] == 21.0 && cur["week_profile_sunday"] == "06:00 17.0, 22:00 21.0, 24:00 17.0"
 	})
 
-	// Change the comfort temperature: written with a burst, read back.
+	// Change the comfort temperature (bits 0-5 of register 1): list 7 is
+	// read right before the write (the other bits), written with a burst,
+	// read back.
 	start := len(mod.Sent())
 	ha.publish("hmbridge/38f59c/set/setting_comfort_temperature", "22.5")
 	waitFor(t, "written", func() bool {
 		cur, det, _ := ha.settingsOf("38f59c")
 		return det["comfort_temperature"] == "ok" && cur["comfort_temperature"] == 22.5
 	})
-	if got, want := configSent(mod, e2eRT, start), "[b0 00050000000007 b0 0008012d b0 0006 b0 00040000000007]"; fmt.Sprint(got) != want {
+	if got, want := configSent(mod, e2eRT, start), "[b0 00040000000007 b0 00050000000007 b0 0008012d b0 0006 b0 00040000000007]"; fmt.Sprint(got) != want {
 		t.Errorf("frames %v, want %s", got, want)
 	}
 	if v, _ := rt.Reg(0, 7, 1); v != 45 {

@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/fjaeckel/hmgo/internal/bidcos"
 	"github.com/fjaeckel/hmgo/internal/hmkey"
 	"github.com/fjaeckel/hmgo/internal/uartgw"
 )
@@ -27,7 +28,7 @@ import (
 // it is restored if every attempt fails. On failure, part is the part
 // (1 or 2) that failed.
 func (b *Bridge) pairKeyExchange(ctx context.Context, peer uartgw.Peer, cur hmkey.Key) (part int, err error) {
-	part, err = b.keyExchange(ctx, peer.Addr, hmkey.EQ3Default, cur)
+	part, _, err = b.keyExchange(ctx, peer.Addr, hmkey.EQ3Default, cur)
 	if err == nil || part != 1 || ctx.Err() != nil {
 		return part, err
 	}
@@ -47,15 +48,18 @@ func (b *Bridge) pairKeyExchange(ctx context.Context, peer uartgw.Peer, cur hmke
 			break
 		}
 		b.logf("pairing: the key exchange from the eQ-3 default key failed (%v); %x may still hold key index %d from an earlier pairing, retrying with that key as its old key", first, peer.Addr[:], old.Index)
-		p, err := b.keyExchange(ctx, peer.Addr, old, cur)
+		p, part1, err := b.keyExchange(ctx, peer.Addr, old, cur)
 		if err == nil {
 			b.logf("pairing: %x accepted the key exchange from key index %d", peer.Addr[:], old.Index)
 			return 0, nil
 		}
 		if p == 2 {
-			if old.Index == cur.Index && old.Bytes == cur.Bytes {
-				// Part 1 was authenticated with the system key, so the
-				// device holds it whether part 2 arrived or not.
+			if old.Index == cur.Index && old.Bytes == cur.Bytes && part1 != nil && part1.Auth() == bidcos.AuthOK {
+				// Part 1 was authenticated with the system key (the
+				// device challenged it and we answered with that key),
+				// so the device holds it whether part 2 arrived or not.
+				// A plain ACK to part 1 proves nothing: anyone in radio
+				// range could have sent it.
 				b.logf("pairing: %x holds the system key (part 2 of the exchange: %v)", peer.Addr[:], err)
 				return 0, nil
 			}

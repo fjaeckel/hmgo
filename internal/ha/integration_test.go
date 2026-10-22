@@ -311,8 +311,14 @@ func TestLWT(t *testing.T) {
 	if d := time.Since(start); d > 1500*time.Millisecond {
 		t.Errorf("Publish blocked for %v", d)
 	}
-	if testutil.ToFloat64(metricConnectionLosses) != lossesBefore+1 {
-		t.Error("connection_losses_total did not move")
+	// paho runs the connection-lost handler (which counts) in its own
+	// goroutine, after the client already reports itself disconnected.
+	for deadline := time.Now().Add(5 * time.Second); testutil.ToFloat64(metricConnectionLosses) != lossesBefore+1; {
+		if time.Now().After(deadline) {
+			t.Errorf("connection_losses_total did not move (%v → %v)", lossesBefore, testutil.ToFloat64(metricConnectionLosses))
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 
 	// Allow reconnects: availability returns to online.

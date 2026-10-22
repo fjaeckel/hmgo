@@ -173,6 +173,10 @@ type Bridge struct {
 	// paramTimeout is the longest gap between two frames of a register
 	// read (paramFrameTimeout; tests shorten it).
 	paramTimeout time.Duration
+	// wakeRetryGap is the least time between a failed settings job of a
+	// config-only battery device and the next one a wake-up frame
+	// triggers (settingsWake).
+	wakeRetryGap time.Duration
 }
 
 type device struct {
@@ -281,6 +285,7 @@ func New(opts Options) (*Bridge, error) {
 		hmip:         opts.HMIP,
 		floodLog:     newFloodLog(),
 		paramTimeout: paramFrameTimeout,
+		wakeRetryGap: settingsWakeRetryGap,
 	}
 	if b.clockSync == nil {
 		b.clockSync = SystemClockSynced
@@ -734,9 +739,6 @@ func (b *Bridge) handleFrame(frame []byte) {
 	if pkt.Cmd == bidcos.Info && params.IsParamResponse(pkt.Payload) && pkt.Dest == central && b.forwardParamResponse(pkt) {
 		return
 	}
-	// A battery device that only listens in config mode signals that it
-	// listens: send the settings changes waiting for it.
-	b.settingsWake(d, pkt)
 	// For an AES device, a frame that was not authenticated could have
 	// been forged by anyone in radio range (whatever its destination,
 	// flags or command): it must not change any state (eQ-3:
@@ -749,6 +751,13 @@ func (b *Bridge) handleFrame(frame []byte) {
 			return
 		}
 	}
+
+	// A battery device that only listens in config mode signals that it
+	// listens: send the settings changes waiting for it. Only frames that
+	// passed the AES checks above (an AES device's frames authenticated,
+	// apart from the DEVICE_INFO of its config button, which no device
+	// signs) and that are addressed to the central or broadcast.
+	b.settingsWake(d, pkt, central)
 
 	// A setting changed on the device itself (authenticated, or a device
 	// without AES: the checks above).

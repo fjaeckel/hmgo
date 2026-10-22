@@ -614,43 +614,78 @@ written completely; slots after the one ending at 24:00 are filled with
 |---|---|
 | read | CONFIG_PARAM_REQ `ch 04 00000000 list` (BiDi); the device answers with INFO_PARAM_RESPONSE `10 02 reg val …` (pairs, ended by `00 00`) or `10 03 start val …` (sequence, ended by start `00`), one frame per ≤ 8 pairs, each acknowledged by the central |
 | write | CONFIG_START `ch 05 00000000 list`, CONFIG_WRITE_INDEX `ch 08 reg val …` (≤ 7 pairs each, only the registers that change), CONFIG_END `ch 06` (pairing.WriteListSequence) |
-| verify | the list is read again and every change compared |
+| verify | the list is read again and every written register compared completely (all bits, also those of other settings sharing it) |
 | device change | INFO_PARAM_CHANGE `10 04 ch 00000000 list pairs…` / `10 05 … start values…` updates a cached list (only when authenticated, or from a device without AES) |
 
 The first answer frame is the response to the request (returned by
 `Send`); the others arrive as received frames, which the event loop hands
 to the worker waiting for them (`paramCollector`, one at a time) before the
-AES checks; they never change device state. The HM-MOD-RPI-PCB acknowledges
-them itself. `DualConn` acknowledges the INFO_PARAM_RESPONSE frames of a
-peer for 30 s after a CONFIG_PARAM_REQ to it (at most 64) outside its
-software ACK budget and without challenging them: a thermostat's list 7 is
-about 26 frames, more than the challenge rate limit (10 per 10 s) allows.
-Writes go through `hm.StandardDevice.Send`, so the ACK of a write to an AES
-channel must be authenticated (`CheckReplyAuth`), like any command's.
+AES checks; they never change device state. A read that reports a register
+twice with different values fails (`params.MergeResponseChecked`: a device
+reports each register once, so someone else sent frames). The
+HM-MOD-RPI-PCB acknowledges the frames itself. `DualConn` acknowledges the
+INFO_PARAM_RESPONSE frames of a peer outside its software ACK budget and
+without challenging them only while a read of that peer is in progress:
+from the module's LLMAC_ACK of the CONFIG_PARAM_REQ (the request has been
+transmitted, so no answer can come earlier) until the frame with the end
+marker, at most 40 frames (the bridge's `maxParamFrames`) and 30 s; a
+failed request closes it too. A thermostat's list 7 is about 26 frames,
+more than the challenge rate limit (10 per 10 s) allows.
+
+**Authenticated writes.** For a device with AES, the ACKs of CONFIG_START
+and CONFIG_WRITE_INDEX must be AES-authenticated (`configNeedsAuth`): for
+a list of one of its AES channels, and for channel 0 (list 0, the
+thermostats' list 7) as soon as any channel has AES, although channel 0 is
+never an AES channel itself. That is how the devices behave in AskSinPP
+(`MultiChannelDevice.h`: `validSignature(pm.channel(), msg)` for
+CONFIG_START, CONFIG_WRITE_INDEX and CONFIG_PEER_ADD/REMOVE;
+`validSignature` of channel 0 requires a signature when list 0 or any
+channel has AES active); eQ-3's own firmware is closed, so this is assumed
+for it. CONFIG_END and CONFIG_PARAM_REQ are not challenged there, so their
+ACKs are taken plain (a forged ACK to CONFIG_END is caught by the read-back
+only as far as the read-back can be trusted, see below).
 
 **Jobs.** A settings job (`jobSettings`, key `settings:<addr>`, coalesced:
-the queued job always carries all pending changes) reads the lists it needs
-(all of the model's on refresh; otherwise only when a change shares a
-register whose other bits are not cached), writes, reads back. The first
-radio failure ends the job; retryable failures are retried twice like
-commands. The worker's timeout for these jobs is 2 minutes. Pending changes
-are kept per setting until the device confirmed them (`detail`: pending →
-writing → ok / failed).
+the queued job always carries all pending changes) reads the lists it needs,
+writes, reads back. **The base of a write is always read in the same job,
+right before the write**, never taken from the cache: a list is read when
+a change touches a register its setting does not own completely (another
+setting shares it, or the setting does not use all its bits:
+`params.Model.OwnsRegisters`), and on refresh. A change to registers it owns
+(a whole byte, a week profile day) is written completely without a read.
+The first radio failure ends the job; retryable failures are retried twice
+like commands (a retry is dropped if the device was unpaired or re-paired
+meanwhile). The worker's timeout for these jobs is 2 minutes. Pending
+changes are kept per setting until the device confirmed them (`detail`:
+pending → writing → ok / failed).
 
 **Battery devices.** Thermostats (wake-on-radio): every message with the
 burst flag (0xB0), like the climate commands and the unpairing. Contacts and
 buttons (config-only): changes and refreshes wait; a DEVICE_INFO (config
 button) or any message with the WAKEMEUP flag (0x02; FHEM processes its
 command stack then) from the device queues them as a priority job without
-burst. A failure that looks like “device asleep” keeps them pending. Pending
-changes are not persisted.
+burst. Only wake-up frames addressed to the central (or broadcast) that
+passed the AES checks count: for an AES device an authenticated frame, or
+a frame of a channel without AES; the DEVICE_INFO of the config button is
+never signed (sent without BiDi) and passes, like for pairing. Because
+anyone can send that DEVICE_INFO, a wake-up after a failed job is ignored
+for 60 s (`settingsWakeRetryGap`), which bounds the messages a forger can
+make hmbridge send to a sleeping device. A failure that looks like “device
+asleep” keeps the changes pending. Pending changes are not persisted.
 
 **Cache.** `settings.json` (store, version 1): per device its model, the
 time of the last change and the lists as hex address/value pairs. Written
 only when the registers read differ from the cache (and on unpairing). A
-cache of another model at the same address is ignored. Settings are never
-read periodically: after pairing (while the device is still in config mode),
-on “Refresh settings”, and before a write that needs unknown bits.
+cache of another model at the same address is ignored. The cache is for
+display only and never the base of a write (it may be stale, or hold what
+forged frames reported). Settings are never read periodically: after
+pairing (while the device is still in config mode), on “Refresh settings”,
+and in a job right before a write to a shared register.
+
+A value the device holds that hmbridge would never write (a week profile
+temperature outside 5 … 30 °C, e.g. set by other software) is shown as
+stored and flagged in `detail` (`invalid: …`); writing that text back is
+rejected with the reason, so the day has to be corrected first.
 
 **Home Assistant.** Per setting a `number`/`select`/`switch`/`text` entity
 (entity_category config; rarely used ones disabled by default) reading
@@ -678,13 +713,36 @@ settings a device does not have are removed once per start
   parameters). The weather sensors only have BURST_RX.
 * Assumed, not yet seen on the air: that the devices answer register reads
   with the frames above (FHEM's parsing); that a thermostat stays awake for
-  the messages of a write when each carries the burst flag; whether devices
-  sign INFO_PARAM_RESPONSE frames. hmbridge takes them unauthenticated (not
-  failed) while it waits for them, from the device's address, to the
-  central: someone who forges them in time can make hmbridge show wrong
-  values or, for a register shared by several settings, write wrong values
-  of the *other* bits along with an authenticated change. Read-back
-  verification does not detect that (it reads the same way).
+  the messages of a write when each carries the burst flag. Every message
+  of a job to a thermostat carries the burst flag (whether FHEM bursts only
+  the first message of a command stack could not be confirmed from its
+  sources), at a cost in airtime: each burst has a ~360 ms wake-up
+  preamble, so changing one register costs 4 bursts (CONFIG_START,
+  CONFIG_WRITE_INDEX, CONFIG_END, read-back request), with a shared
+  register one more for the read before; one week profile day 7, the
+  whole week (26 CONFIG_WRITE_INDEX) 29 bursts, i.e. ~10 s of the
+  module's 36 s per hour (1 % duty cycle).
+* **Residual risk: register reads are not authenticated.** hmbridge takes
+  INFO_PARAM_RESPONSE frames unauthenticated (not failed) while it waits
+  for them, from the device's address, to the central. Requiring
+  authentication is not feasible: devices send the last frame of a read,
+  which holds the remaining registers and the end marker, without BiDi
+  (AskSinPP `sendInfoParamResponsePairs`: `pm.clearAck()`), so it cannot be
+  challenged, and the HM-MOD-RPI-PCB's firmware decides alone which frames
+  it challenges. Someone in radio range who forges frames during a read
+  that hmbridge started (on a refresh, or right before a write to a shared
+  register) can therefore (1) make hmbridge show and cache wrong values,
+  (2) for a register shared by several settings, make hmbridge write
+  chosen values of the *other* bits of that register (only of registers a
+  change touches) along with an authenticated change, and (3) forge the
+  read-back so that the change is reported as verified. The write itself
+  cannot be forged (CONFIG_START and CONFIG_WRITE_INDEX need authenticated
+  ACKs, see above) and the cache is never a write base, so values cannot
+  be planted in advance: a forger has to answer within the seconds of a
+  read that a user's change triggered, while the real device answers too,
+  and frames that report a register with two different values fail the
+  read. Read-back verification does not detect a forger whose frames are
+  consistent and arrive before the device's.
 * The switch's POWERUP_ACTION “on” simulates a press of the device's
   internal button after power-up (FHEM: “simulate short press of peer
   self01”), so its effect depends on that button's (default) link.
@@ -747,13 +805,23 @@ firmware, serial number and SGTIN, and closes it again.
 128-bit system key (crypto/rand) into `<state_dir>/system.key` as 32 hex
 digits, mode 0600, owned by the service user. The configuration only
 references it (`security.key_file`, `index` 1). Both files are created with
-`store.WriteFileNew`: written and fsynced under a temporary name, then
+`store.WriteFileNew`: written and fsynced under a temporary name, given
+their owner and mode on the open file (`store.WithOwner`/`WithMode`:
+fchown/fchmod, never by path, because the state directory belongs to the
+service user, who could replace the name with a symbolic link), then
 hard-linked into place, which fails atomically if the name exists, so an
-existing configuration or key is never overwritten. `config` reads
-`key_file` at parse time (absolute path, regular file, at most 256 bytes,
-the key never in an error message) and warns like for the configuration
-file when the key file has any group/other permission bits or belongs to
-another user. The central address is random in `100000`–`EFFFFF` (rejection
+existing configuration or key is never overwritten. Directories init
+creates get their owner on the open directory too (`O_NOFOLLOW`): the state
+directory 0700 owned by the service user; a `-key_file` directory that does
+not exist yet 0750 `root:<service group>` (0700 when not run as root), so
+the service can read the key but not replace it. `config` reads `key_file`
+at parse time (absolute path, at most 256 bytes, the key never in an error
+message): only a regular file is opened, a symbolic link, FIFO or device is
+refused before the open (Lstat), and the open uses `O_NOFOLLOW|O_NONBLOCK`
+(no blocking on a FIFO put there meanwhile) and must yield the file checked.
+It warns like for the configuration file when the key file has any
+group/other permission bits or belongs to another user; run as root (e.g.
+`-check_config`), the owner must be root or the `hmbridge` user. The central address is random in `100000`–`EFFFFF` (rejection
 sampling, no modulo bias), avoiding `000000`, `FFFFFF` and, by convention,
 the low and high ranges other software uses for broadcasts and virtual
 devices.
@@ -765,5 +833,7 @@ which the module (peer registered with index 0) refuses to answer, or the
 device cannot decrypt the payload. `Bridge.pairKeyExchange` then retries
 once per configured key (current, then previous) as the old key, after
 registering the peer with that key's index. If part 1 of the retry with the
-current key is authenticated, the device holds the system key whether or
-not part 2 arrives.
+current key is authenticated (the device challenged it and the radio
+module reports the final ACK as AES-OK; a plain ACK, which anyone could
+send, is not enough), the device holds the system key whether or not part 2
+arrives; otherwise the outcome is reported as unknown and AES stays off.

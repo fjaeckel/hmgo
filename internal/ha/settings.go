@@ -54,8 +54,9 @@ func (c TopicConfig) SettingsTopic(addr string) string {
 }
 
 // Settings status values (SettingsState.Status starts with one of
-// them; per-setting Detail values are "ok", "pending", "writing" or
-// "failed: …").
+// them; per-setting Detail values are "ok", "pending", "writing",
+// "failed: …" or "invalid: …", a value on the device that hmbridge
+// shows but would never write).
 const (
 	SettingsOK      = "ok"
 	SettingsPending = "pending"
@@ -63,6 +64,7 @@ const (
 	SettingsReading = "reading"
 	SettingsFailed  = "failed"
 	SettingsUnread  = "not read"
+	SettingsInvalid = "invalid"
 )
 
 // SettingsState is the published settings state of a device.

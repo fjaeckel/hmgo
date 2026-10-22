@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 )
 
@@ -48,5 +49,27 @@ func TestWriteFileNew(t *testing.T) {
 	ents, _ := os.ReadDir(dir)
 	if len(ents) != 2 {
 		t.Errorf("entries %v", ents)
+	}
+}
+
+func TestWriteFileNewOwnerAndMode(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "config.json")
+	uid, gid := -1, -1
+	if os.Geteuid() == 0 {
+		uid, gid = 65534, 65534
+	}
+	if err := WriteFileNew(p, []byte("{}\n"), WithMode(0o640), WithOwner(uid, gid)); err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Lstat(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode().Perm() != 0o640 {
+		t.Errorf("mode %v", fi.Mode())
+	}
+	if st := fi.Sys().(*syscall.Stat_t); uid >= 0 && (int(st.Uid) != uid || int(st.Gid) != gid) {
+		t.Errorf("owner %d:%d", st.Uid, st.Gid)
 	}
 }

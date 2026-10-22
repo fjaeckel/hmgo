@@ -18,6 +18,12 @@
 //	echo 'dtoverlay=hmbridge-rpi-rf-mod' | sudo tee -a /boot/firmware/config.txt
 //
 // Not verified on hardware yet.
+//
+// Raspberry Pi 3 and 4 only (and other models whose header GPIOs are
+// the SoC's &gpio). Pi 5: the header GPIOs are on the RP1 chip
+// (&rp1_gpio); with &gpio, fragment@1 would drive SoC pins instead of
+// the module's LEDs. On a Pi 5 replace "<&gpio " by "<&rp1_gpio " in
+// fragment@1 (untested) or delete fragment@1 and keep the RTC.
 
 /dts-v1/;
 /plugin/;

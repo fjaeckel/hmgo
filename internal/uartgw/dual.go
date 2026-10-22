@@ -195,13 +195,15 @@ const (
 	// A register read (CONFIG_PARAM_REQ, cmd 0x01 subtype 0x04) is
 	// answered with a series of INFO_PARAM_RESPONSE frames (cmd 0x10
 	// subtype 0x02/0x03), each waiting for our ACK; a thermostat's list
-	// 7 takes about 26. For regReadWindow after the request, at most
-	// regReadFrames such frames of that peer are acknowledged outside
-	// the ACK budget and delivered without an AES challenge (whose rate
-	// limit they would exceed); the bridge only uses them while it
-	// waits for the read (see bridge/settings.go).
+	// 7 takes about 26. From the module's LLMAC_ACK of the request (it
+	// has been transmitted) until the frame with the end marker, at most
+	// regReadWindow and regReadFrames frames, such frames of that peer
+	// are acknowledged outside the ACK budget and delivered without an
+	// AES challenge (whose rate limit they would exceed); the bridge
+	// only uses them while it waits for the read (see
+	// bridge/settings.go). regReadFrames is the bridge's maxParamFrames.
 	regReadWindow = 30 * time.Second
-	regReadFrames = 64
+	regReadFrames = 40
 )
 
 // AESSigner implements the BidCoS AES computations (software AES; see
@@ -359,6 +361,9 @@ type respWaiter struct {
 	msgcnt  byte
 	ch      chan rxMsg // buffered
 	armed   bool       // guarded by DualConn.mu
+	// paramRead: the message is a register read; its LLMAC_ACK opens
+	// the register read window (regReadWindow).
+	paramRead bool
 }
 
 type aesKey struct {
@@ -1112,6 +1117,11 @@ func (c *DualConn) deliverReq(f frame) bool {
 	delete(c.reqs, f.cnt)
 	if r.arm != nil && f.dst == dstLLMAC && f.cmd == llmacAck && len(f.payload) > 0 && f.payload[0] == llmacStatusOK {
 		r.arm.armed = true
+		if r.arm.paramRead {
+			// The register read request has been transmitted: its
+			// answer frames may come now (not before).
+			c.regReads[r.arm.dev] = regRead{until: c.now().Add(regReadWindow), left: regReadFrames}
+		}
 	}
 	r.ch <- f // buffered, written once
 	return true
@@ -1316,9 +1326,27 @@ func isParamRequest(msg []byte) bool {
 	return len(msg) > minMsgLen+1 && msg[2] == 0x01 && msg[minMsgLen+1] == 0x04
 }
 
-// regReadFrameLocked counts a frame of a register read of dev and
-// reports whether it belongs to one in progress. c.mu must be held.
-func (c *DualConn) regReadFrameLocked(dev [3]byte, now time.Time) bool {
+// isParamResponseEnd reports whether a register read answer payload
+// (subtype …) holds the end marker: the pair 00 00 (subtype 0x02) or
+// start address 00 (subtype 0x03), like params.MergeResponse.
+func isParamResponseEnd(payload []byte) bool {
+	switch {
+	case len(payload) >= 2 && payload[0] == 0x03:
+		return payload[1] == 0
+	case len(payload) >= 1 && payload[0] == 0x02:
+		for i := 1; i+1 < len(payload); i += 2 {
+			if payload[i] == 0 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// regReadFrameLocked counts a frame (payload) of a register read of dev
+// and reports whether it belongs to one in progress; the frame with the
+// end marker closes the read. c.mu must be held.
+func (c *DualConn) regReadFrameLocked(dev [3]byte, payload []byte, now time.Time) bool {
 	r, ok := c.regReads[dev]
 	if !ok {
 		return false
@@ -1329,6 +1357,9 @@ func (c *DualConn) regReadFrameLocked(dev [3]byte, now time.Time) bool {
 	}
 	r.left--
 	c.regReads[dev] = r
+	if isParamResponseEnd(payload) {
+		delete(c.regReads, dev)
+	}
 	return true
 }
 
@@ -1491,6 +1522,9 @@ func (c *DualConn) handleRecv(f frame) {
 	// 2. Response to the packet Send is transmitting (only after the
 	// module transmitted it): consumed by Send.
 	if w := c.resp; w != nil && w.armed && src == w.dev && dst == w.us && msgcnt == w.msgcnt {
+		if w.paramRead && isParamResponse(cmd, msg[minMsgLen:]) && isParamResponseEnd(msg[minMsgLen:]) {
+			delete(c.regReads, src) // the whole list in one frame
+		}
 		select {
 		case w.ch <- rxMsg{frame: recvFrame(recvResp, info, rssi, msg), ts: ts}:
 		default:
@@ -1509,7 +1543,7 @@ func (c *DualConn) handleRecv(f frame) {
 
 	// 2b. The further frames of a register read we requested (see
 	// regReadWindow).
-	if toUs && isPeer && isParamResponse(cmd, msg[minMsgLen:]) && c.regReadFrameLocked(src, now) {
+	if toUs && isPeer && isParamResponse(cmd, msg[minMsgLen:]) && c.regReadFrameLocked(src, msg[minMsgLen:], now) {
 		c.deliverLocked(recvFrame(recvResp, info, rssi, msg))
 		ack := c.softAck && bidi
 		c.mu.Unlock()
@@ -2128,17 +2162,11 @@ func (c *DualConn) Send(ctx context.Context, encoded []byte) ([]byte, error) {
 		c.mu.Unlock()
 	}
 
-	if isParamRequest(msg) {
-		var dev [3]byte
-		copy(dev[:], msg[6:9])
-		c.mu.Lock()
-		c.regReads[dev] = regRead{until: c.now().Add(regReadWindow), left: regReadFrames}
-		c.mu.Unlock()
-	}
-
 	var w *respWaiter
 	if bidi {
-		w = &respWaiter{msgcnt: msg[0], ch: make(chan rxMsg, 8)}
+		// A register read: the window for its further answer frames
+		// opens with the request's LLMAC_ACK (deliverReq).
+		w = &respWaiter{msgcnt: msg[0], ch: make(chan rxMsg, 8), paramRead: isParamRequest(msg)}
 		copy(w.us[:], msg[3:6])
 		copy(w.dev[:], msg[6:9])
 		c.mu.Lock()
@@ -2154,6 +2182,11 @@ func (c *DualConn) Send(ctx context.Context, encoded []byte) ([]byte, error) {
 	}
 
 	resp, err := c.transmit(ctx, msg, opts, w, nil)
+	if err != nil && w != nil && w.paramRead {
+		c.mu.Lock()
+		delete(c.regReads, w.dev) // no answer: no read in progress
+		c.mu.Unlock()
+	}
 	if err != nil {
 		countSendError(err)
 		return nil, err

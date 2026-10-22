@@ -254,6 +254,29 @@ func MergeResponse(r Regs, payload []byte) (done bool, err error) {
 	}
 }
 
+// MergeResponseChecked is MergeResponse, but fails without changing r
+// if the frame reports a register that r already holds with another
+// value: a device reports every register of a list once (a
+// retransmitted frame repeats the same values), so two values for one
+// register in one read mean that someone else sent frames with the
+// device's address.
+func MergeResponseChecked(r Regs, payload []byte) (done bool, err error) {
+	tmp := Regs{}
+	done, err = MergeResponse(tmp, payload)
+	if err != nil {
+		return false, err
+	}
+	for a, v := range tmp {
+		if old, ok := r[a]; ok && old != v {
+			return false, fmt.Errorf("params: register %d reported as %02x and %02x in one read (forged frames?)", a, old, v)
+		}
+	}
+	for a, v := range tmp {
+		r[a] = v
+	}
+	return done, nil
+}
+
 // EncodeResponse returns the INFO_PARAM_RESPONSE_PAIRS payloads a device
 // sends for r (8 pairs per frame, the end marker in the last one). Used
 // by the device emulation in tests.
