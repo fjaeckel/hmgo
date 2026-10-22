@@ -1,7 +1,7 @@
 # Copyright (c) 2026 Frederic Jung
 # SPDX-License-Identifier: BSD-3-Clause
 
-VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo devel)
+VERSION ?= $(shell git describe --tags --match 'v*' --always --dirty 2>/dev/null || echo devel)
 LDFLAGS := -s -w
 GOFLAGS := -trimpath
 

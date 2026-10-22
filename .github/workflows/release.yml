@@ -1,0 +1,57 @@
+# Copyright (c) 2026 Frederic Jung
+# SPDX-License-Identifier: BSD-3-Clause
+
+# Builds the release binaries and publishes them as a GitHub release:
+#  - pushing a tag v* (e.g. git tag v0.1.0 && git push origin v0.1.0)
+#    creates the release for that tag;
+#  - every push to master updates the "nightly" pre-release, so the latest
+#    build is always downloadable for testing.
+
+name: Release
+
+on:
+  push:
+    branches: [master]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # tags, for the version in the file names
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Install mosquitto (end-to-end tests)
+        run: sudo apt-get update && sudo apt-get install -y mosquitto
+      - name: Test
+        run: go vet ./... && go test -race ./...
+      - name: Build
+        run: make dist
+      - name: Publish tagged release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --title "hmbridge $GITHUB_REF_NAME" --generate-notes --verify-tag
+      - name: Publish nightly pre-release
+        if: github.ref == 'refs/heads/master'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git tag -f nightly && git push -f origin nightly
+          gh release delete nightly --yes 2>/dev/null || true
+          gh release create nightly dist/* --prerelease \
+            --title "hmbridge nightly ($(git rev-parse --short HEAD))" \
+            --notes "Automatic build of master at ${GITHUB_SHA}. Not a stable release."
