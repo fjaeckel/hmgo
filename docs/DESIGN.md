@@ -295,7 +295,8 @@ Robustness:
   `state.json` in the state directory (see **Persistence** below).
 * **availability** is measured from the device's last message, also across
   restarts, so a device that died before a restart is unavailable at once;
-  groups are available while any of their thermostats is.
+  groups are available while any of their thermostats is. The member
+  entities on a group's HA device follow their member's availability.
 * **AES:** for AES devices, frames not addressed to the central (which the
   module does not authenticate) never change the state.
 * **module clock:** Open leaves the module's clock alone while the system

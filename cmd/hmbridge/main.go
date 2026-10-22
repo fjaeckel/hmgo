@@ -245,8 +245,9 @@ func run(ctx context.Context, cfg *config.Config, uart io.ReadWriteCloser) error
 			// Restore the last published state from the broker's
 			// retained messages before publishing anything, so that a
 			// restart does not blank Home Assistant (and costs no SD
-			// card writes).
-			retained, err := client.ReadRetained(mqttCtx, client.Topics().StateSubscriptions(), 0, 0)
+			// card writes). The groups' member lists tell which group
+			// entities to remove after a configuration change.
+			retained, err := client.ReadRetained(mqttCtx, client.Topics().RetainedSubscriptions(), 0, 0)
 			if err != nil && mqttCtx.Err() == nil {
 				log.Printf("MQTT: reading retained state: %v", err)
 			}

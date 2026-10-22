@@ -311,6 +311,57 @@ thermostat controlling the radiator thermostats of its room) need peering,
 which hmbridge does not set up yet; support is being added, see the section
 *Direct links* once it is available.
 
+#### Heating groups in Home Assistant
+
+Each group is a Home Assistant device "*name* (group)", model "Heating
+group". Its device page shows:
+
+| entity | from |
+|---|---|
+| climate "*name* (group)" | the group: target temperature, mode and boost go to all thermostats; current temperature (and humidity) from the wall thermostat, else the first radiator thermostat |
+| binary sensor "Window" | open while any member reports an open or tilted window |
+| sensor "*member* valve" (%) | each radiator thermostat (HM-CC-RT-DN) |
+| sensors "*member* temperature", "*member* humidity" | each wall thermostat (HM-TC-IT-WM-W-EU) |
+| binary sensor "*member* window" | each window contact |
+| binary sensor "*member* available" (diagnostic, connectivity) | every member: disconnected once it has been silent longer than its `stale_after` |
+
+The member entities read the members' own state topics; they are unavailable
+while the member (or hmbridge) is. They have no state class, so Home Assistant
+keeps long-term statistics only for the members' own sensors, not twice.
+Their entity IDs follow the unique IDs
+`hmbridge_group_<group>_<address>_<field>`, e.g.
+`sensor.hmbridge_group_bad_38f59c_valve`.
+
+The climate entity's attributes list the members, for automations and cards
+(`state_attr('climate.hmbridge_group_bad', 'members')`):
+
+```json
+{
+  "members": [
+    {"name": "Bad Heizung", "model": "HM-CC-RT-DN", "address": "38f59c", "role": "radiator"},
+    {"name": "Bad Fenster", "model": "HM-Sec-SCo", "address": "4c5d6e", "role": "window"}
+  ],
+  "temperature_source": {"name": "Bad Heizung", "address": "38f59c"}
+}
+```
+
+`role` is `radiator`, `wall` or `window`; `humidity_source` is added when a
+wall thermostat provides the humidity. hmbridge publishes this list retained
+on `hmbridge/group/<group>/members` and reads it back at startup: when a
+device has left a group, or a group was removed from `config.json`, the
+entities it no longer has disappear from Home Assistant after the restart.
+
+The members stay devices of their own (with all their sensors and
+settings); they are not linked to the group with `via_device`, which Home
+Assistant shows as "Connected via", a radio path, which a group is not.
+With `groups_suggest_area` (default `true`), the group's device and its
+members' devices suggest the group name as their area. Home Assistant applies
+a suggested area only when it first creates a device, so devices that are
+already known keep their area, and areas changed in Home Assistant are never
+overwritten. Set the area of existing devices by hand (deleting and
+rediscovering a device does not help: Home Assistant restores a recently
+deleted device with its old area).
+
 ## Migrating from OpenCCU
 
 hmbridge needs exclusive access to the radio module (HM-MOD-RPI-PCB or
@@ -609,7 +660,9 @@ entity and an "Unpair" button (disabled by default). Devices with settings
 (section 6) have configuration entities, a "Settings" status sensor and a
 "Refresh settings" button. hmbridge itself appears
 as the device "hmbridge" with the "Pair new device" button and the pairing
-sensors.
+sensors. Each heating group is a device "*name* (group)" with its climate
+entity and one entity per member (see
+[Heating groups in Home Assistant](#heating-groups-in-home-assistant)).
 
 Notes per device type:
 

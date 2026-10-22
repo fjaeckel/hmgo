@@ -1044,6 +1044,91 @@ func TestSeedFromRetained(t *testing.T) {
 	}
 }
 
+// The group's HA device shows its members, the members' devices get the
+// group name as suggested area, and the entities of former members and
+// groups (found in the retained messages) are removed.
+func TestGroupMembersInHomeAssistant(t *testing.T) {
+	for _, suggest := range []bool{true, false} {
+		conf := testConfig
+		if !suggest {
+			conf = strings.Replace(conf, `"groups": [`, `"groups_suggest_area": false, "groups": [`, 1)
+		}
+		cfg, err := config.Parse([]byte(conf))
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, err := New(Options{Config: cfg, Radio: nopRadio{}, Logf: t.Logf})
+		if err != nil {
+			t.Fatal(err)
+		}
+		topics := ha.TopicConfig{}
+		b.SeedFromRetained(topics, map[string][]byte{
+			// Before: a radiator thermostat that has left the group, and a
+			// group that was removed.
+			"hmbridge/group/wohnzimmer/members": []byte(`{"members":[{"address":"38f59c","role":"radiator"},{"address":"ffffff","role":"radiator"}]}`),
+			"hmbridge/group/bad/state":          []byte(`{}`),
+		})
+		pub := &fakePub{}
+		b.SetPublisher(pub)
+		for _, m := range b.outbox.take() {
+			pub.Publish(m)
+		}
+
+		var attrs ha.GroupAttributes
+		if err := json.Unmarshal(pub.get("hmbridge/group/wohnzimmer/members"), &attrs); err != nil {
+			t.Fatal(err)
+		}
+		var roles []string
+		for _, m := range attrs.Members {
+			roles = append(roles, m.Address+" "+m.Role+" "+m.Name)
+		}
+		want := []string{"2a1b3c wall Wohnzimmer Wand", "38f59c radiator Wohnzimmer Heizung", "38f5a1 radiator Wohnzimmer Heizung 2", "4c5d6e window Wohnzimmer Fenster"}
+		if strings.Join(roles, ", ") != strings.Join(want, ", ") || attrs.TemperatureSource == nil || attrs.TemperatureSource.Address != "2a1b3c" ||
+			attrs.HumiditySource == nil || attrs.HumiditySource.Address != "2a1b3c" {
+			t.Errorf("members = %v, sources %+v %+v", roles, attrs.TemperatureSource, attrs.HumiditySource)
+		}
+		for _, topic := range []string{
+			"homeassistant/sensor/hmbridge_group_wohnzimmer/2a1b3c_temperature/config",
+			"homeassistant/sensor/hmbridge_group_wohnzimmer/2a1b3c_humidity/config",
+			"homeassistant/sensor/hmbridge_group_wohnzimmer/38f59c_valve/config",
+			"homeassistant/sensor/hmbridge_group_wohnzimmer/38f5a1_valve/config",
+			"homeassistant/binary_sensor/hmbridge_group_wohnzimmer/4c5d6e_window/config",
+			"homeassistant/binary_sensor/hmbridge_group_wohnzimmer/4c5d6e_available/config",
+		} {
+			if len(pub.get(topic)) == 0 {
+				t.Errorf("missing %s", topic)
+			}
+		}
+		removed := func(topic string) bool {
+			pub.mu.Lock()
+			defer pub.mu.Unlock()
+			p, ok := pub.msgs[topic]
+			return ok && len(p) == 0
+		}
+		for _, topic := range []string{
+			"homeassistant/sensor/hmbridge_group_wohnzimmer/ffffff_valve/config",
+			"homeassistant/binary_sensor/hmbridge_group_wohnzimmer/ffffff_available/config",
+			"homeassistant/climate/hmbridge_group_bad/config",
+			"hmbridge/group/bad/state",
+		} {
+			if !removed(topic) {
+				t.Errorf("%s not removed", topic)
+			}
+		}
+
+		var climate, member struct {
+			Device map[string]any `json:"device"`
+		}
+		json.Unmarshal(pub.get("homeassistant/climate/hmbridge_group_wohnzimmer/config"), &climate)
+		json.Unmarshal(pub.get("homeassistant/climate/hmbridge_38f59c/config"), &member)
+		for what, dev := range map[string]map[string]any{"group": climate.Device, "member": member.Device} {
+			if area, ok := dev["suggested_area"]; ok != suggest || (suggest && area != "Wohnzimmer") {
+				t.Errorf("groups_suggest_area %v: %s device suggested_area = %v", suggest, what, area)
+			}
+		}
+	}
+}
+
 // nopRadio is a Radio that does nothing (for tests that don't run the bridge).
 type nopRadio struct{}
 

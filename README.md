@@ -53,7 +53,10 @@ heating groups.
 * **Heating groups**, like the CCU's: one climate entity per group that
   controls all its thermostats (or only the wall thermostat, which forwards to
   its valves, with `via_wall_thermostat`), with temperature from the wall
-  thermostat and window state from the contacts.
+  thermostat and window state from the contacts. The group's Home Assistant
+  device also shows every member (valve positions, wall thermostat
+  temperature and humidity, each window, availability); see
+  [docs/DEPLOY.md](docs/DEPLOY.md#heating-groups-in-home-assistant).
 * **Prometheus metrics** at `/metrics`, covering:
   * Per-device state.
   * The radio module (frames, acks, retries, duty cycle, errors).
@@ -219,6 +222,7 @@ once the MQTT integration is set up. Topics, with base topic `hmbridge`:
 | `hmbridge/<address>/set/setting_<key>` | change a setting, e.g. `setting_temperature_offset` `1.5`, `setting_week_profile_monday` `06:00 17, 22:00 21, 24:00 17` |
 | `hmbridge/<address>/set/settings_refresh` | read the device's settings again |
 | `hmbridge/group/<name>/…` | the same for heating groups |
+| `hmbridge/group/<name>/members` | JSON member list of a heating group (attributes of its climate entity) |
 
 HomeMatic modes map to Home Assistant like this:
 

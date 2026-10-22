@@ -104,7 +104,7 @@ func TestGroupDiscovery(t *testing.T) {
 	if msgs[1].Topic != "homeassistant/binary_sensor/hmbridge_group_wohnzimmer/window_open/config" || w["device_class"] != "window" || w["state_topic"] != "hmbridge/group/wohnzimmer/state" {
 		t.Errorf("window = %s %v", msgs[1].Topic, w)
 	}
-	rm := topicsOf(GroupRemovalMessages(cfg, "wohnzimmer"))
+	rm := topicsOf(GroupRemovalMessages(cfg, "wohnzimmer", nil))
 	for _, m := range msgs {
 		if _, ok := rm[m.Topic]; !ok {
 			t.Errorf("GroupRemovalMessages misses %s", m.Topic)

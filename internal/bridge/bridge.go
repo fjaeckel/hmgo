@@ -165,6 +165,10 @@ type Bridge struct {
 	allStaleSent bool
 	// pair is the pairing mode state (see pairing.go).
 	pair pairingMode
+	// staleGroups removes the HA entities of heating groups and group
+	// members that are no longer configured (found by SeedFromRetained);
+	// sent with every PublishAll.
+	staleGroups []ha.Message
 
 	// paramCol receives the frames of the register read the worker is
 	// doing (settings.go); guarded by paramMu.
@@ -233,6 +237,8 @@ type group struct {
 	contacts                  []*device
 	climate                   *device // source of temperature/humidity/target/mode
 	state                     ha.State
+	// desc is the group's discovery description (members included).
+	desc ha.GroupDesc
 }
 
 // maxUnknownSenders bounds the list of unconfigured senders.
@@ -364,6 +370,7 @@ func New(opts Options) (*Bridge, error) {
 		for _, dc := range rg.CommandTargets {
 			g.targets = append(g.targets, b.byAddr[dc.Addr()])
 		}
+		g.desc = b.groupDesc(g)
 		b.groups = append(b.groups, g)
 		b.bySlug[slug] = g
 	}
@@ -373,6 +380,29 @@ func New(opts Options) (*Bridge, error) {
 		}
 	}
 	return b, nil
+}
+
+// groupDesc builds g's discovery description and, with
+// groups_suggest_area, makes the group name the suggested area of the
+// members' HA devices.
+func (b *Bridge) groupDesc(g *group) ha.GroupDesc {
+	suggest := b.cfg.SuggestGroupAreas()
+	desc := ha.GroupDesc{Slug: g.slug, Name: g.name, SuggestArea: suggest}
+	for _, d := range append(append([]*device(nil), g.thermostats...), g.contacts...) {
+		desc.Members = append(desc.Members, ha.GroupMember{
+			Name:    d.cfg.Name,
+			Model:   d.cfg.Model,
+			Address: d.desc.Addr,
+			Role:    ha.RoleForKind(d.desc.Kind),
+		})
+		if suggest {
+			d.desc.SuggestedArea = g.name
+		}
+	}
+	if g.climate != nil {
+		desc.Climate = g.climate.desc.Addr
+	}
+	return desc
 }
 
 // newDevice builds the registry entry for dc. stored is the devices
@@ -511,7 +541,8 @@ func (b *Bridge) PublishAll() {
 		d.availPublished = true
 	}
 	for _, g := range b.groups {
-		msgs = append(msgs, ha.GroupDiscoveryMessages(topics, ha.GroupDesc{Slug: g.slug, Name: g.name})...)
+		msgs = append(msgs, ha.GroupDiscoveryMessages(topics, g.desc)...)
+		msgs = append(msgs, ha.GroupMembersMessage(topics, g.desc))
 		msgs = append(msgs, ha.GroupAvailabilityMessage(topics, g.slug, g.available))
 		g.availPublished = true
 		if !g.state.LastSeen.IsZero() {
@@ -520,6 +551,9 @@ func (b *Bridge) PublishAll() {
 			}
 		}
 	}
+	// Idempotent, so resent on every reconnect (the outbox does not
+	// retry failed publishes).
+	msgs = append(msgs, b.staleGroups...)
 	// Enqueue while holding b.mu: the outbox keeps only the latest
 	// message per topic, so a state snapshot taken here can never
 	// overwrite a newer one queued by the event loop.

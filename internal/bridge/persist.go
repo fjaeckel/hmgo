@@ -138,7 +138,10 @@ func (b *Bridge) loadState(f *store.File) error {
 }
 
 // SeedFromRetained restores device state from the retained state
-// messages hmbridge published before (see ha.Client.ReadRetained). A
+// messages hmbridge published before (see ha.Client.ReadRetained, with
+// ha.TopicConfig.RetainedSubscriptions), and finds the HA entities of
+// heating groups and group members that are no longer configured
+// (ha.StaleGroupMessages; PublishAll removes them). A
 // device is only seeded if nothing newer is known about it (e.g. from
 // the state file, or a message received since startup). Call it before
 // SetPublisher.
@@ -178,6 +181,14 @@ func (b *Bridge) SeedFromRetained(topics ha.TopicConfig, msgs map[string][]byte)
 	b.checkAvailability(b.now())
 	if n > 0 {
 		b.logf("restored the last known state of %d devices from the MQTT broker", n)
+	}
+	descs := make([]ha.GroupDesc, len(b.groups))
+	for i, g := range b.groups {
+		descs[i] = g.desc
+	}
+	b.staleGroups = ha.StaleGroupMessages(topics, descs, msgs)
+	if len(b.staleGroups) > 0 {
+		b.logf("removing %d Home Assistant discovery and state topics of former heating groups and group members", len(b.staleGroups))
 	}
 }
 

@@ -241,6 +241,13 @@ type Config struct {
 	// hmbridge are kept in devices.json in StateDir instead.
 	Devices []Device `json:"devices"`
 	Groups  []Group  `json:"groups,omitempty"`
+	// GroupsSuggestArea sends each heating group's name as the Home
+	// Assistant suggested_area of the group's device and of its members'
+	// devices. Default true. Home Assistant applies a suggested area only
+	// when it creates a device (first discovery), never to an existing
+	// one, so this neither moves devices later nor overrides areas set in
+	// Home Assistant.
+	GroupsSuggestArea *bool `json:"groups_suggest_area,omitempty"`
 
 	centralAddr [3]byte
 	current     hmkey.Key
@@ -1046,6 +1053,12 @@ func (c *Config) StateSaveInterval() time.Duration {
 		return c.StateSaveIntervalSetting.Duration
 	}
 	return DefaultStateSaveInterval
+}
+
+// SuggestGroupAreas reports whether heating group names are sent as
+// suggested areas (groups_suggest_area, default true).
+func (c *Config) SuggestGroupAreas() bool {
+	return c.GroupsSuggestArea == nil || *c.GroupsSuggestArea
 }
 
 // RequiresSyncedClock reports whether time is only handed out while the

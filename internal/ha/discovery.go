@@ -341,6 +341,9 @@ type node struct {
 	eventTopic func(button int) string
 	// topic returns <base>/<addr>/<suffix> (nil for groups).
 	topic func(suffix string) string
+	// attrTopic, if set, is the climate entity's json_attributes_topic
+	// (a group's member list).
+	attrTopic string
 }
 
 func deviceNode(cfg TopicConfig, d DeviceDesc) node {
@@ -360,6 +363,9 @@ func deviceNode(cfg TopicConfig, d DeviceDesc) node {
 	if d.Serial != "" {
 		dev["serial_number"] = d.Serial
 	}
+	if d.SuggestedArea != "" {
+		dev["suggested_area"] = d.SuggestedArea
+	}
 	return node{
 		id:          nodeID(addr),
 		stateTopic:  cfg.StateTopic(addr),
@@ -369,26 +375,6 @@ func deviceNode(cfg TopicConfig, d DeviceDesc) node {
 		deviceAvail: cfg.DeviceAvailabilityTopic(addr),
 		eventTopic:  func(button int) string { return cfg.EventTopic(addr, button) },
 		topic:       func(suffix string) string { return cfg.base() + "/" + addr + "/" + suffix },
-	}
-}
-
-func groupNode(cfg TopicConfig, g GroupDesc) node {
-	name := g.Name
-	if name == "" {
-		name = g.Slug
-	}
-	return node{
-		id:         groupNodeID(g.Slug),
-		stateTopic: cfg.GroupStateTopic(g.Slug),
-		cmdTopic:   func(what string) string { return cfg.GroupCommandTopic(g.Slug, what) },
-		device: map[string]any{
-			"identifiers":  []string{groupNodeID(g.Slug)},
-			"name":         name + " (group)",
-			"model":        "Heating group",
-			"manufacturer": "hmbridge",
-		},
-		humidity:    true, // harmless when the group has no humidity
-		deviceAvail: cfg.GroupAvailabilityTopic(g.Slug),
 	}
 }
 
@@ -464,6 +450,9 @@ func climateConfig(cfg TopicConfig, n node) map[string]any {
 	if n.humidity {
 		m["current_humidity_topic"] = st
 		m["current_humidity_template"] = numTemplate("humidity")
+	}
+	if n.attrTopic != "" {
+		m["json_attributes_topic"] = n.attrTopic
 	}
 	common(cfg, n, "climate", n.id, "", m, false)
 	return m
@@ -590,32 +579,4 @@ func staleMessages(cfg TopicConfig, d DeviceDesc, scoped bool) []Message {
 		}
 	}
 	return msgs
-}
-
-func groupWindowEntity() entity {
-	return entity{component: "binary_sensor", key: "window_open", config: binarySensor("Window", "window_open", "window", nil)}
-}
-
-// GroupDiscoveryMessages returns the discovery messages for a heating
-// group: a climate entity (commands on <base>/group/<slug>/set/...) and a
-// window binary sensor, on their own HA device.
-func GroupDiscoveryMessages(cfg TopicConfig, g GroupDesc) []Message {
-	n := groupNode(cfg, g)
-	return []Message{
-		retained(climateTopic(cfg, n.id), mustJSON(climateConfig(cfg, n))),
-		entityMessage(cfg, n, groupWindowEntity()),
-	}
-}
-
-// GroupRemovalMessages removes a heating group's discovery configs and
-// retained state.
-func GroupRemovalMessages(cfg TopicConfig, slug string) []Message {
-	id := groupNodeID(slug)
-	e := groupWindowEntity()
-	return []Message{
-		retained(climateTopic(cfg, id), nil),
-		retained(entityTopic(cfg, e.component, id, e.key), nil),
-		retained(cfg.GroupStateTopic(slug), nil),
-		retained(cfg.GroupAvailabilityTopic(slug), nil),
-	}
 }

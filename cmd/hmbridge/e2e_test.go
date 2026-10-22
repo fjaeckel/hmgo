@@ -49,7 +49,8 @@ func TestEndToEnd(t *testing.T) {
 	t.Cleanup(func() { broker.Process.Kill(); broker.Wait() })
 	waitTCP(t, fmt.Sprintf("127.0.0.1:%d", brokerPort))
 
-	cfg, err := config.Parse([]byte(fmt.Sprintf(`{
+	confJSON := func(members string) []byte {
+		return []byte(fmt.Sprintf(`{
 	  "central_address": "1A2B3C",
 	  "reset": "none",
 	  "state_file": "",
@@ -60,8 +61,10 @@ func TestEndToEnd(t *testing.T) {
 	    {"name": "Bad", "model": "HM-CC-RT-DN", "address": "38F59C"},
 	    {"name": "Bad Fenster", "model": "HM-Sec-SCo", "address": "4C5D6E"}
 	  ],
-	  "groups": [{"name": "Bad", "members": ["Bad", "Bad Fenster"]}]
-	}`, brokerPort, httpPort)))
+	  "groups": [{"name": "Bad", "members": [%s]}]
+	}`, brokerPort, httpPort, members))
+	}
+	cfg, err := config.Parse(confJSON(`"Bad", "Bad Fenster"`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -109,6 +112,20 @@ func TestEndToEnd(t *testing.T) {
 		return v["unique_id"] == "hmbridge_38f59c"
 	})
 	waitFor(t, "group discovery", func() bool { return len(get("homeassistant/climate/hmbridge_group_bad/config")) > 0 })
+	// The group's device shows its members.
+	const contactOnGroup = "homeassistant/binary_sensor/hmbridge_group_bad/4c5d6e_window/config"
+	waitFor(t, "group member entities", func() bool {
+		v, w := jsonOf("homeassistant/sensor/hmbridge_group_bad/38f59c_valve/config"), jsonOf(contactOnGroup)
+		return v["state_topic"] == "hmbridge/38f59c/state" && v["unique_id"] == "hmbridge_group_bad_38f59c_valve" &&
+			w["device_class"] == "window" && w["device"].(map[string]any)["name"] == "Bad (group)"
+	})
+	waitFor(t, "group member list", func() bool {
+		m, _ := jsonOf("hmbridge/group/bad/members")["members"].([]any)
+		return len(m) == 2 && jsonOf("homeassistant/climate/hmbridge_group_bad/config")["json_attributes_topic"] == "hmbridge/group/bad/members"
+	})
+	if dev, _ := jsonOf("homeassistant/climate/hmbridge_38f59c/config")["device"].(map[string]any); dev["suggested_area"] != "Bad" {
+		t.Errorf("member device = %v, want suggested_area Bad", dev)
+	}
 
 	// The radiator thermostat reports its status.
 	central := []byte{0x1a, 0x2b, 0x3c}
@@ -183,21 +200,39 @@ func TestEndToEnd(t *testing.T) {
 
 	// Restart: without a state file, the second run restores the state
 	// from the broker's retained messages and republishes it before any
-	// device has reported (restored state has no message counter).
+	// device has reported (restored state has no message counter). The
+	// window contact has left the group meanwhile.
 	mu.Lock()
 	delete(seen, "hmbridge/38f59c/state")
 	mu.Unlock()
+	cfg2, err := config.Parse(confJSON(`"Bad"`))
+	if err != nil {
+		t.Fatal(err)
+	}
 	mod2, rw2 := fakemod.New(fakemod.Options{})
 	defer mod2.Close()
 	ctx2, cancel2 := context.WithCancel(context.Background())
 	done2 := make(chan error, 1)
-	go func() { done2 <- run(ctx2, cfg, rw2) }()
+	go func() { done2 <- run(ctx2, cfg2, rw2) }()
 	waitFor(t, "online again", func() bool { return string(get("hmbridge/bridge/availability")) == "online" })
 	waitFor(t, "restored state republished", func() bool {
 		v := jsonOf("hmbridge/38f59c/state")
 		return v["target_temperature"] == 21.5 && v["battery_voltage"] == 3.0 && v["messages_received"] == nil
 	})
 	waitFor(t, "restored group state", func() bool { return jsonOf("hmbridge/group/bad/state")["current_temperature"] == 22.6 })
+	waitFor(t, "former member's entities removed", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		p, ok := seen[contactOnGroup]
+		return ok && len(p) == 0
+	})
+	waitFor(t, "updated member list", func() bool {
+		m, _ := jsonOf("hmbridge/group/bad/members")["members"].([]any)
+		return len(m) == 1
+	})
+	if len(get("homeassistant/sensor/hmbridge_group_bad/38f59c_valve/config")) == 0 {
+		t.Error("remaining member's entity removed")
+	}
 	if a := string(get("hmbridge/38f59c/availability")); a != "online" {
 		t.Errorf("device availability after restart = %q, want online", a)
 	}

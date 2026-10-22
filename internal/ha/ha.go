@@ -32,6 +32,7 @@
 //	hmbridge/bridge/set/pair            "PRESS" (or seconds, 10 … 600): start pairing mode
 //	hmbridge/bridge/pairing             retained JSON PairingState
 //	hmbridge/group/<slug>/state         retained JSON State of a heating group
+//	hmbridge/group/<slug>/members       retained JSON GroupAttributes (member list)
 //	hmbridge/group/<slug>/set/...       as for devices
 //	homeassistant/status                HA birth/will message ("online")
 //
@@ -52,9 +53,13 @@
 //	homeassistant/{number,select,switch,text}/hmbridge_<addr>/setting_<key>/config (device settings)
 //
 // GroupDiscoveryMessages does the same for a heating group, with node id
-// "hmbridge_group_<slug>": a climate entity and a window binary sensor on
-// an HA device "<name> (group)", model "Heating group". Member devices
-// stay independent HA devices (no via_device: a group is not a hub).
+// "hmbridge_group_<slug>": a climate entity, a window binary sensor and
+// per member a few entities that mirror the member's state (see
+// GroupDiscoveryMessages) on an HA device "<name> (group)", model
+// "Heating group". Member devices stay independent HA devices (no
+// via_device: HA shows it as "Connected via", a radio path, which a
+// group is not). The member list is published retained on
+// <base>/group/<slug>/members and is the climate entity's attributes.
 //
 // All entities belong to one HA device (identifier "hmbridge_<addr>") and
 // read the same state topic through value templates. Templates tolerate
@@ -228,6 +233,11 @@ type DeviceDesc struct {
 	// AllSettings are the settings of all models: AllStaleDiscoveryMessages
 	// and SettingsRemovalMessages remove those the device does not have.
 	AllSettings []SettingDesc
+	// SuggestedArea, if set, is sent as the HA device's suggested_area
+	// (typically the name of the device's heating group). Home Assistant
+	// only uses it when it creates the device, so it never moves a device
+	// the user has put into another area.
+	SuggestedArea string
 }
 
 // GroupDesc describes a heating group for discovery. Group topics live
@@ -235,6 +245,16 @@ type DeviceDesc struct {
 type GroupDesc struct {
 	Slug string // [a-z0-9_-]{1,64}, e.g. "wohnzimmer"
 	Name string // e.g. "Wohnzimmer"; the HA device is named "<Name> (group)"
+	// Members are the group's devices (see GroupMember), shown as
+	// entities on the group's HA device and listed in the climate
+	// entity's attributes.
+	Members []GroupMember
+	// Climate is the address of the member that provides the group's
+	// current temperature (and humidity, if it is a wall thermostat).
+	Climate string
+	// SuggestArea sends the group name as suggested_area of the group's
+	// HA device (HA applies it only when it creates the device).
+	SuggestArea bool
 }
 
 // ValidSlug reports whether s can be used as a GroupDesc.Slug.
