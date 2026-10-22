@@ -24,10 +24,10 @@ cat /etc/config/ids
 ls /etc/config/rfd/
 ```
 
-If the firmware is 2.x / "DualCoPro", hmbridge stops at startup with an
-explanation. That firmware exists for Homematic IP, which you don't use, but
-it has to be replaced by the classic firmware first (see "Module firmware"
-below).
+`/var/hm_mode` tells you which radio board you have (`HM_HMRF_DEV`):
+`HM-MOD-RPI-PCB` (classic firmware 1.x) or `RPI-RF-MOD` (eQ-3 dual firmware,
+e.g. 4.4.22). hmbridge supports both and detects them; RPI-RF-MOD support is
+experimental (see the README).
 
 If you set a "system security key" in OpenCCU, put that passphrase into
 `security.passphrase`. Its index is 1 if you set the key once, and goes up by

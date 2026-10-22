@@ -152,6 +152,10 @@ func dstLabel(dst byte) string {
 		return "os"
 	case dstApp:
 		return "app"
+	case dstHMIP:
+		return "hmip"
+	case dstLLMAC:
+		return "llmac"
 	case dstDual:
 		return "dual"
 	case dstDualErr:

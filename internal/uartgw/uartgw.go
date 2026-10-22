@@ -34,7 +34,9 @@ import (
 const (
 	dstOS      = 0x00 // bootloader (also used for “OS” commands while the app runs)
 	dstApp     = 0x01 // BidCoS application
-	dstDual    = 0xfe // dual-coprocessor firmware (Homematic IP)
+	dstHMIP    = 0x02 // dual-coprocessor firmware: Homematic IP (see dual.go)
+	dstLLMAC   = 0x03 // dual-coprocessor firmware: BidCoS MAC (see dual.go)
+	dstDual    = 0xfe // dual-coprocessor firmware “COMMON” (identify, change app)
 	dstDualErr = 0xff // dual-coprocessor firmware error
 )
 
@@ -44,6 +46,10 @@ func dstName(dst byte) string {
 		return "OS"
 	case dstApp:
 		return "App"
+	case dstHMIP:
+		return "HMIP"
+	case dstLLMAC:
+		return "LLMAC"
 	case dstDual:
 		return "Dual"
 	case dstDualErr:
@@ -266,6 +272,56 @@ type Config struct {
 
 	// Debug enables logging of every frame (key material is redacted).
 	Debug bool
+
+	// The following fields only apply to the RPI-RF-MOD (DualConn, see
+	// dual.go); Open and the classic module ignore them.
+
+	// SoftwareAck makes hmbridge acknowledge BiDi messages of registered
+	// peers addressed to HMID itself (nil: true). The dual-coprocessor
+	// firmware presumably leaves this to the host (OCCU's rfd does the
+	// BidCoS logic in software). ASSUMPTION — verify with a capture.
+	SoftwareAck *bool
+
+	// SoftwareAES makes hmbridge challenge BiDi messages of peers with
+	// AES channels and verify the answers with Signer (nil: true).
+	SoftwareAES *bool
+
+	// Signer computes and verifies AES answers (software AES). nil: AES
+	// is not available; AES exchanges fail (logged once).
+	Signer AESSigner
+
+	// ResponseTimeout is how long Send waits for a device's response
+	// after the module confirmed the transmission, and how long a
+	// received message is held while waiting for the answer to our AES
+	// challenge (default 1s; burst devices need ~360ms preamble).
+	ResponseTimeout time.Duration
+
+	// SendRetries is how often an unanswered BiDi packet is retransmitted
+	// with the same message counter (default 2, like the classic
+	// module's internal retries; negative: none).
+	SendRetries int
+
+	// ChangeAppWait is how long to wait for the application announcement
+	// after switching from the bootloader to the application (default
+	// 3.5s; RFNETHM observed ~2.2s).
+	ChangeAppWait time.Duration
+
+	// DualInit is sent to the module after it entered the application.
+	// Empty by default: how OpenCCU's multimacd configures the module
+	// (BidCoS address, AES, duty cycle, …) is not known yet. TODO: fill
+	// in from an hmsniff capture, see docs/SNIFFING.md.
+	DualInit []InitStep
+
+	// DualPeerInit returns steps registering a peer with the module
+	// (sent by AddPeer). nil: none (TODO, see DualInit).
+	DualPeerInit func(p Peer) []InitStep
+
+	// DualFirmwareVersion is reported by FirmwareVersion for the
+	// RPI-RF-MOD, whose version query is not known (default "unknown").
+	DualFirmwareVersion string
+
+	// Rand is the source of AES challenges (nil: crypto/rand).
+	Rand io.Reader
 }
 
 func csmaCAByte(enabled bool) byte {
@@ -299,6 +355,13 @@ type pending struct {
 type Conn struct {
 	rw io.ReadWriter
 	fr *frameReader
+
+	// next, if non-nil, replaces fr as the source of frames (OpenModule:
+	// the frames are read by the framePump which already served the
+	// detection). replay holds frames received during detection, which
+	// are dispatched before reading further frames.
+	next   func() (frame, error)
+	replay []frame
 
 	timeout         time.Duration
 	sendTimeout     time.Duration
@@ -357,6 +420,18 @@ type Conn struct {
 // If Open fails and rw implements io.Closer, rw is closed (so that the
 // reader goroutine terminates).
 func Open(rw io.ReadWriter, cfg Config) (*Conn, error) {
+	return openConn(rw, cfg, legacyOpts{})
+}
+
+// legacyOpts are used by OpenModule to hand a detected HM-MOD-RPI-PCB
+// over to the classic implementation.
+type legacyOpts struct {
+	pump             *framePump // nil: Conn reads rw itself
+	replay           []frame    // frames received during detection
+	skipAnnounceWait bool       // detection already waited for the announcement in vain
+}
+
+func openConn(rw io.ReadWriter, cfg Config, opts legacyOpts) (*Conn, error) {
 	c := &Conn{
 		rw:              rw,
 		fr:              newFrameReader(rw),
@@ -388,7 +463,17 @@ func Open(rw io.ReadWriter, cfg Config) (*Conn, error) {
 	if c.maxAckTimeouts == 0 {
 		c.maxAckTimeouts = defaultMaxAckTimeouts
 	}
-	c.fr.altInits = c.altCRCInits
+	if opts.pump != nil {
+		c.fr = nil
+		c.next = opts.pump.next
+		c.replay = opts.replay
+		opts.pump.setAltInits(c.altCRCInits)
+	} else {
+		c.fr.altInits = c.altCRCInits
+	}
+	if opts.skipAnnounceWait {
+		c.announceWait = time.Millisecond
+	}
 
 	go c.readLoop()
 
@@ -429,6 +514,9 @@ func (c *Conn) FirmwareVersion() string { return c.firmware }
 
 // SerialNumber returns the module’s serial number, e.g. “NEQ1330980”.
 func (c *Conn) SerialNumber() string { return c.serial }
+
+// Kind returns KindHMModRPIPCB.
+func (c *Conn) Kind() string { return KindHMModRPIPCB }
 
 // Recv delivers received radio frames (AppRecv payloads: status, info,
 // rssi, msg…; decodable with bidcos.Decode). The channel is buffered;
@@ -528,8 +616,19 @@ func (c *Conn) logFrame(dir string, f frame) {
 
 // readLoop reads and dispatches all frames until a read error occurs.
 func (c *Conn) readLoop() {
+	for _, f := range c.replay {
+		c.logFrame("recv", f)
+		c.dispatch(f)
+	}
+	c.replay = nil
 	for {
-		f, err := c.fr.next()
+		var f frame
+		var err error
+		if c.next != nil {
+			f, err = c.next()
+		} else {
+			f, err = c.fr.next()
+		}
 		if err != nil {
 			if errors.Is(err, errBadFrame) {
 				frameErrors.Inc()
@@ -541,7 +640,7 @@ func (c *Conn) readLoop() {
 			}
 			return
 		}
-		if c.fr.skipped > 0 {
+		if c.fr != nil && c.fr.skipped > 0 {
 			log.Printf("uartgw: skipped %d bytes of garbage before frame", c.fr.skipped)
 			c.fr.skipped = 0
 		}

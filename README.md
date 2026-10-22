@@ -49,9 +49,15 @@ heating groups.
 
 ## Requirements
 
-* A Raspberry Pi with an **HM-MOD-RPI-PCB** running the **classic firmware
-  1.x**. OpenCCU may have flashed eQ-3's Homematic IP "dual" firmware;
-  hmbridge detects this and refuses to start with an explanation.
+* A Raspberry Pi with one of eQ-3's radio boards (detected automatically,
+  or set `"radio"` in the configuration):
+  * **HM-MOD-RPI-PCB** with the classic firmware 1.x. The module handles
+    acknowledgements and AES itself.
+  * **RPI-RF-MOD** (eQ-3 "dual" firmware, as used by OpenCCU for Homematic IP
+    and classic Homematic). **Experimental:** hmbridge acknowledges device
+    messages and does AES in software, and parts of the module protocol are
+    still being verified against recordings of OpenCCU's traffic
+    ([docs/SNIFFING.md](docs/SNIFFING.md)).
 * An MQTT broker reachable from the Pi (e.g. the Mosquitto add-on of Home
   Assistant).
 

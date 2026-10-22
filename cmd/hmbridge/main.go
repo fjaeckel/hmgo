@@ -25,10 +25,12 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"golang.org/x/sys/unix"
 
+	bidcosaes "github.com/fjaeckel/hmgo/internal/bidcos/aes"
 	"github.com/fjaeckel/hmgo/internal/bridge"
 	"github.com/fjaeckel/hmgo/internal/config"
 	"github.com/fjaeckel/hmgo/internal/gpio"
 	"github.com/fjaeckel/hmgo/internal/ha"
+	"github.com/fjaeckel/hmgo/internal/hmkey"
 	"github.com/fjaeckel/hmgo/internal/serial"
 	"github.com/fjaeckel/hmgo/internal/uartgw"
 )
@@ -99,26 +101,16 @@ func main() {
 // done or the radio fails. uart is closed on return.
 func run(ctx context.Context, cfg *config.Config, uart io.ReadWriteCloser) error {
 	buildInfo.WithLabelValues(version(), runtime.Version()).Set(1)
-	current, previous := cfg.Keys()
-	conn, err := uartgw.Open(uart, uartgw.Config{
-		HMID:     cfg.CentralAddr(),
-		Current:  current,
-		Previous: previous,
-		CSMACA:   cfg.CSMACA,
-		// Don't hand a stale clock to the module (no RTC on a Pi); the
-		// bridge sets it once NTP has synchronised.
-		SkipSetTime: cfg.RequiresSyncedClock() && !bridge.SystemClockSynced(),
-		Debug:       *debugFrames,
-	})
+	conn, err := openModule(cfg, uart)
 	if err != nil {
 		uart.Close()
-		if errors.Is(err, uartgw.ErrDualCoProFirmware) {
-			return fmt.Errorf("%w\n\nThe radio module runs eQ-3's dual-coprocessor (Homematic IP) firmware. hmbridge needs the classic HM-MOD-RPI-PCB firmware 1.4.x; see docs/DEPLOY.md, section \"Module firmware\"", err)
-		}
-		return fmt.Errorf("initialising the radio module on %s: %w", cfg.SerialPort, err)
+		return err
 	}
 	defer conn.Close()
-	log.Printf("radio module ready: firmware %s, serial %s, central address %x", conn.FirmwareVersion(), conn.SerialNumber(), cfg.CentralAddr())
+	log.Printf("radio module ready: %s, firmware %s, serial %s, central address %x", conn.Kind(), conn.FirmwareVersion(), conn.SerialNumber(), cfg.CentralAddr())
+	if conn.Kind() == uartgw.KindRPIRFMod {
+		log.Printf("RPI-RF-MOD support is experimental: acknowledgements and AES are done in software, and parts of the module protocol are still unverified (see docs/SNIFFING.md)")
+	}
 
 	b, err := bridge.New(bridge.Options{Config: cfg, Radio: conn})
 	if err != nil {
@@ -133,6 +125,7 @@ func run(ctx context.Context, cfg *config.Config, uart io.ReadWriteCloser) error
 		mux.Handle("/metrics", promhttp.Handler())
 		mux.Handle("/", b.StatusHandler(bridge.Info{
 			"version":  version(),
+			"module":   conn.Kind(),
 			"firmware": conn.FirmwareVersion(),
 			"serial":   conn.SerialNumber(),
 		}))
@@ -198,6 +191,53 @@ func run(ctx context.Context, cfg *config.Config, uart io.ReadWriteCloser) error
 	}
 
 	return b.Run(ctx)
+}
+
+// openModule initialises the radio module selected by cfg.Radio ("auto"
+// detects it).
+func openModule(cfg *config.Config, uart io.ReadWriter) (uartgw.Module, error) {
+	current, previous := cfg.Keys()
+	keys := []hmkey.Key{*current}
+	if previous != nil {
+		keys = append(keys, *previous)
+	}
+	ucfg := uartgw.Config{
+		HMID:     cfg.CentralAddr(),
+		Current:  current,
+		Previous: previous,
+		CSMACA:   cfg.CSMACA,
+		// Don't hand a stale clock to the module (no RTC on a Pi); the
+		// bridge sets it once NTP has synchronised.
+		SkipSetTime: cfg.RequiresSyncedClock() && !bridge.SystemClockSynced(),
+		// The RPI-RF-MOD leaves AES to the host.
+		Signer: bidcosaes.NewSigner(keys...),
+		Debug:  *debugFrames,
+	}
+	var (
+		mod uartgw.Module
+		err error
+	)
+	switch cfg.Radio {
+	case config.RadioHMModRPIPCB:
+		var c *uartgw.Conn
+		if c, err = uartgw.Open(uart, ucfg); err == nil {
+			mod = c
+		}
+	case config.RadioRPIRFMod:
+		var c *uartgw.DualConn
+		if c, err = uartgw.OpenDual(uart, ucfg); err == nil {
+			mod = c
+		}
+	default:
+		mod, err = uartgw.OpenModule(uart, ucfg)
+	}
+	if err != nil {
+		if errors.Is(err, uartgw.ErrDualCoProFirmware) {
+			return nil, fmt.Errorf("%w\n\nThe radio module is an RPI-RF-MOD (or an HM-MOD-RPI-PCB with eQ-3's dual firmware), but the configuration says \"radio\": %q. Set \"radio\": \"auto\" or \"rpi-rf-mod\"", err, cfg.Radio)
+		}
+		return nil, fmt.Errorf("initialising the radio module on %s: %w", cfg.SerialPort, err)
+	}
+	return mod, nil
 }
 
 // mqttAuthRetry is the delay between attempts after the broker refused

@@ -1,6 +1,7 @@
 // Package fakemod emulates a HM-MOD-RPI-PCB radio module (classic
-// firmware 1.x, or optionally the unsupported dual-coprocessor
-// firmware) for tests.
+// firmware 1.x, or optionally the dual-coprocessor firmware as seen by
+// the classic protocol) or an RPI-RF-MOD (dual-coprocessor firmware,
+// Options.DualCoPro; see dual.go) for tests.
 //
 // New returns the module and the host end of an in-memory pipe, which
 // can be passed to uartgw.Open:
@@ -22,6 +23,7 @@ import (
 	"net"
 	"sort"
 	"sync"
+	"time"
 )
 
 // Destinations.
@@ -101,6 +103,41 @@ type Options struct {
 	// built-in handling. If it returns handled, the module acks the
 	// request with ackStatus (no payload; NoAck swallows it) instead.
 	OnOS func(cmd byte, payload []byte) (ackStatus byte, handled bool)
+
+	// DualCoPro emulates an RPI-RF-MOD running the dual-coprocessor
+	// firmware with its own protocol (IDENTIFY/CHANGE_APP on COMMON,
+	// LLMAC_SEND/ACK/RECV on dst 3; see dual.go). It starts in the
+	// bootloader and announces “HMIP_TRX_Bl”, unless StartInApp (no
+	// announcement) or AnnounceApp is set. Unlike DualFirmware, which
+	// only answers with DUAL_ERR.
+	DualCoPro bool
+
+	// AnnounceApp (DualCoPro) starts the module in the application and
+	// announces “DualCoPro_App”.
+	AnnounceApp bool
+
+	// BannerOnOS (DualCoPro) sends announcements on dst OS ([0x00
+	// tag…]) instead of COMMON.
+	BannerOnOS bool
+
+	// IgnoreIdentify (DualCoPro) makes the module ignore IDENTIFY.
+	IgnoreIdentify bool
+
+	// AppSwitchDelay (DualCoPro) is the delay between CHANGE_APP and
+	// the announcement of the new application (default 20ms; the real
+	// module takes ~2.2s).
+	AppSwitchDelay time.Duration
+
+	// LLMACAckStatus (DualCoPro) returns the LLMAC_ACK status for a
+	// transmitted BidCoS message (default 0x01 OK; NoAck: no ack).
+	LLMACAckStatus func(msg []byte) byte
+
+	// OnLLMACSend (DualCoPro) emulates the devices: it is called for
+	// every successfully transmitted BidCoS message (cnt flags cmd src
+	// dst payload) and returns the messages the devices answer with,
+	// which are received (LLMAC_RECV) right after the LLMAC_ACK.
+	// Default: DefaultOnLLMACSend.
+	OnLLMACSend func(msg []byte) (responses [][]byte)
 }
 
 // Peer is the module’s state for a peer.
@@ -145,6 +182,11 @@ type Module struct {
 	timeSet []byte
 	readErr error
 
+	llmacOpts  [][]byte
+	changeApps int
+	identifies int
+	ts         uint16
+
 	normalMode bool // OS 0x06 received
 	csmaCA     bool // last OS 0x0A setting
 	csmaCASet  bool // OS 0x0A received
@@ -167,7 +209,7 @@ func New(opts Options) (*Module, io.ReadWriteCloser) {
 	m := &Module{
 		opts:  opts,
 		conn:  mod,
-		inApp: opts.StartInApp,
+		inApp: opts.StartInApp || (opts.DualCoPro && opts.AnnounceApp),
 		keys:  make(map[byte][]byte),
 		peers: make(map[[3]byte]*Peer),
 		done:  make(chan struct{}),
@@ -178,7 +220,13 @@ func New(opts Options) (*Module, io.ReadWriteCloser) {
 		m.wg.Add(1)
 		go func() {
 			defer m.wg.Done()
-			if opts.DualFirmware {
+			if opts.DualCoPro {
+				if opts.AnnounceApp {
+					m.announceDual(TagDualApp)
+				} else {
+					m.announceDual(TagDualBootloader)
+				}
+			} else if opts.DualFirmware {
 				m.write(Frame{Dst: DstDual, Cmd: 0x00, Payload: []byte("DualCoPro_App")})
 			} else {
 				// on the wire: FD000C000000436F5F4350555F424C7251
@@ -256,6 +304,9 @@ func (m *Module) serve() {
 }
 
 func (m *Module) handle(f Frame) error {
+	if m.opts.DualCoPro {
+		return m.handleDualCoPro(f)
+	}
 	if m.opts.DualFirmware {
 		// The dual firmware does not understand the classic protocol;
 		// it answers on its own destinations.
@@ -469,7 +520,8 @@ func (m *Module) InjectRecv(status byte, msg []byte) error {
 }
 
 // Reset emulates a module reset (or crash): the module falls back to
-// the bootloader and announces “Co_CPU_BL”, losing its configuration.
+// the bootloader and announces “Co_CPU_BL” (DualCoPro: “HMIP_TRX_Bl”),
+// losing its configuration.
 func (m *Module) Reset() error {
 	m.mu.Lock()
 	m.inApp = false
@@ -480,6 +532,9 @@ func (m *Module) Reset() error {
 	m.keys = make(map[byte][]byte)
 	m.peers = make(map[[3]byte]*Peer)
 	m.mu.Unlock()
+	if m.opts.DualCoPro {
+		return m.announceDual(TagDualBootloader)
+	}
 	return m.announce("Co_CPU_BL")
 }
 

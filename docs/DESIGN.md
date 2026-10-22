@@ -92,6 +92,31 @@ payload is `info rssi msg…`, i.e. the device's response frame.
 Received radio frames: cmd 0x05 on dst 1, payload `status info rssi
 msg…`. Status 0x01/0x11 normal, 0x02/0x12 AES OK, 0x03 AES failed.
 
+## RPI-RF-MOD (eQ-3 dual firmware)
+
+`uartgw.OpenModule` detects the module: a startup message or the reply to
+IDENTIFY (dst COMMON, payload 01) names the application, `Co_CPU_*` for the
+HM-MOD-RPI-PCB and `HMIP_TRX_Bl` / `DualCoPro_App` for the RPI-RF-MOD.
+`uartgw.DualConn` implements the same `uartgw.Module` interface as the
+classic `uartgw.Conn`, so the bridge doesn't care which one is attached.
+
+Known from the open-source RFNETHM project (protocol reference only):
+same frame format; dst 0x03 LLMAC carries classic BidCoS: LLMAC_SEND
+`06 80 00 80 <msg>`, acknowledged by LLMAC_ACK `01 <status>` with the same
+frame counter; received messages arrive as LLMAC_RECV
+`05 <ts:2> <info> <rssi> <msg>`; CHANGE_APP from the bootloader is `03` on
+dst COMMON.
+
+Unlike the HM-MOD-RPI-PCB, the module apparently neither acknowledges device
+messages nor does AES, so `DualConn` does both in software
+(`internal/bidcos/aes`, ported from FHEM's CUL_HM and verified against FHEM's
+own Perl code): it ACKs BiDi messages from registered peers, challenges
+messages from AES peers and verifies the answers, answers devices' AES
+challenges to our commands, correlates device responses with sent commands,
+and retransmits unanswered commands. Whatever OpenCCU's multimacd sends the
+module at startup (address, peers) is still unknown; `Config.DualInit`
+takes those steps once a capture (`cmd/hmsniff`) shows them.
+
 ## Interfaces
 
 ### uartgw
