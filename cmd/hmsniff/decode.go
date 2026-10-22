@@ -11,6 +11,7 @@ import (
 	"github.com/fjaeckel/hmgo/internal/bidcos"
 	"github.com/fjaeckel/hmgo/internal/hm"
 	"github.com/fjaeckel/hmgo/internal/hm/devices"
+	"github.com/fjaeckel/hmgo/internal/hmip"
 )
 
 // Decoder turns module frames into human-readable lines.
@@ -20,6 +21,7 @@ type Decoder struct {
 	RedactAES bool
 
 	stats *Stats
+	hmip  hmip.Describer // HmIP: names responses after their requests
 }
 
 // Msg is a BidCoS message: cnt flags cmd src(3) dst(3) payload.
@@ -87,13 +89,14 @@ func (d *Decoder) Describe(dir string, f Frame) string {
 			fmt.Fprintf(&sb, " cmd=%02X %s %q", cmd, hex.EncodeToString(p), tag)
 			return sb.String()
 		}
-	case dstHmIP:
-		// Homematic IP traffic: not decoded, length only (the user has
-		// no HmIP devices; this is mostly housekeeping).
-		fmt.Fprintf(&sb, " cmd=%02X len=%d", cmd, len(p))
+	case dstHmIP, hmip.DstKey:
+		// Homematic IP: serial command and MAC header (internal/hmip);
+		// key material is always redacted.
+		pkt, _ := hmip.ParsePacket(f.Dst, f.Cnt, f.Payload) // non-empty
+		sb.WriteString(" " + d.hmip.Describe(dir == "TX", pkt))
 		return sb.String()
 	}
-	if looksLikeKey(f, d) {
+	if looksLikeKey(f) {
 		fmt.Fprintf(&sb, " cmd=%02X <%d bytes redacted (possible key material)>", cmd, len(p))
 		return sb.String()
 	}
@@ -102,11 +105,9 @@ func (d *Decoder) Describe(dir string, f Frame) string {
 }
 
 // looksLikeKey is a conservative guess for unknown host→module frames that
-// may carry an AES key (16 bytes + index). They are redacted.
-func looksLikeKey(f Frame, d *Decoder) bool {
-	if !d.RedactAES {
-		return false
-	}
+// may carry an AES key (16 bytes + index). They are always redacted
+// (-no-redact only affects AES responses).
+func looksLikeKey(f Frame) bool {
 	n := len(f.Payload) - 1
 	return (f.Dst == dstLLMAC || f.Dst == dstCommon || f.Dst == dstOS) && (n == 16 || n == 17 || n == 18)
 }

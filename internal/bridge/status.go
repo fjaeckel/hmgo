@@ -129,4 +129,11 @@ th{background:#eee}.warn{color:#b00;font-weight:600}.muted{color:#888}
 <tr><th>Address</th><th>Messages</th><th>Last seen</th><th>Last cmd</th><th>RSSI</th><th>Serial</th><th>Model ID</th></tr>
 {{range .Unknown}}<tr><td>{{.Address}}</td><td>{{.Messages}}</td><td>{{ago .LastSeen}}</td><td>{{.LastCmd}}</td><td>{{.RSSI}}</td><td>{{.Serial}}</td><td>{{.ModelID}}</td></tr>{{end}}
 </table></div>{{else}}<p class="muted">none</p>{{end}}
+{{if .HMIP}}
+<h2>HomematicIP devices heard (not supported yet)</h2>
+<p class="muted">Homematic IP radio addresses whose frames the radio module passed on. hmbridge does not decode or control Homematic IP devices and publishes nothing about them to MQTT (docs/HMIP.md).</p>
+<div class="wrap"><table>
+<tr><th>Address</th><th>Frames</th><th>Last seen</th><th>RSSI</th><th>Last frame</th><th>To</th></tr>
+{{range .HMIP}}<tr><td>{{.Address}}</td><td>{{.Frames}}</td><td>{{ago .LastSeen}}</td><td>{{i .RSSI}}</td><td>{{.Last}}</td><td>{{.To}}</td></tr>{{end}}
+</table></div>{{end}}
 </body></html>`))

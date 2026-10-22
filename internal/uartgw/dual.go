@@ -32,8 +32,10 @@ package uartgw
 // (Config.SoftwareAck, Config.SoftwareAES).
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/subtle"
 	"errors"
 	"fmt"
 	"io"
@@ -41,6 +43,7 @@ import (
 	"sync"
 	"time"
 
+	bidcosaes "github.com/fjaeckel/hmgo/internal/bidcos/aes"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
@@ -55,8 +58,11 @@ const (
 
 // dstHMIPCrypto is used by OpenCCU's HMIPServer at its start (restart
 // capture lines 96-104), apparently for Homematic IP key handling;
-// hmbridge ignores it like dstHMIP.
+// hmbridge treats it like dstHMIP (Config.HMIPHandler).
 const dstHMIPCrypto = 0x0c
+
+// hmipQueueSize bounds the frames waiting for Config.HMIPHandler.
+const hmipQueueSize = 64
 
 // LLMAC (dst 0x03) commands (from RFNETHM, confirmed by the capture).
 const (
@@ -107,7 +113,7 @@ const (
 // t - replyLateMargin, the reply is sent at once instead.
 const (
 	replyDelay      = 100 * time.Millisecond
-	replyLateMargin = 10 * time.Millisecond
+	replyLateMargin = 25 * time.Millisecond
 	// replyWindow: a non-BiDi Send to a device that sent us a message
 	// with the same message counter within this window is a reply (e.g.
 	// the bridge's answer to a time request).
@@ -164,6 +170,18 @@ const (
 	minAESHoldTimeout      = time.Second
 	writeQueueSize         = 64
 	maxOneshots            = 64
+
+	// maxChallengeResends bounds how often a challenge is re-sent
+	// because the device retransmitted the held message (it did not
+	// receive our challenge); each re-send extends the hold by
+	// aesHoldTimeout.
+	maxChallengeResends = 3
+	// At most challengeRateLimit new AES challenges are sent per peer
+	// within challengeRateWindow; further messages needing one are
+	// dropped. This protects the module's 1% duty cycle against spoofed
+	// frames (anyone can send frames with a peer's address).
+	challengeRateLimit  = 10
+	challengeRateWindow = 10 * time.Second
 )
 
 // AESSigner implements the BidCoS AES computations (software AES; see
@@ -177,6 +195,24 @@ type AESSigner interface {
 	// for msg (the device's original message).
 	Verify(keyIndex byte, challenge [6]byte, msg []byte, response [16]byte) bool
 }
+
+// AESAuthResponder is optionally implemented by an AESSigner (package
+// bidcosaes: Signer.RespondAuth). If it is, Send checks the 4 auth bytes
+// the device must append to its final ACK after our AES answer (FHEM
+// 10_CUL_HM.pm: AESreqAck, compared with the last 4 bytes of the ACK
+// payload, so both ACK 02 00 auth(4) and ACK_STATUS 02 01 … auth(4)
+// work); a final ACK without them or with wrong ones fails with
+// ErrAESFailed (FHEM: “aesCommToDev:fail”). Without it, any final ACK
+// which is not a NACK counts as AES OK.
+type AESAuthResponder interface {
+	RespondAuth(keyIndex byte, challenge [6]byte, msg []byte) (response [16]byte, auth [4]byte, err error)
+}
+
+var (
+	_ AESSigner        = (*bidcosaes.Signer)(nil)
+	_ AESAuthResponder = (*bidcosaes.Signer)(nil)
+	_ AESAuthVerifier  = (*bidcosaes.Signer)(nil)
+)
 
 // AESAuthVerifier is optionally implemented by an AESSigner. If it is,
 // the final ACK after a successful verification carries the 4 auth
@@ -207,9 +243,13 @@ var (
 			Namespace: metricsNamespace,
 			Subsystem: metricsSubsystem,
 			Name:      "dual_events_total",
-			Help: "RPI-RF-MOD software BidCoS events: software_ack, aes_challenge_sent, aes_ok, aes_failed, " +
-				"aes_timeout, aes_challenge_received, response_timeout, retransmit, oneshot_failed, " +
-				"reply_scheduled, reply_late (sent at once: the host was too slow to schedule it), hmip_ignored, trx_poll_failed.",
+			Help: "RPI-RF-MOD software BidCoS events: software_ack, aes_challenge_sent, aes_challenge_resent (the device " +
+				"retransmitted a held message), aes_challenge_rate_limited (message dropped), aes_ok, aes_failed, " +
+				"aes_timeout, aes_duplicate (retransmission of an authenticated message, acknowledged again), " +
+				"aes_stray_answer (AES answer without a pending challenge, dropped), aes_challenge_received, " +
+				"response_timeout, retransmit, oneshot_failed, " +
+				"reply_scheduled, reply_late (sent at once: the host was too slow to schedule it), hmip_ignored (Homematic IP frame, " +
+				"not used for BidCoS), hmip_dropped (Homematic IP frame not passed on: handler too slow), trx_poll_failed.",
 		},
 		[]string{"event"})
 
@@ -241,7 +281,17 @@ type dualReq struct {
 	dst  byte
 	sent time.Time
 	ch   chan frame // buffered (1)
+	// arm, if non-nil, is armed by a successful LLMAC_ACK of this
+	// request (in the reader goroutine, before any later frame is
+	// dispatched).
+	arm *respWaiter
 }
+
+// errDualErr marks a DUAL_ERR reply (wrapped together with ErrNACK).
+var errDualErr = errors.New("DUAL_ERR")
+
+// errNoCounter is returned when all 255 frame counters are in use.
+var errNoCounter = errors.New("uartgw: no free frame counter (too many outstanding requests)")
 
 // rxMsg is a received message as handed to Send.
 type rxMsg struct {
@@ -250,10 +300,13 @@ type rxMsg struct {
 }
 
 // respWaiter matches device responses to the packet Send transmits.
+// Only frames received after the module confirmed the transmission
+// (LLMAC_ACK, armed) are responses.
 type respWaiter struct {
 	dev, us [3]byte
 	msgcnt  byte
 	ch      chan rxMsg // buffered
+	armed   bool       // guarded by DualConn.mu
 }
 
 type aesKey struct {
@@ -269,6 +322,17 @@ type heldMsg struct {
 	keyIndex   byte
 	challenge  [6]byte
 	timer      *time.Timer
+	resends    int // challenges re-sent for retransmissions
+}
+
+// aesDone remembers a successfully authenticated message, so that a
+// retransmission (the device missed our final ACK) is acknowledged
+// again with the same auth bytes instead of being challenged and
+// delivered a second time.
+type aesDone struct {
+	msg  []byte
+	auth []byte
+	at   time.Time
 }
 
 // rxSeen records when a device's message to us was received, so that a
@@ -333,7 +397,9 @@ type DualConn struct {
 	lateIdentify map[byte]bool      // IDENTIFY requests we gave up on
 	resp         *respWaiter
 	held         map[aesKey]*heldMsg
-	seen         map[aesKey]rxSeen // recent messages to us, by sender and message counter
+	authed       map[aesKey]aesDone      // recently authenticated messages
+	challenges   map[[3]byte][]time.Time // recent challenges per peer (rate limit)
+	seen         map[aesKey]rxSeen       // recent messages to us, by sender and message counter
 	peers        map[[3]byte]Peer
 	clockTs      uint16    // module time of the last LLMAC_RECV …
 	clockAt      time.Time // … and the local time it was read
@@ -344,6 +410,8 @@ type DualConn struct {
 	recv         chan []byte
 	ackTimeouts  int
 	signerWarned bool
+
+	hmip chan frame // to Config.HMIPHandler; nil without one
 }
 
 // OpenDual initializes an RPI-RF-MOD (dual-coprocessor firmware) on rw
@@ -363,10 +431,12 @@ func OpenDual(rw io.ReadWriter, cfg Config) (*DualConn, error) {
 	p := newFramePump(rw)
 	d, err := detect(p, rw, announceWait, timeout, cfg.Debug)
 	if err != nil {
+		p.stop()
 		closeRW(rw)
 		return nil, err
 	}
 	if d.kind != KindRPIRFMod {
+		p.stop()
 		closeRW(rw)
 		if d.tag != "" {
 			return nil, fmt.Errorf("%w: expected an RPI-RF-MOD, but the module announced %q (%s)", ErrUnknownModule, d.tag, d.kind)
@@ -413,6 +483,8 @@ func openDual(rw io.ReadWriter, cfg Config, p *framePump, d detection) (*DualCon
 		// detect's IDENTIFY may be answered after an announcement.
 		lateIdentify: map[byte]bool{detectCnt: true},
 		held:         make(map[aesKey]*heldMsg),
+		authed:       make(map[aesKey]aesDone),
+		challenges:   make(map[[3]byte][]time.Time),
 		seen:         make(map[aesKey]rxSeen),
 		peers:        make(map[[3]byte]Peer),
 		recv:         make(chan []byte, recvBufferSize),
@@ -446,6 +518,10 @@ func openDual(rw io.ReadWriter, cfg Config, p *framePump, d detection) (*DualCon
 	}
 	if c.rand == nil {
 		c.rand = rand.Reader
+	}
+	if cfg.HMIPHandler != nil {
+		c.hmip = make(chan frame, hmipQueueSize)
+		go c.hmipLoop(cfg.HMIPHandler)
 	}
 
 	go c.readLoop()
@@ -651,9 +727,10 @@ func (c *DualConn) enqueue(ctx context.Context, f frame, urgent bool) error {
 	}
 }
 
-// nextCnt returns an unused frame counter. Counter 0 is skipped, as
-// unsolicited frames (announcements) may use it. c.mu must be held.
-func (c *DualConn) nextCnt() byte {
+// nextCnt returns an unused frame counter, or errNoCounter if all are
+// in use. Counter 0 is skipped, as unsolicited frames (announcements)
+// may use it. c.mu must be held.
+func (c *DualConn) nextCnt() (byte, error) {
 	for i := 0; i < 256; i++ {
 		c.cnt++
 		if c.cnt == 0 {
@@ -665,23 +742,32 @@ func (c *DualConn) nextCnt() byte {
 		if _, ok := c.oneshots[c.cnt]; ok {
 			continue
 		}
-		break
+		return c.cnt, nil
 	}
-	return c.cnt
+	return 0, errNoCounter
 }
 
 // request sends payload (first byte = command) to dst and waits for the
 // reply (a frame on dst or DUAL_ERR with the same counter). DUAL_ERR
-// replies are returned with an error wrapping ErrNACK.
+// replies are returned with an error wrapping ErrNACK (and errDualErr).
 func (c *DualConn) request(ctx context.Context, dst byte, payload []byte, timeout time.Duration) (frame, error) {
+	return c.requestArm(ctx, dst, payload, timeout, nil)
+}
+
+// requestArm is request; a successful LLMAC_ACK arms w (see dualReq).
+func (c *DualConn) requestArm(ctx context.Context, dst byte, payload []byte, timeout time.Duration, w *respWaiter) (frame, error) {
 	c.mu.Lock()
 	if c.err != nil {
 		err := c.err
 		c.mu.Unlock()
 		return frame{}, err
 	}
-	cnt := c.nextCnt()
-	r := &dualReq{dst: dst, sent: time.Now(), ch: make(chan frame, 1)}
+	cnt, err := c.nextCnt()
+	if err != nil {
+		c.mu.Unlock()
+		return frame{}, err
+	}
+	r := &dualReq{dst: dst, sent: time.Now(), ch: make(chan frame, 1), arm: w}
 	c.reqs[cnt] = r
 	c.mu.Unlock()
 	abandon := func() {
@@ -705,12 +791,14 @@ func (c *DualConn) request(ctx context.Context, dst byte, payload []byte, timeou
 	select {
 	case rf := <-r.ch:
 		requestDuration.Observe(time.Since(r.sent).Seconds())
+		if rf.dst == dstDualErr {
+			// Not a sign of life: a module which dropped into its
+			// bootloader answers everything with DUAL_ERR.
+			return rf, fmt.Errorf("%w: %w: module answered with DUAL_ERR (dst %s, cnt %d): %x", ErrNACK, errDualErr, dstName(dst), cnt, append([]byte{rf.cmd}, rf.payload...))
+		}
 		c.mu.Lock()
 		c.ackTimeouts = 0
 		c.mu.Unlock()
-		if rf.dst == dstDualErr {
-			return rf, fmt.Errorf("%w: module answered with DUAL_ERR (dst %s, cnt %d): %x", ErrNACK, dstName(dst), cnt, append([]byte{rf.cmd}, rf.payload...))
-		}
 		return rf, nil
 	case <-t.C:
 		abandon()
@@ -723,8 +811,15 @@ func (c *DualConn) request(ctx context.Context, dst byte, payload []byte, timeou
 	}
 }
 
-// ackTimeout counts consecutive requests the module did not ack (only
-// once running, like Conn) and fails with ErrModuleUnresponsive.
+// isLivenessFailure reports whether err means the module did not
+// properly answer a request: no reply at all, or DUAL_ERR.
+func isLivenessFailure(err error) bool {
+	return errors.Is(err, ErrTimeout) || errors.Is(err, errDualErr)
+}
+
+// ackTimeout counts consecutive requests the module did not ack or
+// answered with DUAL_ERR (only once running, like Conn) and fails with
+// ErrModuleUnresponsive.
 func (c *DualConn) ackTimeout(err error) {
 	ackTimeouts.Inc()
 	c.mu.Lock()
@@ -736,7 +831,7 @@ func (c *DualConn) ackTimeout(err error) {
 	n := c.ackTimeouts
 	c.mu.Unlock()
 	if c.maxAckTimeouts > 0 && n >= c.maxAckTimeouts {
-		c.fail(fmt.Errorf("%w: %d consecutive requests were not acknowledged (last: %v)", ErrModuleUnresponsive, n, err))
+		c.fail(fmt.Errorf("%w: %d consecutive requests were not acknowledged or rejected (last: %v)", ErrModuleUnresponsive, n, err))
 	}
 }
 
@@ -748,16 +843,16 @@ func llmacSendPayload(opts [3]byte, msg []byte) []byte {
 }
 
 // llmacSend transmits msg (cnt flags cmd src dst payload) and waits for
-// the module's LLMAC_ACK.
-func (c *DualConn) llmacSend(ctx context.Context, msg []byte, opts [3]byte) error {
+// the module's LLMAC_ACK, which arms w (if non-nil).
+func (c *DualConn) llmacSend(ctx context.Context, msg []byte, opts [3]byte, w *respWaiter) error {
 	timeout := c.timeout
 	if opts[0]&0x80 == 0 {
 		// scheduled: the module waits up to ~replyDelay before sending
 		timeout += replyDelay
 	}
-	f, err := c.request(ctx, dstLLMAC, llmacSendPayload(opts, msg), timeout)
+	f, err := c.requestArm(ctx, dstLLMAC, llmacSendPayload(opts, msg), timeout, w)
 	if err != nil {
-		if errors.Is(err, ErrTimeout) {
+		if isLivenessFailure(err) {
 			c.ackTimeout(err)
 		}
 		return err
@@ -796,7 +891,12 @@ func (c *DualConn) sendOneshot(msg []byte, opts [3]byte, what string) {
 			}
 		}
 	}
-	cnt := c.nextCnt()
+	cnt, err := c.nextCnt()
+	if err != nil {
+		c.mu.Unlock()
+		log.Printf("uartgw: dropping %s: %v", what, err)
+		return
+	}
 	c.oneshots[cnt] = now
 	c.mu.Unlock()
 	f := frame{dst: dstLLMAC, cnt: cnt, cmd: llmacSend, payload: llmacSendPayload(opts, msg)[1:]}
@@ -832,7 +932,9 @@ func (c *DualConn) sendReply(msg []byte, rxTs uint16, what string) {
 
 // trxPollLoop polls the TRX status like multimacd (every 10s, APP cmd
 // 0x03, capture line 30 ff.). It is the liveness check: unanswered polls
-// count towards Config.MaxAckTimeouts.
+// and polls answered with DUAL_ERR count towards Config.MaxAckTimeouts,
+// and after each failed poll the module is asked for its application
+// (checkBootloader).
 func (c *DualConn) trxPollLoop() {
 	t := time.NewTicker(c.trxPollInterval)
 	defer t.Stop()
@@ -851,7 +953,10 @@ func (c *DualConn) trxPollLoop() {
 			}
 			dualEvents.WithLabelValues("trx_poll_failed").Inc()
 			log.Printf("uartgw: polling the TRX status: %v", err)
-			if errors.Is(err, ErrTimeout) {
+			if c.checkBootloader() {
+				return
+			}
+			if isLivenessFailure(err) {
 				c.ackTimeout(err)
 			}
 			continue
@@ -872,6 +977,26 @@ func (c *DualConn) trxPollLoop() {
 			}
 		}
 	}
+}
+
+// checkBootloader sends IDENTIFY after a failed TRX poll. A module
+// which dropped into its bootloader without (or with a lost)
+// announcement answers every request with DUAL_ERR; if it reports its
+// bootloader (“HMIP_TRX_Bl”), the connection fails with ErrModuleReset
+// at once. It reports whether it failed the connection.
+func (c *DualConn) checkBootloader() bool {
+	tag, err := c.identify()
+	if err != nil {
+		if c.debug {
+			log.Printf("uartgw: IDENTIFY after a failed TRX poll: %v", err)
+		}
+		return false
+	}
+	if isBootloaderTag(tag) || !isAppTag(tag) {
+		c.fail(fmt.Errorf("%w (the module reports %q)", ErrModuleReset, tag))
+		return true
+	}
+	return false
 }
 
 // ---- reading ----
@@ -901,6 +1026,9 @@ func (c *DualConn) deliverReq(f frame) bool {
 		return false
 	}
 	delete(c.reqs, f.cnt)
+	if r.arm != nil && f.dst == dstLLMAC && f.cmd == llmacAck && len(f.payload) > 0 && f.payload[0] == llmacStatusOK {
+		r.arm.armed = true
+	}
 	r.ch <- f // buffered, written once
 	return true
 }
@@ -959,8 +1087,15 @@ func (c *DualConn) dispatch(f frame) {
 		}
 
 	case f.dst == dstHMIP, f.dst == dstHMIPCrypto:
-		// Homematic IP traffic (OpenCCU's HMIPServer); not ours.
+		// Homematic IP traffic; not used for BidCoS, only passed on.
 		dualEvents.WithLabelValues("hmip_ignored").Inc()
+		if c.hmip != nil {
+			select {
+			case c.hmip <- f:
+			default:
+				dualEvents.WithLabelValues("hmip_dropped").Inc()
+			}
+		}
 
 	case f.dst == dstApp && f.cmd == trxUnsolicited:
 		if c.debug {
@@ -977,6 +1112,18 @@ func (c *DualConn) dispatch(f frame) {
 			return
 		}
 		log.Printf("uartgw: ignoring unexpected frame: %v", f)
+	}
+}
+
+// hmipLoop passes Homematic IP frames to h until the connection ends.
+func (c *DualConn) hmipLoop(h func(dst, cnt byte, packet []byte)) {
+	for {
+		select {
+		case f := <-c.hmip:
+			h(f.dst, f.cnt, append([]byte{f.cmd}, f.payload...))
+		case <-c.done:
+			return
+		}
 	}
 }
 
@@ -1041,11 +1188,53 @@ func aesRequired(peer Peer, cmd byte, payload []byte) bool {
 	return false
 }
 
-// ackExempt lists commands which are not acknowledged: ACKs, and time
+// ackExempt lists commands which are not acknowledged: ACKs, time
 // requests, which are answered with the time instead (capture, lines
-// 1322-1324: no ACK, only the 0x3f answer).
+// 1322-1324: no ACK, only the 0x3f answer), and AES answers, which are
+// only acknowledged after a successful verification (finishAES).
 func ackExempt(cmd byte) bool {
-	return cmd == bidcosCmdAck || cmd == bidcosCmdTime
+	return cmd == bidcosCmdAck || cmd == bidcosCmdTime || cmd == bidcosCmdAESResponse
+}
+
+// sameMsg reports whether a and b are the same message, ignoring the
+// “repeated” flag (0x40) repeaters may set.
+func sameMsg(a, b []byte) bool {
+	if len(a) != len(b) || len(a) < 2 {
+		return false
+	}
+	return a[0] == b[0] && a[1]&^0x40 == b[1]&^0x40 && bytes.Equal(a[2:], b[2:])
+}
+
+// challengeMsg returns our AES challenge for h (a message from dev):
+// cnt flags 0x02 us dev 04 challenge(6) keyIndex*2 (capture line 694:
+// key index 2 → 04).
+func (c *DualConn) challengeMsg(dev [3]byte, h *heldMsg) []byte {
+	ch := []byte{h.msg[0], challengeFlags, bidcosCmdAck}
+	ch = append(ch, c.hmid[:]...)
+	ch = append(ch, dev[:]...)
+	ch = append(ch, bidcosAckChallenge)
+	ch = append(ch, h.challenge[:]...)
+	return append(ch, h.keyIndex*2)
+}
+
+// challengeAllowedLocked applies the per-peer challenge rate limit and
+// records a challenge if allowed. c.mu must be held.
+func (c *DualConn) challengeAllowedLocked(dev [3]byte, now time.Time) bool {
+	ts := c.challenges[dev]
+	n := 0
+	for _, t := range ts {
+		if now.Sub(t) < challengeRateWindow {
+			ts[n] = t
+			n++
+		}
+	}
+	ts = ts[:n]
+	if len(ts) >= challengeRateLimit {
+		c.challenges[dev] = ts
+		return false
+	}
+	c.challenges[dev] = append(ts, now)
+	return true
 }
 
 func (c *DualConn) handleRecv(f frame) {
@@ -1065,6 +1254,7 @@ func (c *DualConn) handleRecv(f frame) {
 	copy(dst[:], msg[6:9])
 	toUs := dst == c.hmid
 	bidi := flags&bidcosFlagBiDi != 0
+	k := aesKey{src, msgcnt}
 
 	c.mu.Lock()
 	if c.err != nil {
@@ -1081,29 +1271,15 @@ func (c *DualConn) handleRecv(f frame) {
 				}
 			}
 		}
-		c.seen[aesKey{src, msgcnt}] = rxSeen{ts: ts, at: now}
+		c.seen[k] = rxSeen{ts: ts, at: now}
 	}
 	peer, isPeer := c.peers[src]
 	wantAck := c.softAck && toUs && bidi && isPeer && !ackExempt(cmd)
 
-	// 1. Response to the packet Send is transmitting: consumed by Send.
-	if w := c.resp; w != nil && src == w.dev && dst == w.us && msgcnt == w.msgcnt {
-		select {
-		case w.ch <- rxMsg{frame: recvFrame(recvResp, info, rssi, msg), ts: ts}:
-		default:
-		}
-		c.mu.Unlock()
-		// e.g. a BiDi config read response (INFO 0x10) needs our ACK;
-		// it is not challenged (Send's caller asked for it).
-		if wantAck && cmd != bidcosCmdAESResponse {
-			c.sendReply(c.ackMsg(msgcnt, src, nil), ts, "software_ack")
-		}
-		return
-	}
-
-	// 2. Answer to our AES challenge.
+	// 1. Answer to our AES challenge. A device only sends cmd 0x03 when
+	// we challenged it, so it is never a response to Send (whose
+	// message counter may collide with a held message's).
 	if toUs && cmd == bidcosCmdAESResponse {
-		k := aesKey{src, msgcnt}
 		if h := c.held[k]; h != nil {
 			delete(c.held, k)
 			h.timer.Stop()
@@ -1111,16 +1287,64 @@ func (c *DualConn) handleRecv(f frame) {
 			c.finishAES(src, h, msg[minMsgLen:], ts)
 			return
 		}
+		if a, ok := c.authedLocked(k, now); ok {
+			// We verified this answer already, but the device missed our
+			// final ACK: acknowledge it again.
+			c.mu.Unlock()
+			dualEvents.WithLabelValues("aes_duplicate").Inc()
+			c.sendReply(c.ackMsg(msgcnt, src, a.auth), ts, "software_ack")
+			return
+		}
+		c.mu.Unlock()
+		dualEvents.WithLabelValues("aes_stray_answer").Inc()
+		if c.debug {
+			log.Printf("uartgw: dropping AES answer without a pending challenge: %x", msg)
+		}
+		return
+	}
+
+	// 2. Response to the packet Send is transmitting (only after the
+	// module transmitted it): consumed by Send.
+	if w := c.resp; w != nil && w.armed && src == w.dev && dst == w.us && msgcnt == w.msgcnt {
+		select {
+		case w.ch <- rxMsg{frame: recvFrame(recvResp, info, rssi, msg), ts: ts}:
+		default:
+		}
+		c.mu.Unlock()
+		// e.g. a BiDi config read response (INFO 0x10) needs our ACK;
+		// it is not challenged (Send's caller asked for it).
+		if wantAck {
+			c.sendReply(c.ackMsg(msgcnt, src, nil), ts, "software_ack")
+		}
+		return
 	}
 
 	// 3. Software AES: challenge before accepting the message.
 	if c.softAES && toUs && bidi && isPeer && aesRequired(peer, cmd, msg[minMsgLen:]) {
-		k := aesKey{src, msgcnt}
-		if _, dup := c.held[k]; dup {
-			c.mu.Unlock()
-			if c.debug {
-				log.Printf("uartgw: ignoring retransmission while challenging: %x", msg)
+		if h := c.held[k]; h != nil {
+			// A retransmission: the device did not get our challenge (or
+			// its answer was lost). Challenge again, with the same
+			// challenge, and extend the hold (bounded).
+			if c.signer == nil || h.resends >= maxChallengeResends || !h.timer.Stop() {
+				c.mu.Unlock()
+				if c.debug {
+					log.Printf("uartgw: ignoring retransmission while challenging: %x", msg)
+				}
+				return
 			}
+			h.resends++
+			h.timer = time.AfterFunc(c.aesHoldTimeout, func() { c.aesTimeout(k, h) })
+			ch := c.challengeMsg(src, h)
+			c.mu.Unlock()
+			c.sendReply(ch, ts, "aes_challenge_resent")
+			return
+		}
+		if a, ok := c.authedLocked(k, now); ok && sameMsg(a.msg, msg) {
+			// Authenticated and delivered already; the device missed our
+			// final ACK.
+			c.mu.Unlock()
+			dualEvents.WithLabelValues("aes_duplicate").Inc()
+			c.sendReply(c.ackMsg(msgcnt, src, a.auth), ts, "software_ack")
 			return
 		}
 		if c.signer == nil {
@@ -1133,6 +1357,14 @@ func (c *DualConn) handleRecv(f frame) {
 			c.mu.Unlock()
 			return
 		}
+		if !c.challengeAllowedLocked(src, now) {
+			c.mu.Unlock()
+			dualEvents.WithLabelValues("aes_challenge_rate_limited").Inc()
+			if c.debug {
+				log.Printf("uartgw: AES challenge rate limit for %X reached, dropping %x", src, msg)
+			}
+			return
+		}
 		h := &heldMsg{info: info, rssi: rssi, msg: msg, keyIndex: peer.KeyIndex}
 		if _, err := io.ReadFull(c.rand, h.challenge[:]); err != nil {
 			log.Printf("uartgw: generating AES challenge: %v", err)
@@ -1142,16 +1374,8 @@ func (c *DualConn) handleRecv(f frame) {
 		}
 		c.held[k] = h
 		h.timer = time.AfterFunc(c.aesHoldTimeout, func() { c.aesTimeout(k, h) })
+		ch := c.challengeMsg(src, h)
 		c.mu.Unlock()
-
-		// cnt flags 0x02 us dev 04 challenge(6) keyIndex*2 (capture
-		// line 694: key index 2 → 04)
-		ch := []byte{msgcnt, challengeFlags, bidcosCmdAck}
-		ch = append(ch, c.hmid[:]...)
-		ch = append(ch, src[:]...)
-		ch = append(ch, bidcosAckChallenge)
-		ch = append(ch, h.challenge[:]...)
-		ch = append(ch, h.keyIndex*2)
 		c.sendReply(ch, ts, "aes_challenge_sent")
 		return
 	}
@@ -1162,6 +1386,20 @@ func (c *DualConn) handleRecv(f frame) {
 	if wantAck {
 		c.sendReply(c.ackMsg(msgcnt, src, nil), ts, "software_ack")
 	}
+}
+
+// aesDoneWindow is how long an authenticated message is remembered for
+// re-acknowledging retransmissions.
+func (c *DualConn) aesDoneWindow() time.Duration { return 2 * c.aesHoldTimeout }
+
+// authedLocked returns the recently authenticated message k. c.mu must
+// be held.
+func (c *DualConn) authedLocked(k aesKey, now time.Time) (aesDone, bool) {
+	a, ok := c.authed[k]
+	if !ok || now.Sub(a.at) > c.aesDoneWindow() {
+		return aesDone{}, false
+	}
+	return a, true
 }
 
 // finishAES verifies the device's answer (received at ts) to our
@@ -1190,6 +1428,17 @@ func (c *DualConn) finishAES(src [3]byte, h *heldMsg, payload []byte, ts uint16)
 		log.Printf("uartgw: AES authentication of %X failed (message %x)", src, h.msg)
 	}
 	c.mu.Lock()
+	if ok {
+		now := c.now()
+		if len(c.authed) >= 32 {
+			for k, a := range c.authed {
+				if now.Sub(a.at) > c.aesDoneWindow() {
+					delete(c.authed, k)
+				}
+			}
+		}
+		c.authed[aesKey{src, h.msg[0]}] = aesDone{msg: h.msg, auth: auth, at: now}
+	}
 	c.deliverLocked(recvFrame(status, h.info, h.rssi, h.msg))
 	c.mu.Unlock()
 }
@@ -1378,8 +1627,11 @@ func (c *DualConn) runStep(s InitStep) error {
 	defer c.release()
 	if !s.ExpectAck {
 		c.mu.Lock()
-		cnt := c.nextCnt()
+		cnt, err := c.nextCnt()
 		c.mu.Unlock()
+		if err != nil {
+			return fmt.Errorf("uartgw: init step %q: %w", s.Name, err)
+		}
 		return c.enqueue(ctx, frame{dst: s.Dst, cnt: cnt, cmd: s.Payload[0], payload: s.Payload[1:]}, false)
 	}
 	f, err := c.request(ctx, s.Dst, s.Payload, c.timeout)
@@ -1400,7 +1652,11 @@ func (c *DualConn) identify() (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout+time.Second)
 	defer cancel()
 	c.mu.Lock()
-	cnt := c.nextCnt()
+	cnt, err := c.nextCnt()
+	if err != nil {
+		c.mu.Unlock()
+		return "", err
+	}
 	r := &dualReq{dst: dstDual, sent: time.Now(), ch: make(chan frame, 1)}
 	c.reqs[cnt] = r
 	c.mu.Unlock()
@@ -1450,12 +1706,16 @@ func (c *DualConn) changeApp() (string, error) {
 	}
 	for attempt := 0; attempt < 3; attempt++ {
 		c.mu.Lock()
-		cnt := c.nextCnt()
+		cnt, err := c.nextCnt()
+		if err != nil {
+			c.mu.Unlock()
+			return "", err
+		}
 		// Register the request so that a possible reply (unknown
 		// format) is swallowed instead of logged as unexpected.
 		c.reqs[cnt] = &dualReq{dst: dstDual, sent: time.Now(), ch: make(chan frame, 1)}
 		c.mu.Unlock()
-		err := c.enqueue(context.Background(), frame{dst: dstDual, cnt: cnt, cmd: commonChangeApp}, false)
+		err = c.enqueue(context.Background(), frame{dst: dstDual, cnt: cnt, cmd: commonChangeApp}, false)
 		if err != nil {
 			return "", err
 		}
@@ -1552,10 +1812,13 @@ func isChallenge(resp []byte) bool {
 // For BiDi packets, Send then waits Config.ResponseTimeout for the
 // device's response (src/dst swapped, same message counter) and
 // retransmits up to Config.SendRetries times before failing with
-// ErrNoResponse. The response is returned as a receive frame (status
-// 0x01) and not delivered on Recv. If the device answers with an AES
-// challenge, Send answers it with Config.Signer and returns the final
-// response with status 0x02, or ErrAESFailed.
+// ErrNoResponse. Only frames received after the module's LLMAC_ACK
+// count as the response. The response is returned as a receive frame
+// (status 0x01) and not delivered on Recv. If the device answers with an
+// AES challenge, Send answers it with Config.Signer and returns the
+// final ACK with status 0x02, or ErrAESFailed (NACK, or wrong/missing
+// auth bytes, see AESAuthResponder); a final response other than an ACK
+// cannot be authenticated and is returned with status 0x01.
 func (c *DualConn) Send(ctx context.Context, encoded []byte) ([]byte, error) {
 	if len(encoded) < 3+minMsgLen {
 		return nil, fmt.Errorf("uartgw: packet too short: %x", encoded)
@@ -1628,12 +1891,14 @@ func countSendError(err error) {
 
 // responseWait returns how long to wait for a response to msg, whose
 // send request was written at sent and confirmed (LLMAC_ACK) at acked.
-// Like OpenCCU, the timeout of a normal message counts from the send
-// request, but never ends sooner than minWaitAfterAck after a late
-// LLMAC_ACK. A burst message's LLMAC_ACK arrives only after the ~360ms
-// wake-up preamble, so its timeout counts from the LLMAC_ACK.
-func (c *DualConn) responseWait(msg []byte, sent, acked time.Time) time.Duration {
-	if len(msg) > 1 && msg[1]&0x10 != 0 { // BURST
+// Like OpenCCU, the timeout of a normal message sent at once counts from
+// the send request, but never ends sooner than minWaitAfterAck after a
+// late LLMAC_ACK. A burst message's LLMAC_ACK arrives only after the
+// ~360ms wake-up preamble, and a scheduled message (e.g. our AES answer,
+// replyDelay after the challenge) is only transmitted at its time, so
+// their timeouts count from the LLMAC_ACK.
+func (c *DualConn) responseWait(msg []byte, scheduled bool, sent, acked time.Time) time.Duration {
+	if scheduled || (len(msg) > 1 && msg[1]&0x10 != 0) { // BURST
 		return c.responseTimeout
 	}
 	d := c.responseTimeout - acked.Sub(sent)
@@ -1651,19 +1916,27 @@ func (c *DualConn) transmit(ctx context.Context, msg []byte, opts [3]byte, w *re
 	if w != nil {
 		attempts += c.retries
 	}
+	if w != nil {
+		// Responses to a previous message (e.g. the challenge we are
+		// answering) do not count before this one was transmitted.
+		c.mu.Lock()
+		w.armed = false
+		c.mu.Unlock()
+	}
 	for i := 0; i < attempts; i++ {
 		if i > 0 {
 			dualEvents.WithLabelValues("retransmit").Inc()
 			opts = sendOpts(sendNow, msg[1])
 		}
+		scheduled := opts[0]&0x80 == 0
 		sent := time.Now()
-		if err := c.llmacSend(ctx, msg, opts); err != nil {
+		if err := c.llmacSend(ctx, msg, opts, w); err != nil {
 			return rxMsg{}, err
 		}
 		if w == nil {
 			return rxMsg{}, nil
 		}
-		t := time.NewTimer(c.responseWait(msg, sent, time.Now()))
+		t := time.NewTimer(c.responseWait(msg, scheduled, sent, time.Now()))
 	wait:
 		for {
 			select {
@@ -1688,7 +1961,9 @@ func (c *DualConn) transmit(ctx context.Context, msg []byte, opts [3]byte, w *re
 }
 
 // answerChallenge answers a device's AES challenge (chal) to msg and
-// waits for the device's final response.
+// waits for the device's final response. With an AESAuthResponder
+// signer, a final ACK must carry the expected auth bytes (see
+// AESAuthResponder).
 func (c *DualConn) answerChallenge(ctx context.Context, msg []byte, chal rxMsg, w *respWaiter) ([]byte, error) {
 	dualEvents.WithLabelValues("aes_challenge_received").Inc()
 	if c.signer == nil {
@@ -1702,10 +1977,23 @@ func (c *DualConn) answerChallenge(ctx context.Context, msg []byte, chal rxMsg, 
 		return nil, fmt.Errorf("%w: no AES signer configured", ErrAESFailed)
 	}
 	p := chal.frame[3+minMsgLen:] // 04 c(6) k
-	var challenge [6]byte
-	copy(challenge[:], p[1:7])
-	keyIndex := p[7] / 2
-	r, err := c.signer.Respond(keyIndex, challenge, msg)
+	if len(p) > 8 {
+		p = p[:8]
+	}
+	keyIndex, challenge, ok := bidcosaes.ParseChallenge(p)
+	if !ok {
+		return nil, fmt.Errorf("%w: malformed AES challenge %x", ErrAESFailed, chal.frame[3+minMsgLen:])
+	}
+	var r [16]byte
+	var wantAuth []byte
+	var err error
+	if ar, isAuth := c.signer.(AESAuthResponder); isAuth {
+		var a [4]byte
+		r, a, err = ar.RespondAuth(keyIndex, challenge, msg)
+		wantAuth = a[:]
+	} else {
+		r, err = c.signer.Respond(keyIndex, challenge, msg)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrAESFailed, err)
 	}
@@ -1726,9 +2014,21 @@ func (c *DualConn) answerChallenge(ctx context.Context, msg []byte, chal rxMsg, 
 		return nil, err
 	}
 	f := final.frame
-	if f[3+2] == bidcosCmdAck && len(f) > 3+minMsgLen && f[3+minMsgLen] == bidcosNACK {
+	if f[3+2] != bidcosCmdAck {
+		// Not an ACK (e.g. INFO): nothing authenticates it (FHEM only
+		// checks the auth bytes of ACKs), so it is not reported as AES
+		// OK.
+		f[0] = recvResp
+		return f, nil
+	}
+	pl := f[3+minMsgLen:]
+	if len(pl) > 0 && pl[0] >= bidcosNACK {
 		f[0] = recvRespWithAESKO
 		return f, fmt.Errorf("%w: device NACKed our AES answer", ErrAESFailed)
+	}
+	if wantAuth != nil && (len(pl) < 1+len(wantAuth) || subtle.ConstantTimeCompare(pl[len(pl)-len(wantAuth):], wantAuth) != 1) {
+		f[0] = recvRespWithAESKO
+		return f, fmt.Errorf("%w: the device's ACK lacks the expected auth bytes (%x)", ErrAESFailed, pl)
 	}
 	f[0] = recvRespWithAESOK
 	return f, nil

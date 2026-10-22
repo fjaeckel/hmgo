@@ -469,7 +469,23 @@ func parseAddr(s string) ([3]byte, error) {
 	return a, nil
 }
 
+// Placeholder is the prefix of the placeholder values hmgenconfig writes
+// for settings it cannot know (passphrase, MQTT credentials).
+const Placeholder = "CHANGE-ME"
+
+func isPlaceholder(v string) bool { return strings.HasPrefix(strings.TrimSpace(v), Placeholder) }
+
+func placeholderError(what string) error {
+	return fmt.Errorf("%s: still the %s… placeholder from hmgenconfig; fill in the real value", what, Placeholder)
+}
+
 func resolveKey(what, key string, passphrase *string, index *int, defIndex int) (hmkey.Key, error) {
+	if isPlaceholder(key) {
+		return hmkey.Key{}, placeholderError(what + ".key")
+	}
+	if passphrase != nil && isPlaceholder(*passphrase) {
+		return hmkey.Key{}, placeholderError(what + ".passphrase")
+	}
 	if key != "" && passphrase != nil {
 		return hmkey.Key{}, fmt.Errorf("%s: set either key or passphrase, not both", what)
 	}
@@ -534,6 +550,9 @@ func (c *Config) resolve() error {
 		return fmt.Errorf("reset_gpio: %d out of range 0..63", c.ResetGPIO)
 	}
 
+	if isPlaceholder(c.CentralAddress) {
+		return placeholderError("central_address")
+	}
 	if c.CentralAddress == "" {
 		return fmt.Errorf("central_address is required (the BidCoS address of your CCU, e.g. \"1A2B3C\")")
 	}
@@ -571,6 +590,15 @@ func (c *Config) resolve() error {
 		}
 	}
 
+	if c.MQTT.Broker != nil && isPlaceholder(*c.MQTT.Broker) {
+		return placeholderError("mqtt.broker")
+	}
+	if isPlaceholder(c.MQTT.Username) {
+		return placeholderError("mqtt.username")
+	}
+	if isPlaceholder(c.MQTT.Password) {
+		return placeholderError("mqtt.password")
+	}
 	if c.MQTT.ClientID == "" {
 		c.MQTT.ClientID = DefaultClientID
 	}
@@ -647,6 +675,10 @@ func (c *Config) resolve() error {
 		}
 		if d.StaleAfter.set && d.StaleAfter.Duration != 0 && d.StaleAfter.Duration < time.Minute {
 			return fmt.Errorf("%s: stale_after %v is too short (minimum 1m, or \"0s\" for never)", where, d.StaleAfter.Duration)
+		}
+		if poll := c.StatusPollIntervalSetting.Duration; IsActuator(d.Model) && poll > 0 &&
+			d.StaleAfter.set && d.StaleAfter.Duration != 0 && d.StaleAfter.Duration <= poll {
+			return fmt.Errorf("%s: stale_after %v must be longer than status_poll_interval %v (the actuator is only heard from when polled), or \"0s\" for never", where, d.StaleAfter.Duration, poll)
 		}
 		d.staleDefault = defaultStale(d.Model, c.StatusPollIntervalSetting.Duration)
 		d.keyIndex = c.current.Index

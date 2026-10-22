@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: BSD-3-Clause -->
+
 # hmbridge
 
 hmbridge replaces a HomeMatic CCU (OpenCCU/RaspberryMatic, CCU2/3) for
@@ -65,7 +67,9 @@ Every device also gets diagnostic sensors (last seen, signal strength, AES
 result, outcome of the last command). [docs/DEPLOY.md](docs/DEPLOY.md#4-home-assistant)
 lists the entities per model. Switches, dimmers and the LED display are asked
 for their status after startup and every hour (`status_poll_interval`);
-remotes and weather sensors only send.
+remotes and weather sensors only send. On buttons with AES, the repeats sent
+while a button is held are not authenticated, so `press_long` only arrives
+together with `press_long_release` when the button is let go.
 
 ## Requirements
 
@@ -92,6 +96,7 @@ GOOS=linux GOARCH=arm GOARM=6 go build -o hmbridge ./cmd/hmbridge    # Pi 1 / Ze
 # Write a configuration and check it: either run hmgenconfig on your
 # OpenCCU (while it is running) and fill in the passphrase and MQTT
 # settings, or write it by hand (see internal/config/example.json).
+# -check_config fails until every CHANGE-ME placeholder is filled in.
 ./hmgenconfig > config.json
 ./hmbridge -config config.json -check_config
 
@@ -182,7 +187,8 @@ Example alerting rules are in
   settings or direct links yet. Use the CCU for that, then switch back.
 * Of the dimmer plug only the physical channel 1 is exposed (2 and 3 are
   virtual channels).
-* Homematic IP is not supported (and the dual firmware is not either).
+* Homematic IP is not supported yet. On the RPI-RF-MOD, hmbridge only lists
+  the Homematic IP devices it hears; see [docs/HMIP.md](docs/HMIP.md).
 * Commands to battery devices are sent as wake-up bursts, which use the radio's
   duty cycle (1 % airtime). Normal use is far below the limit; the duty cycle
   is exported as a metric.
@@ -211,7 +217,8 @@ Stapelberg's [hmgo](https://github.com/stapelberg/hmgo) (Copyright (c) 2017
 Michael Stapelberg); files that come from hmgo carry his copyright line in
 their header. Michael Stapelberg does not endorse this fork.
 
-`hmbridge -license`, `hmsniff -license` and `hmgenconfig -license` print the license. Protocol
+`hmbridge -license`, `hmsniff -license`, `hmgenconfig -license` and
+`hmkeycheck -license` print the license. Protocol
 knowledge comes from [FHEM](https://fhem.de/) (HMUARTLGW, CUL_HM),
 [Homegear](https://homegear.eu/) and [RFNETHM](https://github.com/tostmann/RFNETHM);
 no code from these GPL projects is included. The AES test vectors in

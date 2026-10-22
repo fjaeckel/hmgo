@@ -941,8 +941,10 @@ func parseActuatorCommand(cmd *Command, what, p string) error {
 			cmd.Transition = ptr(*t)
 		}
 	default: // led_<n>
-		n, err := strconv.Atoi(strings.TrimPrefix(what, "led_"))
-		if err != nil || n < 1 || n > LEDCount {
+		num := strings.TrimPrefix(what, "led_")
+		n, err := strconv.Atoi(num)
+		// Only the canonical form (led_3, not led_03 or led_+3).
+		if err != nil || n < 1 || n > LEDCount || strconv.Itoa(n) != num {
 			return fmt.Errorf("ha: invalid LED %q", what)
 		}
 		c := strings.ToLower(p)

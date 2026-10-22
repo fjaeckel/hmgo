@@ -5,6 +5,7 @@ package bridge
 
 import (
 	"bytes"
+	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -195,6 +196,36 @@ func TestDimmerBrightness(t *testing.T) {
 	}
 }
 
+// A status answer or INFO_LEVEL of a dimmer that is still ramping
+// (working) is no final level: it neither changes the level nor the
+// level the dimmer is switched on at.
+func TestDimmerWorkingReportKeepsLevel(t *testing.T) {
+	a := &actuatorDevices{}
+	e := newDevEnv(t, a, devConf, nil)
+	topic := "hmbridge/41e951/state"
+	e.waitFor("status after startup", func() bool { return e.state(topic)["level"] == 0.0 })
+	e.inject(0x01, msg(0x31, 0xa4, 0x10, dim, central, 0x06, 0x01, 0x50, 0x00, 0x00))
+	e.waitFor("final 40 %", func() bool { return e.state(topic)["level"] == 40.0 })
+	// Ramping down: 8 %, working (flags 0x20 = down).
+	e.inject(0x01, msg(0x32, 0xa4, 0x10, dim, central, 0x06, 0x01, 0x10, 0x20, 0x00))
+	// Ramping up from off: a working report must not become lastOnLevel.
+	e.inject(0x01, msg(0x33, 0xa4, 0x10, dim, central, 0x06, 0x01, 0x04, 0x10, 0x00))
+	e.waitFor("working reports seen", func() bool {
+		e.b.mu.Lock()
+		defer e.b.mu.Unlock()
+		return strings.Contains(e.b.byAddr[dim].lastEvent, "2 %")
+	})
+	e.b.mu.Lock()
+	l, lastOn := e.b.byAddr[dim].state.Level, e.b.byAddr[dim].lastOnLevel
+	e.b.mu.Unlock()
+	if l == nil || *l != 40 || lastOn != 40 {
+		t.Errorf("after working reports: level %v, lastOnLevel %v (want 40, 40)", l, lastOn)
+	}
+	if st := e.state(topic); st["level"] != 40.0 || st["on"] != true {
+		t.Errorf("published state %v", st)
+	}
+}
+
 func TestLEDDisplayUnreachable(t *testing.T) {
 	a := &actuatorDevices{}
 	e := newDevEnv(t, a, devConf, nil)
@@ -379,5 +410,108 @@ func TestBrightnessToLevel(t *testing.T) {
 		if got := brightnessToLevel(br); got != want {
 			t.Errorf("brightnessToLevel(%d) = %v, want %v", br, got, want)
 		}
+	}
+}
+
+// Restored actuator state (retained message or state file) is
+// sanitized: no LEDs beyond 16, no unknown colors, no level outside
+// 0…100.
+func TestRestoredActuatorStateSanitized(t *testing.T) {
+	newB := func() *Bridge {
+		cfg, err := config.Parse([]byte(devConf))
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, err := New(Options{Config: cfg, Radio: nopRadio{}, Logf: t.Logf})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return b
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+	leds := `["red","blue","green","","orange","off","red","red","red","red","red","red","red","red","red","red","green","green"]`
+	wantLEDs := []string{"red", "", "green", "", "orange", "off", "red", "red", "red", "red", "red", "red", "red", "red", "red", "red"}
+
+	b := newB()
+	b.SeedFromRetained(ha.TopicConfig{}, map[string][]byte{
+		"hmbridge/41e951/state": []byte(`{"on":true,"level":150,"last_seen":"` + now + `"}`),
+		"hmbridge/6a9d15/state": []byte(`{"on":false,"level":-1,"last_seen":"` + now + `"}`),
+		"hmbridge/7564ea/state": []byte(`{"leds":` + leds + `,"last_seen":"` + now + `"}`),
+	})
+	if d := b.byAddr[dim]; d.state.Level != nil || d.lastOnLevel != 0 || d.state.On == nil || !*d.state.On {
+		t.Errorf("retained dimmer: level %v, lastOnLevel %v, on %v", d.state.Level, d.lastOnLevel, d.state.On)
+	}
+	if l := b.byAddr[plug].state.Level; l != nil {
+		t.Errorf("retained switch level %v", *l)
+	}
+	if got := b.byAddr[led].state.LEDs; !reflect.DeepEqual(got, wantLEDs) {
+		t.Errorf("retained LEDs %q", got)
+	}
+
+	path := filepath.Join(t.TempDir(), "state.json")
+	file := `{"version":1,"devices":{
+		"41e951":{"state":{"on":true,"level":101,"last_seen":"` + now + `"},"last_on_level":250},
+		"7564ea":{"state":{"leds":` + leds + `,"last_seen":"` + now + `"}}}}`
+	if err := os.WriteFile(path, []byte(file), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	b = newB()
+	if err := b.loadState(path); err != nil {
+		t.Fatal(err)
+	}
+	if d := b.byAddr[dim]; d.state.Level != nil || d.lastOnLevel != 0 {
+		t.Errorf("state file dimmer: level %v, lastOnLevel %v", d.state.Level, d.lastOnLevel)
+	}
+	if got := b.byAddr[led].state.LEDs; !reflect.DeepEqual(got, wantLEDs) {
+		t.Errorf("state file LEDs %q", got)
+	}
+	// Valid values survive.
+	b.SeedFromRetained(ha.TopicConfig{}, map[string][]byte{
+		"hmbridge/41e951/state": []byte(`{"on":true,"level":42.5,"last_seen":"` + time.Now().UTC().Add(time.Second).Format(time.RFC3339) + `"}`),
+	})
+	if d := b.byAddr[dim]; d.state.Level == nil || *d.state.Level != 42.5 || d.lastOnLevel != 42.5 {
+		t.Errorf("valid level not restored: %v %v", d.state.Level, d.lastOnLevel)
+	}
+}
+
+// The first PublishAll after start removes the button and LED entities
+// of other kinds (a device whose kind changed); reconnects don't repeat
+// those removals.
+func TestFirstPublishRemovesOtherKindsEntities(t *testing.T) {
+	cfg, err := config.Parse([]byte(devConf))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := New(Options{Config: cfg, Radio: nopRadio{}, Logf: t.Logf})
+	if err != nil {
+		t.Fatal(err)
+	}
+	removed := func() map[string]bool {
+		r := map[string]bool{}
+		for _, m := range b.outbox.take() {
+			if len(m.Payload) == 0 {
+				r[m.Topic] = true
+			}
+		}
+		return r
+	}
+	b.SetPublisher(&fakePub{})
+	first := removed()
+	for _, k := range []string{
+		"homeassistant/select/hmbridge_6a9d15/led_16/config",                          // switch: LED selects
+		"homeassistant/device_automation/hmbridge_6a9d15/button_8_press_short/config", // switch: button triggers
+		"homeassistant/event/hmbridge_7564ea/button_1/config",                         // LED display: button events
+		"homeassistant/select/hmbridge_6c10ce/led_1/config",                           // remote: LED selects
+	} {
+		if !first[k] {
+			t.Errorf("first PublishAll does not remove %s", k)
+		}
+	}
+	if first["homeassistant/select/hmbridge_7564ea/led_1/config"] || first["homeassistant/event/hmbridge_6c10ce/button_8/config"] {
+		t.Error("first PublishAll removes a live entity")
+	}
+	b.PublishAll()
+	if again := removed(); again["homeassistant/select/hmbridge_6a9d15/led_16/config"] || again["homeassistant/event/hmbridge_7564ea/button_1/config"] {
+		t.Error("reconnect repeats the removals of other kinds' entity sets")
 	}
 }

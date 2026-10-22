@@ -916,12 +916,13 @@ func TestStateSaveFailureIsRetried(t *testing.T) {
 	if n := count("saving state to"); n != 1 {
 		t.Errorf("save failure logged %d times, want once", n)
 	}
-	e.b.mu.Lock()
-	dirty := e.b.significantDirty
-	e.b.mu.Unlock()
-	if !dirty {
-		t.Error("state not dirty after a failed save; it would not be retried")
-	}
+	// A save attempt may be in progress (it clears the flag until the
+	// write fails), so wait for the flag instead of sampling it once.
+	e.waitFor("state dirty again after a failed save (so it is retried)", func() bool {
+		e.b.mu.Lock()
+		defer e.b.mu.Unlock()
+		return e.b.significantDirty
+	})
 	// Make the path writable: the next attempt succeeds.
 	os.Remove(blocker)
 	e.waitFor("saved after recovery", func() bool { _, ok := readStateFile(t, path); return ok })

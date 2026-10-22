@@ -9,11 +9,15 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"runtime"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/fjaeckel/hmgo/internal/bidcos"
+	bidcosaes "github.com/fjaeckel/hmgo/internal/bidcos/aes"
 	"github.com/fjaeckel/hmgo/internal/uartgw/fakemod"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 )
@@ -800,7 +804,7 @@ func TestDualResponseWait(t *testing.T) {
 		{normal.Encode()[3:], 260 * ms, minWaitAfterAck},
 		{burst.Encode()[3:], 384 * ms, defaultResponseTimeout},
 	} {
-		if got := c.responseWait(tt.msg, t0, t0.Add(tt.ack)); got != tt.want {
+		if got := c.responseWait(tt.msg, false, t0, t0.Add(tt.ack)); got != tt.want {
 			t.Errorf("ack after %v (flags %02x): wait %v, want %v", tt.ack, tt.msg[1], got, tt.want)
 		}
 	}
@@ -854,6 +858,49 @@ func TestDualIgnoredFrames(t *testing.T) {
 	}
 	if _, err := c.Send(context.Background(), bidiPacket(0x52).Encode()); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// HMIPHandler gets the Homematic IP frames; a handler that blocks
+// neither delays BidCoS reception nor makes the module transmit.
+func TestDualHMIPHandler(t *testing.T) {
+	type got struct {
+		dst, cnt byte
+		packet   []byte
+	}
+	ch := make(chan got, 1)
+	release := make(chan struct{})
+	defer close(release)
+	c, mod := openDualTest(t, fakemod.Options{}, Config{HMIPHandler: func(dst, cnt byte, packet []byte) {
+		ch <- got{dst, cnt, packet}
+		<-release // blocks until the test ends
+	}})
+	dropped := testutil.ToFloat64(dualEvents.WithLabelValues("hmip_dropped"))
+	// Captured: a device's frame (restart capture 10:39:37).
+	event := []byte{0x45, 0x12, 0x00, 0x83, 0x47, 0xde, 0xf5, 0xf0, 0x00, 0x01, 0x05, 0x89, 0x06, 0x7d, 0xf0, 0x60, 0x02, 0x3e, 0x88, 0x04}
+	mod.WriteRaw(fakemod.Frame{Dst: fakemod.DstHMIP, Cnt: 0x16, Cmd: 0x07, Payload: event}.Encode())
+	select {
+	case g := <-ch:
+		if g.dst != 0x02 || g.cnt != 0x16 || !bytes.Equal(g.packet, append([]byte{0x07}, event...)) {
+			t.Errorf("handler got %02x %02x %x", g.dst, g.cnt, g.packet)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("handler not called")
+	}
+	// The handler is busy now: fill its queue and overflow it.
+	for i := 0; i < hmipQueueSize+5; i++ {
+		mod.WriteRaw(fakemod.Frame{Dst: 0x0c, Cnt: byte(i), Cmd: 0x03, Payload: []byte{0x01}}.Encode())
+	}
+	msg := msgBytes(0x12, 0x84, 0x70, testDevice, [3]byte{}, 0x00, 0xd3)
+	if err := mod.InjectLLMACRecv(0x52, msg); err != nil {
+		t.Fatal(err)
+	}
+	recvOne(t, c)
+	if d := testutil.ToFloat64(dualEvents.WithLabelValues("hmip_dropped")) - dropped; d != 5 {
+		t.Errorf("dropped %v HMIP frames, want 5", d)
+	}
+	if n := len(mod.Sent()); n != 0 || c.Err() != nil {
+		t.Errorf("transmitted %d messages, err %v", n, c.Err())
 	}
 }
 
@@ -1079,4 +1126,429 @@ func TestDualSoftwareAESPerChannel(t *testing.T) {
 	if aesRequired(Peer{}, 0x40, []byte{0x01, 0x01}) {
 		t.Error("challenge for a peer without AES")
 	}
+}
+
+// ---- regression tests for review findings ----
+
+// A module which silently drops into its bootloader answers the TRX
+// poll with DUAL_ERR; the poll's IDENTIFY then reveals the bootloader.
+func TestDualSilentBootloader(t *testing.T) {
+	c, mod := openDualTest(t, fakemod.Options{}, Config{TRXPollInterval: 30 * time.Millisecond, Timeout: 200 * time.Millisecond})
+	mod.DropToBootloader()
+	select {
+	case <-c.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("connection still up after the module dropped into its bootloader")
+	}
+	if !errors.Is(c.Err(), ErrModuleReset) {
+		t.Fatalf("Err = %v, want ErrModuleReset", c.Err())
+	}
+}
+
+// DUAL_ERR replies count towards MaxAckTimeouts, for the TRX poll and
+// for sends.
+func TestDualErrNotAlive(t *testing.T) {
+	t.Run("poll", func(t *testing.T) {
+		c, mod := openDualTest(t, fakemod.Options{}, Config{TRXPollInterval: 30 * time.Millisecond, Timeout: 200 * time.Millisecond})
+		mod.SetDualErrAll(true)
+		select {
+		case <-c.done:
+		case <-time.After(3 * time.Second):
+			t.Fatal("connection still up although every request is answered with DUAL_ERR")
+		}
+		if !errors.Is(c.Err(), ErrModuleUnresponsive) {
+			t.Fatalf("Err = %v, want ErrModuleUnresponsive", c.Err())
+		}
+	})
+	t.Run("send", func(t *testing.T) {
+		c, mod := openDualTest(t, fakemod.Options{}, Config{TRXPollInterval: -1})
+		mod.SetDualErrAll(true)
+		for i := 0; i < 3; i++ {
+			if _, err := c.Send(context.Background(), noBiDiPacket(byte(i+1))); !errors.Is(err, ErrNACK) && !errors.Is(err, ErrModuleUnresponsive) {
+				t.Fatalf("Send %d: %v", i, err)
+			}
+		}
+		if !errors.Is(c.Err(), ErrModuleUnresponsive) {
+			t.Fatalf("Err = %v, want ErrModuleUnresponsive", c.Err())
+		}
+	})
+}
+
+// authResponder is a fakeSigner which also implements AESAuthResponder.
+type authResponder struct{ fakeSigner }
+
+func fakeAuth(keyIndex byte, challenge [6]byte, msg []byte) []byte {
+	a := fakeAnswer(keyIndex^0xff, challenge, msg)
+	return a[:4]
+}
+
+func (authResponder) RespondAuth(keyIndex byte, challenge [6]byte, msg []byte) ([16]byte, [4]byte, error) {
+	var a [4]byte
+	copy(a[:], fakeAuth(keyIndex, challenge, msg))
+	return fakeAnswer(keyIndex, challenge, msg), a, nil
+}
+
+// authDevice challenges cmd 0x11 and answers our AES answer with final
+// (orig, auth) as its ACK payload.
+func authDevice(final func(auth []byte) []byte) func([]byte) [][]byte {
+	var mu sync.Mutex
+	var orig []byte
+	ch := [6]byte{1, 2, 3, 4, 5, 6}
+	return func(msg []byte) [][]byte {
+		mu.Lock()
+		defer mu.Unlock()
+		switch msg[2] {
+		case 0x11:
+			orig = append([]byte(nil), msg...)
+			return [][]byte{msgBytes(msg[0], 0xa0, 0x02, testDevice, testHMID, append(append([]byte{0x04}, ch[:]...), 0x02)...)}
+		case 0x03:
+			return [][]byte{msgBytes(msg[0], 0x80, 0x02, testDevice, testHMID, final(fakeAuth(1, ch, orig))...)}
+		}
+		return nil
+	}
+}
+
+func TestDualSendAESAuthBytes(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		final  func(auth []byte) []byte
+		signer AESSigner
+		ok     bool
+	}{
+		{"ack with auth", func(a []byte) []byte { return append([]byte{0x00}, a...) }, authResponder{}, true},
+		{"ack_status with auth", func(a []byte) []byte { return append([]byte{0x01, 0x01, 0xc8, 0x00, 0x40}, a...) }, authResponder{}, true},
+		{"wrong auth", func(a []byte) []byte { return []byte{0x00, a[0] ^ 1, a[1], a[2], a[3]} }, authResponder{}, false},
+		{"bare ack", func([]byte) []byte { return []byte{0x00} }, authResponder{}, false},
+		{"bare ack, signer without RespondAuth", func([]byte) []byte { return []byte{0x00} }, fakeSigner{}, true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			c, _ := openDualTest(t, fakemod.Options{OnLLMACSend: authDevice(tt.final)}, Config{Signer: tt.signer})
+			resp, err := c.Send(context.Background(), bidiPacket(0x47).Encode())
+			if tt.ok {
+				if err != nil || resp == nil || resp[0] != 0x02 {
+					t.Fatalf("Send = %x, %v; want status 0x02", resp, err)
+				}
+				return
+			}
+			if !errors.Is(err, ErrAESFailed) || resp == nil || resp[0] != 0x03 {
+				t.Fatalf("Send = %x, %v; want status 0x03, ErrAESFailed", resp, err)
+			}
+		})
+	}
+}
+
+// The real bidcosaes.Signer on both ends: the device computes the auth
+// bytes from our answer like a real device (VerifyAuth).
+func TestDualSendAESRealSigner(t *testing.T) {
+	signer := bidcosaes.NewSigner(testKey)
+	var mu sync.Mutex
+	var orig []byte
+	ch := [6]byte{9, 8, 7, 6, 5, 4}
+	dev := func(msg []byte) [][]byte {
+		mu.Lock()
+		defer mu.Unlock()
+		switch msg[2] {
+		case 0x11:
+			orig = append([]byte(nil), msg...)
+			return [][]byte{msgBytes(msg[0], 0xa0, 0x02, testDevice, testHMID, append(append([]byte{0x04}, ch[:]...), testKey.Index*2)...)}
+		case 0x03:
+			var r [16]byte
+			copy(r[:], msg[9:])
+			auth, ok := signer.VerifyAuth(testKey.Index, ch, orig, r)
+			if !ok {
+				return [][]byte{msgBytes(msg[0], 0x80, 0x02, testDevice, testHMID, 0x80)}
+			}
+			return [][]byte{msgBytes(msg[0], 0x80, 0x02, testDevice, testHMID, append([]byte{0x00}, auth[:]...)...)}
+		}
+		return nil
+	}
+	c, _ := openDualTest(t, fakemod.Options{OnLLMACSend: dev}, Config{Signer: signer})
+	resp, err := c.Send(context.Background(), bidiPacket(0x48).Encode())
+	if err != nil || resp[0] != 0x02 {
+		t.Fatalf("Send = %x, %v", resp, err)
+	}
+}
+
+// Challenges with an odd key index byte are rejected (ParseChallenge).
+func TestDualSendAESOddKeyIndex(t *testing.T) {
+	c, mod := openDualTest(t, fakemod.Options{OnLLMACSend: func(msg []byte) [][]byte {
+		if msg[2] == 0x11 {
+			return [][]byte{msgBytes(msg[0], 0xa0, 0x02, testDevice, testHMID, 0x04, 1, 2, 3, 4, 5, 6, 0x03)}
+		}
+		return nil
+	}}, Config{Signer: fakeSigner{}})
+	if _, err := c.Send(context.Background(), bidiPacket(0x49).Encode()); !errors.Is(err, ErrAESFailed) {
+		t.Fatalf("Send: got %v, want ErrAESFailed", err)
+	}
+	if n := len(mod.Sent()); n != 1 {
+		t.Errorf("transmitted %d messages, want 1 (no AES answer)", n)
+	}
+}
+
+// Our AES answer is scheduled replyDelay after the challenge; the
+// response timeout counts from its transmission (LLMAC_ACK), not from
+// the send request.
+func TestDualScheduledResponseWait(t *testing.T) {
+	c := &DualConn{responseTimeout: defaultResponseTimeout}
+	t0 := time.Unix(0, 0)
+	if got := c.responseWait(bidiPacket(1).Encode()[3:], true, t0, t0.Add(100*time.Millisecond)); got != defaultResponseTimeout {
+		t.Errorf("scheduled: wait %v, want %v", got, defaultResponseTimeout)
+	}
+
+	var modp atomic.Pointer[fakemod.Module]
+	ch := [6]byte{1, 2, 3, 4, 5, 6}
+	dev := func(msg []byte) [][]byte {
+		switch msg[2] {
+		case 0x11:
+			return [][]byte{msgBytes(msg[0], 0xa0, 0x02, testDevice, testHMID, append(append([]byte{0x04}, ch[:]...), 0x02)...)}
+		case 0x03:
+			// The device answers 150ms after our (scheduled) answer.
+			ack := msgBytes(msg[0], 0x80, 0x02, testDevice, testHMID, 0x00)
+			go func() {
+				time.Sleep(150 * time.Millisecond)
+				modp.Load().InjectLLMACRecv(fakemod.DefaultRSSI, ack)
+			}()
+		}
+		return nil
+	}
+	c2, mod := openDualTest(t, fakemod.Options{OnLLMACSend: dev}, Config{Signer: fakeSigner{}, ResponseTimeout: 200 * time.Millisecond, SendRetries: -1})
+	modp.Store(mod)
+	resp, err := c2.Send(context.Background(), bidiPacket(0x4a).Encode())
+	if err != nil || resp[0] != 0x02 {
+		t.Fatalf("Send = %x, %v", resp, err)
+	}
+	ls := mod.LLMACSent()
+	if len(ls) != 2 || ls[1].Opts[0]&0x80 != 0 {
+		t.Fatalf("sent %v, want the AES answer scheduled", ls)
+	}
+}
+
+// A lost challenge: the device retransmits its message, and we send
+// the same challenge again (scheduled after the retransmission).
+func TestDualSoftwareAESLostChallenge(t *testing.T) {
+	orig := msgBytes(0x61, 0xa2, 0x10, testDevice, testHMID, 0x06, 0x01, 0xc8, 0x00)
+	var mu sync.Mutex
+	challenges := 0
+	answer := aesPeerDevice(orig, "ok")
+	c, m := openDualTest(t, fakemod.Options{OnLLMACSend: func(msg []byte) [][]byte {
+		mu.Lock()
+		defer mu.Unlock()
+		if msg[2] == 0x02 && len(msg) > 9 && msg[9] == 0x04 {
+			challenges++
+			if challenges == 1 {
+				return nil // lost
+			}
+		}
+		return answer(msg)
+	}}, Config{Signer: fakeSigner{}, Rand: bytes.NewReader(bytes.Repeat([]byte{0xa5}, 64))})
+	if err := c.AddPeer(context.Background(), Peer{Addr: testDevice, KeyIndex: 1, AESChannels: []byte{1}}); err != nil {
+		t.Fatal(err)
+	}
+	m.InjectLLMACRecv(fakemod.DefaultRSSI, orig)
+	waitSent(t, m, 1)
+	m.InjectLLMACRecv(fakemod.DefaultRSSI, orig) // retransmission
+	got := recvOne(t, c)
+	if want := append([]byte{0x02, 0x00, fakemod.DefaultRSSI}, orig...); !bytes.Equal(got, want) {
+		t.Fatalf("received %x, want %x", got, want)
+	}
+	sent := waitSent(t, m, 3)
+	if !bytes.Equal(sent[0], sent[1]) || sent[1][9] != 0x04 {
+		t.Errorf("re-sent challenge %x differs from %x", sent[1], sent[0])
+	}
+	ls, inj := m.LLMACSent(), m.Injected()
+	checkScheduled(t, ls[1], inj[1].Ts)
+	expectNoRecv(t, c, 100*time.Millisecond)
+}
+
+// Stray AES answers (nothing held) are neither acknowledged nor
+// delivered.
+func TestDualStrayAESAnswer(t *testing.T) {
+	c, mod := openDualTest(t, fakemod.Options{}, Config{Signer: fakeSigner{}})
+	c.AddPeer(context.Background(), Peer{Addr: testDevice, KeyIndex: 1, AESChannels: []byte{1}})
+	before := testutil.ToFloat64(dualEvents.WithLabelValues("aes_stray_answer"))
+	mod.InjectLLMACRecv(fakemod.DefaultRSSI, msgBytes(0x33, 0xa0, 0x03, testDevice, testHMID, bytes.Repeat([]byte{0x11}, 16)...))
+	expectNoRecv(t, c, 150*time.Millisecond)
+	if n := len(mod.Sent()); n != 0 {
+		t.Errorf("transmitted %x", mod.Sent())
+	}
+	if d := testutil.ToFloat64(dualEvents.WithLabelValues("aes_stray_answer")) - before; d != 1 {
+		t.Errorf("aes_stray_answer +%v, want +1", d)
+	}
+}
+
+// Frames received before the LLMAC_ACK are no responses to Send.
+func TestDualResponseAfterLLMACAck(t *testing.T) {
+	var modp atomic.Pointer[fakemod.Module]
+	early := msgBytes(0x4b, 0x80, 0x02, testDevice, testHMID, 0x00)
+	real := msgBytes(0x4b, 0x80, 0x02, testDevice, testHMID, 0x01, 0x01, 0xc8, 0x00, 0x40)
+	c, mod := openDualTest(t, fakemod.Options{
+		LLMACAckStatus: func(msg []byte) byte {
+			if msg[2] == 0x11 {
+				modp.Load().InjectLLMACRecv(fakemod.DefaultRSSI, early)
+			}
+			return fakemod.LLMACStatusOK
+		},
+		OnLLMACSend: func(msg []byte) [][]byte { return [][]byte{real} },
+	}, Config{})
+	modp.Store(mod)
+	resp, err := c.Send(context.Background(), bidiPacket(0x4b).Encode())
+	if err != nil || !bytes.Equal(resp[3:], real) {
+		t.Fatalf("Send = %x, %v; want %x", resp, err, real)
+	}
+	if got := recvOne(t, c); !bytes.Equal(got[3:], early) {
+		t.Errorf("received %x, want the early frame %x", got, early)
+	}
+}
+
+// A device's AES answer for a held message is not taken as the
+// response to a Send with the same message counter.
+func TestDualAESAnswerCounterCollision(t *testing.T) {
+	orig := msgBytes(0x4c, 0xa2, 0x10, testDevice, testHMID, 0x06, 0x01, 0xc8, 0x00)
+	ch := [6]byte{0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5}
+	r := fakeAnswer(1, ch, orig)
+	answer := msgBytes(0x4c, 0xa0, 0x03, testDevice, testHMID, r[:]...)
+	c, m := openDualTest(t, fakemod.Options{OnLLMACSend: func(msg []byte) [][]byte {
+		if msg[2] == 0x11 { // our Send: the AES answer arrives first
+			return [][]byte{answer, fakemod.DeviceAck(msg)}
+		}
+		return nil
+	}}, Config{Signer: fakeSigner{}, Rand: bytes.NewReader(bytes.Repeat([]byte{0xa5}, 64))})
+	c.AddPeer(context.Background(), Peer{Addr: testDevice, KeyIndex: 1, AESChannels: []byte{1}})
+	m.InjectLLMACRecv(fakemod.DefaultRSSI, orig)
+	waitSent(t, m, 1) // challenge
+	resp, err := c.Send(context.Background(), bidiPacket(0x4c).Encode())
+	if err != nil || resp[3+2] != 0x02 {
+		t.Fatalf("Send = %x, %v; want the device's ACK", resp, err)
+	}
+	if got := recvOne(t, c); got[0] != 0x02 || !bytes.Equal(got[3:], orig) {
+		t.Errorf("received %x, want %x with AES OK", got, orig)
+	}
+}
+
+// After a successful AES exchange, retransmissions (of the message or
+// of the device's answer) are acknowledged again with the same auth
+// bytes, not challenged or delivered again.
+func TestDualSoftwareAESDuplicate(t *testing.T) {
+	orig := msgBytes(0x62, 0xa2, 0x10, testDevice, testHMID, 0x06, 0x01, 0xc8, 0x00)
+	c, m := openDualTest(t, fakemod.Options{OnLLMACSend: aesPeerDevice(orig, "ok")}, Config{
+		Signer: authSigner{},
+		Rand:   bytes.NewReader(bytes.Repeat([]byte{0xa5}, 64)),
+	})
+	c.AddPeer(context.Background(), Peer{Addr: testDevice, KeyIndex: 1, AESChannels: []byte{1}})
+	m.InjectLLMACRecv(fakemod.DefaultRSSI, orig)
+	if got := recvOne(t, c); got[0] != 0x02 {
+		t.Fatalf("received %x", got)
+	}
+	sent := waitSent(t, m, 2)
+	finalAck := sent[1]
+	m.InjectLLMACRecv(fakemod.DefaultRSSI, orig)
+	sent = waitSent(t, m, 3)
+	r := fakeAnswer(1, [6]byte{0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5}, orig)
+	m.InjectLLMACRecv(fakemod.DefaultRSSI, msgBytes(0x62, 0xa0, 0x03, testDevice, testHMID, r[:]...))
+	sent = waitSent(t, m, 4)
+	for i, s := range sent[2:] {
+		if !bytes.Equal(s, finalAck) {
+			t.Errorf("re-ACK %d = %x, want %x", i, s, finalAck)
+		}
+	}
+	expectNoRecv(t, c, 150*time.Millisecond)
+}
+
+// A late APP reply of the dual-coprocessor firmware during detection
+// does not make it a classic module.
+func TestOpenModuleDetectStrayAppReply(t *testing.T) {
+	mod, rw := fakemod.New(fakemod.Options{DualCoPro: true, StartInApp: true})
+	defer mod.Close()
+	go mod.WriteRaw(fakemod.Frame{Dst: fakemod.DstApp, Cnt: 0x05, Cmd: 0x04, Payload: []byte{0x01, 0x02}}.Encode())
+	m, err := OpenModule(rw, dualCfg(Config{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	if m.Kind() != KindRPIRFMod {
+		t.Fatalf("Kind = %q", m.Kind())
+	}
+}
+
+func TestDualNextCntExhausted(t *testing.T) {
+	c := &DualConn{reqs: make(map[byte]*dualReq), oneshots: make(map[byte]time.Time)}
+	for i := 1; i < 256; i++ {
+		c.reqs[byte(i)] = &dualReq{}
+	}
+	if _, err := c.nextCnt(); !errors.Is(err, errNoCounter) {
+		t.Fatalf("nextCnt: %v, want errNoCounter", err)
+	}
+	delete(c.reqs, 0x42)
+	if cnt, err := c.nextCnt(); err != nil || cnt != 0x42 {
+		t.Fatalf("nextCnt = %02x, %v", cnt, err)
+	}
+}
+
+func pumpGoroutines() int {
+	buf := make([]byte, 1<<20)
+	return strings.Count(string(buf[:runtime.Stack(buf, true)]), "(*framePump).run")
+}
+
+// The frame pump goroutine ends when detection fails.
+func TestDetectFailureNoLeak(t *testing.T) {
+	before := pumpGoroutines()
+	mod, rw := fakemod.New(fakemod.Options{DualCoPro: true, StartInApp: true, Mute: true})
+	defer mod.Close()
+	// Mute: no announcement, no IDENTIFY answer → classic assumed, whose
+	// init fails; then a failing OpenDual.
+	if _, err := OpenDual(rw, dualCfg(Config{Timeout: 50 * time.Millisecond, AnnounceWait: 20 * time.Millisecond})); err == nil {
+		t.Fatal("OpenDual succeeded")
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for pumpGoroutines() > before {
+		if time.Now().After(deadline) {
+			t.Fatalf("%d frame pump goroutines left, %d before", pumpGoroutines(), before)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestDualReplyLateMargin(t *testing.T) {
+	t0 := time.Now()
+	c := &DualConn{now: func() time.Time { return t0 }, clockValid: true, clockAt: t0}
+	for _, tt := range []struct {
+		elapsed uint16 // module time since the reception
+		now     bool
+	}{{70, false}, {80, true}} {
+		c.clockTs = 0x1000 + tt.elapsed
+		opts := c.replyOptsLocked(0x1000, 0x80)
+		if got := opts[0]&0x80 != 0; got != tt.now {
+			t.Errorf("%dms after the reception: options %x, sent now %v, want %v", tt.elapsed, opts, got, tt.now)
+		}
+	}
+}
+
+// At most challengeRateLimit challenges per peer within
+// challengeRateWindow; further messages are dropped.
+func TestDualChallengeRateLimit(t *testing.T) {
+	c, m := openDualTest(t, fakemod.Options{OnLLMACSend: func([]byte) [][]byte { return nil }}, Config{Signer: fakeSigner{}})
+	c.AddPeer(context.Background(), Peer{Addr: testDevice, KeyIndex: 1, AESChannels: []byte{1}})
+	before := testutil.ToFloat64(dualEvents.WithLabelValues("aes_challenge_rate_limited"))
+	for i := 0; i < challengeRateLimit+2; i++ {
+		m.InjectLLMACRecv(fakemod.DefaultRSSI, msgBytes(byte(0x80+i), 0xa0, 0x10, testDevice, testHMID, 0x06, 0x01, 0xc8, 0x00))
+	}
+	waitSent(t, m, challengeRateLimit)
+	deadline := time.Now().Add(2 * time.Second)
+	for testutil.ToFloat64(dualEvents.WithLabelValues("aes_challenge_rate_limited"))-before < 2 {
+		if time.Now().After(deadline) {
+			t.Fatal("no messages rate limited")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if n := len(m.Sent()); n != challengeRateLimit {
+		t.Errorf("sent %d challenges, want %d", n, challengeRateLimit)
+	}
+	// The challenged ones end as AES failed (unanswered), the others are
+	// not delivered at all.
+	for i := 0; i < challengeRateLimit; i++ {
+		if got := recvOne(t, c); got[0] != 0x03 {
+			t.Errorf("received %x", got)
+		}
+	}
+	expectNoRecv(t, c, 100*time.Millisecond)
 }

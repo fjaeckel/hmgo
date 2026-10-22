@@ -122,6 +122,12 @@ func (m *Module) handleDualCoPro(f Frame) error {
 	if m.opts.DualIgnore != nil && m.opts.DualIgnore(f.Dst, f.Cmd) {
 		return nil
 	}
+	m.mu.Lock()
+	errAll := m.dualErrAll
+	m.mu.Unlock()
+	if errAll {
+		return m.dualErr(f)
+	}
 
 	// Replies captured from multimacd's start (OpenCCU, RPI-RF-MOD
 	// firmware 4.4.22).
@@ -315,6 +321,24 @@ func (m *Module) Identifies() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.identifies
+}
+
+// DropToBootloader emulates a module which fell back into its bootloader
+// without announcing it (e.g. a watchdog reset whose announcement was
+// lost): from now on it answers application requests (TRX status poll,
+// LLMAC_SEND, …) with DUAL_ERR and IDENTIFY with “HMIP_TRX_Bl”.
+func (m *Module) DropToBootloader() {
+	m.mu.Lock()
+	m.inApp = false
+	m.mu.Unlock()
+}
+
+// SetDualErrAll makes the module answer every request with DUAL_ERR
+// (including IDENTIFY), or stops that.
+func (m *Module) SetDualErrAll(on bool) {
+	m.mu.Lock()
+	m.dualErrAll = on
+	m.mu.Unlock()
 }
 
 // TRXPolls returns how many TRX status polls (APP cmd 0x03) the module

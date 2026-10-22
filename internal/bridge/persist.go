@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -52,6 +53,7 @@ func (b *Bridge) restore(d *device, st ha.State, lastOnTarget float64, preBoost 
 	// Counters and command outcomes describe this bridge run only.
 	st.MessagesReceived = nil
 	st.LastCommand = ""
+	sanitizeActuatorState(&st)
 	// A boost that has expired since the state was saved is over; don't
 	// show it (and don't let “preset none” send a command for it).
 	if st.ControlMode == "boost" {
@@ -80,6 +82,30 @@ func (b *Bridge) restore(d *device, st ha.State, lastOnTarget float64, preBoost 
 	deriveState(d)
 }
 
+// validLevel reports whether l is an actuator level in percent.
+func validLevel(l float64) bool { return l >= 0 && l <= 100 } // false for NaN
+
+// sanitizeActuatorState drops restored actuator values hmbridge would
+// never have produced (a damaged state file or a foreign retained
+// message): LEDs beyond LEDCount, unknown colors, levels outside 0…100.
+func sanitizeActuatorState(st *ha.State) {
+	if l := st.Level; l != nil && !validLevel(*l) {
+		st.Level = nil
+	}
+	if len(st.LEDs) > ha.LEDCount {
+		st.LEDs = st.LEDs[:ha.LEDCount]
+	}
+	if st.LEDs != nil {
+		leds := make([]string, len(st.LEDs))
+		for i, c := range st.LEDs {
+			if slices.Contains(ha.LEDColors, c) {
+				leds[i] = c // others stay "" (unknown)
+			}
+		}
+		st.LEDs = leds
+	}
+}
+
 // loadState restores the last known device state from the state file. A
 // missing file is not an error.
 func (b *Bridge) loadState(path string) error {
@@ -101,7 +127,7 @@ func (b *Bridge) loadState(path string) error {
 			continue
 		}
 		b.restore(d, pd.State, pd.LastOnTarget, pd.PreBoostHAMode)
-		if pd.LastOnLevel > 0 {
+		if pd.LastOnLevel > 0 && validLevel(pd.LastOnLevel) {
 			d.lastOnLevel = pd.LastOnLevel
 		}
 		n++

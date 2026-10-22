@@ -214,6 +214,7 @@ type Module struct {
 	clockStart time.Time
 	changeApps int
 	identifies int
+	dualErrAll bool
 	ts         uint16
 
 	normalMode bool // OS 0x06 received

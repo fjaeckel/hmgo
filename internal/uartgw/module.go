@@ -56,8 +56,10 @@ var ErrUnknownModule = errors.New("uartgw: unknown radio module")
 // (detection) and then hand the very same stream over to Conn or
 // DualConn without losing buffered bytes.
 type framePump struct {
-	fr *frameReader
-	ch chan pumped
+	fr   *frameReader
+	ch   chan pumped
+	quit chan struct{} // closed by stop
+	once sync.Once
 
 	mu  sync.Mutex
 	alt func() []uint16
@@ -69,7 +71,7 @@ type pumped struct {
 }
 
 func newFramePump(r io.Reader) *framePump {
-	p := &framePump{fr: newFrameReader(r), ch: make(chan pumped)}
+	p := &framePump{fr: newFrameReader(r), ch: make(chan pumped), quit: make(chan struct{})}
 	p.fr.altInits = func() []uint16 {
 		p.mu.Lock()
 		alt := p.alt
@@ -89,8 +91,13 @@ func (p *framePump) setAltInits(fn func() []uint16) {
 	p.mu.Unlock()
 }
 
+// stop makes run return instead of waiting for a reader of the next
+// frame (detection failed: nobody will call next again). The read in
+// progress, if any, ends when rw is closed.
+func (p *framePump) stop() { p.once.Do(func() { close(p.quit) }) }
+
 // run reads frames until a read error, which is handed out as the last
-// item. Undecodable frames are logged and skipped.
+// item, or until stop. Undecodable frames are logged and skipped.
 func (p *framePump) run() {
 	for {
 		f, err := p.fr.next()
@@ -103,7 +110,11 @@ func (p *framePump) run() {
 			log.Printf("uartgw: skipped %d bytes of garbage before frame", p.fr.skipped)
 			p.fr.skipped = 0
 		}
-		p.ch <- pumped{f: f, err: err}
+		select {
+		case p.ch <- pumped{f: f, err: err}:
+		case <-p.quit:
+			return
+		}
 		if err != nil {
 			return
 		}
@@ -199,10 +210,12 @@ func classify(f frame) (kind, tag string) {
 		// HMUARTLGW_Parse in FHEM: “Minimally handle
 		// DualCopro-Firmware”).
 		return KindRPIRFMod, ""
-	case (f.dst == dstOS || f.dst == dstApp) && f.cmd == osAck:
-		// Only the classic firmware acks with cmd 0x04 on dst 0/1.
-		return KindHMModRPIPCB, ""
 	}
+	// Frames on dst OS/APP with cmd 0x04 imply nothing: the classic
+	// firmware acks with them, but they are also the dual-coprocessor
+	// firmware's APP replies (e.g. a late answer to a TRX status poll of
+	// a previous session). Only the answer to our IDENTIFY (see detect)
+	// or an announcement identifies a classic module.
 	return "", ""
 }
 
@@ -320,6 +333,7 @@ func OpenModule(rw io.ReadWriter, cfg Config) (Module, error) {
 	p := newFramePump(rw)
 	d, err := detect(p, rw, announceWait, timeout, cfg.Debug)
 	if err != nil {
+		p.stop()
 		closeRW(rw)
 		return nil, err
 	}

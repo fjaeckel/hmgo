@@ -20,7 +20,6 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
-	"runtime/debug"
 	"syscall"
 	"time"
 
@@ -30,6 +29,7 @@ import (
 
 	bidcosaes "github.com/fjaeckel/hmgo/internal/bidcos/aes"
 	"github.com/fjaeckel/hmgo/internal/bridge"
+	"github.com/fjaeckel/hmgo/internal/buildinfo"
 	"github.com/fjaeckel/hmgo/internal/config"
 	"github.com/fjaeckel/hmgo/internal/gpio"
 	"github.com/fjaeckel/hmgo/internal/ha"
@@ -47,20 +47,7 @@ var (
 	showLicense = flag.Bool("license", false, "print the licenses and exit")
 )
 
-func version() string {
-	v := "devel"
-	if bi, ok := debug.ReadBuildInfo(); ok {
-		if bi.Main.Version != "" && bi.Main.Version != "(devel)" {
-			v = bi.Main.Version
-		}
-		for _, s := range bi.Settings {
-			if s.Key == "vcs.revision" && len(s.Value) >= 12 {
-				v += "+" + s.Value[:12]
-			}
-		}
-	}
-	return v
-}
+func version() string { return buildinfo.Version() }
 
 var buildInfo = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 	Namespace: "hmbridge", Name: "build_info",
@@ -110,7 +97,13 @@ func main() {
 // done or the radio fails. uart is closed on return.
 func run(ctx context.Context, cfg *config.Config, uart io.ReadWriteCloser) error {
 	buildInfo.WithLabelValues(version(), runtime.Version()).Set(1)
-	conn, err := openModule(cfg, uart)
+	var debugf func(string, ...any)
+	if *debugFrames {
+		debugf = log.Printf
+	}
+	// Homematic IP frames of the RPI-RF-MOD: shown, not supported yet.
+	hmipMon := bridge.NewHMIPMonitor(nil, debugf)
+	conn, err := openModule(cfg, uart, hmipMon.Handle)
 	if err != nil {
 		uart.Close()
 		return err
@@ -121,11 +114,7 @@ func run(ctx context.Context, cfg *config.Config, uart io.ReadWriteCloser) error
 		log.Printf("RPI-RF-MOD support is experimental: acknowledgements and AES are done in software, and parts of the module protocol are still unverified (see docs/SNIFFING.md)")
 	}
 
-	var debugf func(string, ...any)
-	if *debugFrames {
-		debugf = log.Printf
-	}
-	opts := bridge.Options{Config: cfg, Radio: conn, Debugf: debugf}
+	opts := bridge.Options{Config: cfg, Radio: conn, Debugf: debugf, HMIP: hmipMon}
 	if testBridgeOptions != nil {
 		testBridgeOptions(&opts)
 	}
@@ -216,7 +205,7 @@ func run(ctx context.Context, cfg *config.Config, uart io.ReadWriteCloser) error
 // status polls). Always nil outside tests.
 var testBridgeOptions func(*bridge.Options)
 
-func openModule(cfg *config.Config, uart io.ReadWriter) (uartgw.Module, error) {
+func openModule(cfg *config.Config, uart io.ReadWriter, hmipHandler func(dst, cnt byte, packet []byte)) (uartgw.Module, error) {
 	current, previous := cfg.Keys()
 	keys := []hmkey.Key{*current}
 	if previous != nil {
@@ -233,6 +222,8 @@ func openModule(cfg *config.Config, uart io.ReadWriter) (uartgw.Module, error) {
 		// The RPI-RF-MOD leaves AES to the host.
 		Signer: bidcosaes.NewSigner(keys...),
 		Debug:  *debugFrames,
+		// RPI-RF-MOD only; receive only.
+		HMIPHandler: hmipHandler,
 	}
 	var (
 		mod uartgw.Module

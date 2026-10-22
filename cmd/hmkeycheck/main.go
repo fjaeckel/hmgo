@@ -3,7 +3,7 @@
 
 // Command hmkeycheck finds out which AES key a BidCoS device really uses.
 //
-// It reads an hmbridge -debug log (or an hmsniff log), extracts the AES
+// It reads an hmbridge -debug log, extracts the AES
 // handshakes it contains (a device's message, the central's challenge and
 // the device's 16-byte answer) and checks every candidate key against
 // them, offline: no radio, no OpenCCU service and no network are needed.
@@ -26,6 +26,7 @@ import (
 	"strings"
 
 	"github.com/fjaeckel/hmgo/internal/bidcos/aes"
+	"github.com/fjaeckel/hmgo/internal/buildinfo"
 	"github.com/fjaeckel/hmgo/internal/hmkey"
 	"github.com/fjaeckel/hmgo/licenses"
 )
@@ -41,6 +42,7 @@ var (
 	keysFile    = flag.String("keys", "", "file to take candidate keys from: every 32-hex-digit value (e.g. /etc/config/keys on OpenCCU)")
 	stdinPass   = flag.Bool("stdin", false, "read candidate passphrases from standard input, one per line (keeps them out of the shell history)")
 	license     = flag.Bool("license", false, "print the licenses and exit")
+	showVersion = flag.Bool("version", false, "print the version and exit")
 )
 
 func main() {
@@ -62,6 +64,10 @@ Examples:
 	flag.Parse()
 	if *license {
 		fmt.Print(licenses.Text())
+		return
+	}
+	if *showVersion {
+		fmt.Println("hmkeycheck", buildinfo.Version())
 		return
 	}
 	if flag.NArg() == 0 {
@@ -129,7 +135,8 @@ func candidates() ([]candidate, error) {
 	for i, k := range hexKeys {
 		key, err := hmkey.FromHex(k, 0)
 		if err != nil {
-			return nil, fmt.Errorf("-key #%d: %v", i+1, err)
+			// Generic: hmkey's error may quote a character of the key.
+			return nil, fmt.Errorf("-key #%d: must be 32 hex digits (16 bytes)", i+1)
 		}
 		res = append(res, candidate{fmt.Sprintf("-key #%d", i+1), key.Bytes})
 	}

@@ -338,6 +338,15 @@ type Config struct {
 
 	// Rand is the source of AES challenges (nil: crypto/rand).
 	Rand io.Reader
+
+	// HMIPHandler, if set, receives every frame the RPI-RF-MOD sends on
+	// its Homematic IP destinations (0x02, 0x0c): destination, counter
+	// and packet (command byte, data…; not reused). It runs on its own
+	// goroutine, in order; while it lags behind by more than 64 frames,
+	// further ones are dropped (hmip_dropped), so it never delays the
+	// BidCoS traffic. Receive only: nothing is ever sent on these
+	// destinations.
+	HMIPHandler func(dst, cnt byte, packet []byte)
 }
 
 func csmaCAByte(enabled bool) byte {

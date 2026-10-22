@@ -216,7 +216,7 @@ func actuatorEntities() []entity {
 			"command_on_template":  `{"state": "on"{% if brightness is defined %}, "brightness": {{ brightness }}{% endif %}{% if transition is defined %}, "transition": {{ transition }}{% endif %}}`,
 			"command_off_template": `{"state": "off"{% if transition is defined %}, "transition": {{ transition }}{% endif %}}`,
 			"state_template":       "{{ ('on' if value_json.on else 'off') if value_json.on is defined else 'None' }}",
-			"brightness_template":  "{{ (value_json.level * 2.55) | round(0) | int if value_json.level is defined else 'None' }}",
+			"brightness_template":  "{{ (value_json.level * 2.55) | round(0) | int if value_json.level is defined else '' }}",
 			"optimistic":           false,
 			"qos":                  1,
 		}},
@@ -490,15 +490,30 @@ func RemovalMessages(cfg TopicConfig, addr string) []Message {
 
 // StaleDiscoveryMessages returns removal messages for the entities that
 // exist for some Kind/Model but not for d (useful when a device's model was
-// corrected in the configuration). Publishing them is optional.
+// corrected in the configuration). Publishing them is optional. The
+// per-button and per-LED entities of other kinds are left out (see
+// entity.staleScope); AllStaleDiscoveryMessages includes them.
 func StaleDiscoveryMessages(cfg TopicConfig, d DeviceDesc) []Message {
+	return staleMessages(cfg, d, true)
+}
+
+// AllStaleDiscoveryMessages is StaleDiscoveryMessages including the
+// entity sets of all other kinds (8 buttons' events and triggers, 16 LED
+// selects), so that a device whose kind changed (e.g. a remote
+// reconfigured as a switch) loses all of its old entities. Meant for
+// once per start, not every reconnect.
+func AllStaleDiscoveryMessages(cfg TopicConfig, d DeviceDesc) []Message {
+	return staleMessages(cfg, d, false)
+}
+
+func staleMessages(cfg TopicConfig, d DeviceDesc, scoped bool) []Message {
 	id := nodeID(d.Addr)
 	var msgs []Message
 	if !thermostats(d) {
 		msgs = append(msgs, retained(climateTopic(cfg, id), nil))
 	}
 	for _, e := range entities() {
-		if !e.match(d) && (e.staleScope == nil || e.staleScope(d)) {
+		if !e.match(d) && (!scoped || e.staleScope == nil || e.staleScope(d)) {
 			msgs = append(msgs, retained(entityTopic(cfg, e.component, id, e.key), nil))
 		}
 	}

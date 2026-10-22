@@ -28,7 +28,7 @@ const GroupTypeHeating = "HomeMatic.heating"
 //	{"groups":[{"id":1,
 //	  "groupMembers":[{"memberType":{"id":"HM-CC-RT-DN"},"properties":{},"id":"NEQ0873206"}, …],
 //	  "groupType":{"id":"HomeMatic.heating","label":"Heating_Control","version":3},
-//	  "groupProperties":{"GROUP_DEVICE_NAME":"EG Office INT0000001","NAME":"EG Office", …}}, …]}
+//	  "groupProperties":{"GROUP_DEVICE_NAME":"Room B INT0000001","NAME":"Room B", …}}, …]}
 //
 // If that yields no groups, a lenient walk looks for any object with a
 // name and a list of members that look like device serials. lenient

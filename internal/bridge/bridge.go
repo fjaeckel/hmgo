@@ -83,6 +83,9 @@ type Options struct {
 	// ReleaseCheckInterval is how often long button presses are checked
 	// for a missing release. Zero means 500ms.
 	ReleaseCheckInterval time.Duration
+	// HMIP, if set, lists the Homematic IP devices the radio module
+	// heard on the status page.
+	HMIP *HMIPMonitor
 }
 
 // Bridge is the hmbridge core. Create it with New, then call Setup once
@@ -124,10 +127,14 @@ type Bridge struct {
 	mu      sync.Mutex // guards the fields below and all device/group state
 	pub     Publisher
 	unknown map[[3]byte]*UnknownSender
+	hmip    *HMIPMonitor // has its own lock
 	started time.Time
 	// stateDirty: any state changed since the last save;
 	// significantDirty: a change worth writing to the SD card.
 	stateDirty, significantDirty bool
+	// allStaleSent: the first PublishAll removed the entities of all
+	// other kinds (AllStaleDiscoveryMessages); later ones are scoped.
+	allStaleSent bool
 }
 
 type device struct {
@@ -218,6 +225,7 @@ func New(opts Options) (*Bridge, error) {
 		queue:        newJobQueue(),
 		outbox:       newOutbox(),
 		unknown:      make(map[[3]byte]*UnknownSender),
+		hmip:         opts.HMIP,
 	}
 	if b.clockSync == nil {
 		b.clockSync = SystemClockSynced
@@ -374,9 +382,15 @@ func (b *Bridge) PublishAll() {
 	}
 	topics := pub.Topics()
 	var msgs []ha.Message
+	stale := ha.StaleDiscoveryMessages
+	if !b.allStaleSent {
+		// Once per start: a device whose kind changed loses all old
+		// entities (button events/triggers, LED selects included).
+		stale, b.allStaleSent = ha.AllStaleDiscoveryMessages, true
+	}
 	for _, d := range b.devices {
 		msgs = append(msgs, ha.DiscoveryMessages(topics, d.desc)...)
-		msgs = append(msgs, ha.StaleDiscoveryMessages(topics, d.desc)...)
+		msgs = append(msgs, stale(topics, d.desc)...)
 		// Never overwrite the retained state with an empty one (e.g.
 		// right after a restart without a state file).
 		if !d.state.LastSeen.IsZero() {
@@ -837,6 +851,7 @@ type Snapshot struct {
 	Devices []DeviceSnapshot  `json:"devices"`
 	Groups  []GroupSnapshot   `json:"groups"`
 	Unknown []UnknownSender   `json:"unknown_senders"`
+	HMIP    []HMIPDevice      `json:"hmip_heard,omitempty"`
 	Queue   int               `json:"command_queue"`
 	Extra   map[string]string `json:"info,omitempty"`
 }
@@ -901,6 +916,9 @@ func (b *Bridge) Snapshot() Snapshot {
 		s.Unknown = append(s.Unknown, *u)
 	}
 	sort.Slice(s.Unknown, func(i, j int) bool { return s.Unknown[i].LastSeen.After(s.Unknown[j].LastSeen) })
+	if b.hmip != nil {
+		s.HMIP = b.hmip.Heard()
+	}
 	return s
 }
 

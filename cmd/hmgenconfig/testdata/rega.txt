@@ -1,21 +1,21 @@
 NEQ0873206	Büro Heizung
 MEQ1571441	Büro Wandthermostat
 SEQ2094299	Büro Fenster
-NEQ1004984	Spielzimmer Heizung
-REQ0836840	Spielzimmer Wandthermostat
-SEQ2094449	Spielzimmer Tür
-NEQ1007152	Wohnzimmer Heizkörper
-REQ0836852	Wohnzimmer Wandthermostat
-PEQ1190989	Wohnzimmer Heizkörper
+NEQ1004984	Gästezimmer Heizung
+REQ0836840	Gästezimmer Wandthermostat
+SEQ2094449	Gästezimmer Tür
+NEQ1007152	Esszimmer Heizkörper
+REQ0836852	Esszimmer Wandthermostat
+PEQ1190989	Esszimmer Heizkörper
 PEQ1315854	Küche Heizung
 LEQ0123456	Stehlampe Schalter
-PEQ1107611	Stehlampe Wohnzimmer
+PEQ1107611	Stehlampe Esszimmer
 MEQ1116747	Leselampe
-REQ1215000	Taster Flur
+REQ1215000	Taster Diele
 PEQ1918407	Fernbedienung
 SEQ1234485	Statusanzeige
-QEQ1859460	Garten Außen
-TEQ0694924	Teich
-LEQ0999999	Bewegungsmelder Flur
+QEQ1859460	Außen Nord
+TEQ0694924	Wassertemperatur
+LEQ0999999	Bewegungsmelder Diele
 BidCoS-RF	Zentrale
 <xml><exec>/rega.exe</exec><sessionId></sessionId><httpUserAgent></httpUserAgent><sId>2</sId><oDev>1234</oDev></xml>

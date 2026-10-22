@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: BSD-3-Clause -->
+
 # hmbridge design
 
 hmbridge turns a Raspberry Pi with an HM-MOD-RPI-PCB radio module into a
@@ -71,10 +73,11 @@ Escaping after the first byte: 0xFC/0xFD → 0xFC, byte&0x7F.
 Destinations: 0 = OS (bootloader), 1 = App, 254 = Dual, 255 = DualErr.
 After a reset the module announces `Co_CPU_BL` (cmd 0x00 on dst 0);
 `OSChangeApp` (0x03) switches to the app, which announces `Co_CPU_App`.
-The dual-coprocessor firmware (used for Homematic IP) answers on dst
-254/255 or announces `DualCoPro_App`; hmbridge must detect that and
-fail with `uartgw.ErrDualCoProFirmware` and a message telling the user
-to install the classic firmware.
+The dual-coprocessor firmware (RPI-RF-MOD, also used for Homematic IP)
+answers on dst 254/255 or announces `DualCoPro_App`. The classic driver
+(`uartgw.Open`) rejects it with `uartgw.ErrDualCoProFirmware`;
+`uartgw.OpenModule` detects it and uses the RPI-RF-MOD driver
+(`uartgw.OpenDual`, see docs/SNIFFING.md for the protocol as captured).
 
 Commands we use: OS 0x02 get firmware, 0x06 normal mode (leave update mode), 0x0A CSMA/CA (off by default, like FHEM/Homegear), 0x0B get
 serial, 0x0E set time (uint32 BE unix time + int8 UTC offset in 30 min);
@@ -113,8 +116,8 @@ dst COMMON.
 
 Unlike the HM-MOD-RPI-PCB, the module apparently neither acknowledges device
 messages nor does AES, so `DualConn` does both in software
-(`internal/bidcos/aes`, ported from FHEM's CUL_HM and verified against FHEM's
-own Perl code): it ACKs BiDi messages from registered peers, challenges
+(`internal/bidcos/aes`, implemented independently from the protocol as
+documented by FHEM/Homegear and verified against FHEM-generated test vectors): it ACKs BiDi messages from registered peers, challenges
 messages from AES peers and verifies the answers, answers devices' AES
 challenges to our commands, correlates device responses with sent commands,
 and retransmits unanswered commands. Whatever OpenCCU's multimacd sends the

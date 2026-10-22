@@ -1,6 +1,9 @@
+<!-- SPDX-License-Identifier: BSD-3-Clause -->
+
 # Deploying hmbridge
 
-hmbridge needs exclusive access to the HM-MOD-RPI-PCB radio module. While
+hmbridge needs exclusive access to the radio module (HM-MOD-RPI-PCB or
+RPI-RF-MOD). While
 you are still evaluating it, you keep OpenCCU installed and take turns: stop
 OpenCCU's radio services (or boot a different SD card), run hmbridge, and go
 back to OpenCCU whenever you like. Your thermostats keep their pairing and
@@ -111,6 +114,10 @@ Then edit `config.json`:
 2. `mqtt`: the broker URL, user name and password of your Home Assistant MQTT
    broker.
 
+hmbridge refuses to start while any value still starts with `CHANGE-ME`
+(`-check_config` reports which one), so the unedited output of hmgenconfig is
+expected to fail the check.
+
 What else to look at before the first run:
 
 * `devices` are sorted by group, then by name. `aes` is set when OpenCCU
@@ -132,7 +139,8 @@ What else to look at before the first run:
 * To start small, delete devices and groups you don't want yet (and remove
   deleted devices from the groups' `members`).
 
-Finally check the result:
+Finally check the result (it fails, naming the setting, while a `CHANGE-ME`
+placeholder is left):
 
 ```sh
 ./hmbridge -config config.json -check_config
@@ -251,8 +259,11 @@ finding device addresses.
 
 ## Module firmware
 
-OpenCCU may have installed eQ-3's "dual coprocessor" firmware on the module so
-that it can talk Homematic IP. hmbridge (like FHEM and Homegear) only speaks
-the classic firmware's protocol. Downgrading is a deliberate step; do it only
-once you know which firmware is installed. Note that OpenCCU may upgrade the
-module again when it starts with the radio module attached.
+An RPI-RF-MOD runs eQ-3's "dual coprocessor" firmware (4.x, e.g. 4.4.22),
+which OpenCCU installs so that the module can talk Homematic IP as well.
+hmbridge supports it (experimental): it detects the module, starts its
+application if needed and does the BidCoS work the firmware leaves to the
+host (ACKs, AES, retransmissions) itself. No firmware downgrade is needed,
+and OpenCCU updating the module firmware does not get in the way.
+
+An HM-MOD-RPI-PCB with the classic firmware (1.x) is supported as well.

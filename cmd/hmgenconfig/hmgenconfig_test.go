@@ -64,7 +64,13 @@ func generate(t *testing.T, src Sources) (*config.Config, map[string]any, string
 	if err != nil {
 		t.Fatal(err)
 	}
-	cfg, err := config.Parse(out)
+	// The placeholders must be filled in: hmbridge rejects them.
+	if bytes.Contains(out, []byte(placeholder)) {
+		if _, err := config.Parse(out); err == nil || !strings.Contains(err.Error(), placeholder) {
+			t.Errorf("unfilled config: Parse error %v, want a %s placeholder error", err, placeholder)
+		}
+	}
+	cfg, err := config.Parse(fillPlaceholders(out))
 	if err != nil {
 		t.Fatalf("generated config does not validate: %v\n%s\nlog:\n%s", err, out, log.String())
 	}
@@ -73,6 +79,13 @@ func generate(t *testing.T, src Sources) (*config.Config, map[string]any, string
 		t.Fatal(err)
 	}
 	return cfg, raw, string(out) + "\n--- log:\n" + log.String()
+}
+
+// fillPlaceholders does what the user does: replace the placeholder
+// passphrases and MQTT credentials with real values.
+func fillPlaceholders(out []byte) []byte {
+	out = bytes.ReplaceAll(out, []byte(`"`+placeholder+`-PREVIOUS"`), []byte(`"old passphrase"`))
+	return bytes.ReplaceAll(out, []byte(`"`+placeholder+`"`), []byte(`"filled in"`))
 }
 
 func device(cfg *config.Config, name string) *config.Device {
@@ -123,20 +136,20 @@ func TestGenerateAllSources(t *testing.T) {
 		{"Büro Heizung", "NEQ0873206", true, []byte{1, 2, 3, 4, 5, 6}, 2},
 		{"Büro Wandthermostat", "MEQ1571441", true, []byte{2}, 2},
 		{"Büro Fenster", "SEQ2094299", true, []byte{1}, 2},
-		{"Spielzimmer Tür", "SEQ2094449", true, []byte{1}, 2},
+		{"Gästezimmer Tür", "SEQ2094449", true, []byte{1}, 2},
 		{"Küche Heizung", "PEQ1315854", true, []byte{1, 2, 3, 4, 5, 6}, 2},
-		{"Wohnzimmer Heizkörper NEQ1007152", "NEQ1007152", true, []byte{1, 2, 3, 4, 5, 6}, 2},
-		{"Wohnzimmer Heizkörper PEQ1190989", "PEQ1190989", false, nil, 2},
-		{"EG Livingroom HM-CC-RT-DN", "NEQ1009870", true, []byte{1, 2, 3, 4, 5, 6}, 1},
+		{"Esszimmer Heizkörper NEQ1007152", "NEQ1007152", true, []byte{1, 2, 3, 4, 5, 6}, 2},
+		{"Esszimmer Heizkörper PEQ1190989", "PEQ1190989", false, nil, 2},
+		{"Room A HM-CC-RT-DN", "NEQ1009870", true, []byte{1, 2, 3, 4, 5, 6}, 1},
 		// The other classic devices of the user's installation.
 		{"Stehlampe Schalter", "LEQ0123456", false, nil, 2},
-		{"Stehlampe Wohnzimmer", "PEQ1107611", true, []byte{1}, 2},
+		{"Stehlampe Esszimmer", "PEQ1107611", true, []byte{1}, 2},
 		{"Leselampe", "MEQ1116747", false, nil, 2},
-		{"Taster Flur", "REQ1215000", true, []byte{1, 2}, 2},
+		{"Taster Diele", "REQ1215000", true, []byte{1, 2}, 2},
 		{"Fernbedienung", "PEQ1918407", true, []byte{1, 2, 3, 4, 5, 6, 7}, 2},
 		{"Statusanzeige", "SEQ1234485", false, nil, 2},
-		{"Garten Außen", "QEQ1859460", false, nil, 2},
-		{"Teich", "TEQ0694924", false, nil, 2},
+		{"Außen Nord", "QEQ1859460", false, nil, 2},
+		{"Wassertemperatur", "TEQ0694924", false, nil, 2},
 	} {
 		d := device(cfg, w.name)
 		if d == nil {
@@ -154,7 +167,7 @@ func TestGenerateAllSources(t *testing.T) {
 	for _, dv := range raw["devices"].([]any) {
 		m := dv.(map[string]any)
 		switch m["name"] {
-		case "Büro Heizung", "Taster Flur":
+		case "Büro Heizung", "Taster Diele":
 			if m["aes_channels"] != nil {
 				t.Errorf("aes_channels written for the fully secured %v", m)
 			}
@@ -170,17 +183,17 @@ func TestGenerateAllSources(t *testing.T) {
 		t.Fatalf("%d groups, want 3\n%s", len(groups), out)
 	}
 	names := []string{groups[0].Name, groups[1].Name, groups[2].Name}
-	if !reflect.DeepEqual(names, []string{"EG Livingroom", "EG Office", "UG Playroom"}) {
+	if !reflect.DeepEqual(names, []string{"Room A", "Room B", "Room C"}) {
 		t.Errorf("groups = %v", names)
 	}
 	if g := groups[0]; len(g.Thermostats) != 4 || len(g.Contacts) != 0 || g.Climate.Model != config.ModelTC {
-		t.Errorf("EG Livingroom: %d thermostats, %d contacts", len(g.Thermostats), len(g.Contacts))
+		t.Errorf("Room A: %d thermostats, %d contacts", len(g.Thermostats), len(g.Contacts))
 	}
 	if g := groups[1]; len(g.Thermostats) != 2 || len(g.Contacts) != 1 || g.Contacts[0].Name != "Büro Fenster" {
-		t.Errorf("EG Office: %+v", g)
+		t.Errorf("Room B: %+v", g)
 	}
 	// Devices are sorted by group, then name; ungrouped last.
-	if cfg.Devices[0].Name != "EG Livingroom HM-CC-RT-DN" || cfg.Devices[len(cfg.Devices)-1].Name != "Teich" {
+	if cfg.Devices[0].Name != "Esszimmer Heizkörper NEQ1007152" || cfg.Devices[len(cfg.Devices)-1].Name != "Wassertemperatur" {
 		t.Errorf("device order: first %q last %q", cfg.Devices[0].Name, cfg.Devices[len(cfg.Devices)-1].Name)
 	}
 
@@ -191,7 +204,7 @@ func TestGenerateAllSources(t *testing.T) {
 	}
 	joined := strings.Join(all, "\n")
 	for _, s := range []string{
-		"not supported yet: Bewegungsmelder Flur (HM-Sen-MDIR-WM55 1D2000)",
+		"not supported yet: Bewegungsmelder Diele (HM-Sen-MDIR-WM55 1D2000)",
 		"not a device: Zentrale (HM-RCV-50 458086)",
 	} {
 		if !strings.Contains(joined, s) {
@@ -202,7 +215,7 @@ func TestGenerateAllSources(t *testing.T) {
 		t.Errorf("_comment lists supported devices:\n%s", joined)
 	}
 	// Models without AES get neither aes nor an "AES state unknown" note.
-	for _, name := range []string{"Garten Außen", "Teich"} {
+	for _, name := range []string{"Außen Nord", "Wassertemperatur"} {
 		for _, dv := range raw["devices"].([]any) {
 			m := dv.(map[string]any)
 			if m["name"] == name && (m["aes"] != nil || m["_comment"] != nil) {
@@ -234,8 +247,8 @@ func TestGenerateFilesOnly(t *testing.T) {
 	if len(cfg.Devices) != 11 || len(cfg.Groups) != 3 {
 		t.Errorf("%d devices, %d groups\n%s", len(cfg.Devices), len(cfg.Groups), out)
 	}
-	if d := device(cfg, "EG Office HM-CC-RT-DN"); d == nil || d.AESEnabled() {
-		t.Errorf("EG Office HM-CC-RT-DN: %+v\n%s", d, out)
+	if d := device(cfg, "Room B HM-CC-RT-DN"); d == nil || d.AESEnabled() {
+		t.Errorf("Room B HM-CC-RT-DN: %+v\n%s", d, out)
 	}
 	if d := device(cfg, "HM-CC-RT-DN PEQ1315854"); d == nil {
 		t.Errorf("fallback name missing\n%s", out)

@@ -55,3 +55,16 @@ func TestParseAndMatch(t *testing.T) {
 		t.Errorf("key file candidate not found among %d candidates", len(keys))
 	}
 }
+
+// A malformed -key is reported without echoing any of its characters.
+func TestBadKeyNotEchoed(t *testing.T) {
+	old := hexKeys
+	defer func() { hexKeys = old }()
+	for _, k := range []string{"zq112233445566778899aabbccddeeff", "0011"} {
+		hexKeys = multiFlag{k}
+		_, err := candidates()
+		if err == nil || err.Error() != "-key #1: must be 32 hex digits (16 bytes)" {
+			t.Errorf("candidates() error = %v", err)
+		}
+	}
+}

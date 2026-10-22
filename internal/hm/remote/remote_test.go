@@ -120,6 +120,18 @@ func TestTracker(t *testing.T) {
 			{key(2, false, true, 2), 100, []remote.Press{p(2, remote.PressShort, false)}},
 			{key(1, true, true, 1), 200, []remote.Press{p(1, remote.PressLongRelease, false)}},
 		}},
+		{"release after frames lost for longer than the duplicate window", []step{
+			{key(1, true, false, 4), 0, []remote.Press{p(1, remote.PressLong, false)}},
+			{key(1, true, true, 4), 12000, []remote.Press{p(1, remote.PressLongRelease, false)}},
+			{key(1, true, true, 4), 12100, nil},
+		}},
+		{"real release after the synthetic one, beyond the duplicate window", []step{
+			{key(1, true, false, 4), 0, []remote.Press{p(1, remote.PressLong, false)}},
+			{nil, 6000, []remote.Press{p(1, remote.PressLongRelease, true)}},
+			{key(1, true, false, 4), 11000, nil},
+			{key(1, true, true, 4), 22000, nil},
+			{key(1, true, true, 5), 23000, []remote.Press{p(1, remote.PressLong, true), p(1, remote.PressLongRelease, false)}},
+		}},
 		{"counter reused after the duplicate window", []step{
 			{key(1, false, true, 5), 0, []remote.Press{p(1, remote.PressShort, false)}},
 			{key(1, false, true, 5), 11000, []remote.Press{p(1, remote.PressShort, false)}},

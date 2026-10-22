@@ -48,6 +48,10 @@ func TestSwitchAndDimmerDiscovery(t *testing.T) {
 		!strings.Contains(l["command_on_template"].(string), "brightness") || !strings.Contains(l["brightness_template"].(string), "is defined") {
 		t.Errorf("light config = %v", l)
 	}
+	// An unknown level renders empty (HA skips it), never 'None'.
+	if bt := l["brightness_template"].(string); strings.Contains(bt, "None") || !strings.Contains(bt, "is defined else ''") || !strings.Contains(bt, "* 2.55") {
+		t.Errorf("brightness_template = %s", bt)
+	}
 	if dim["sensor/hmbridge_41e951/fault"] == nil || dim["switch/hmbridge_41e951/switch"] != nil {
 		t.Errorf("dimmer entities: %v", keys(dim))
 	}
@@ -122,6 +126,20 @@ func TestRemoteDiscovery(t *testing.T) {
 			t.Errorf("thermostat stale message %s", topic)
 		}
 	}
+	// Once per start, a device whose kind changed loses the entity sets
+	// of all other kinds too, but nothing it has.
+	sw := DeviceDesc{Addr: "6c10ce", Model: "HM-LC-Sw1-Pl-DN-R1", Kind: Switch}
+	all := topicsOf(AllStaleDiscoveryMessages(TopicConfig{}, sw))
+	for _, k := range []string{"homeassistant/device_automation/hmbridge_6c10ce/button_8_press_short/config", "homeassistant/event/hmbridge_6c10ce/button_1/config", "homeassistant/select/hmbridge_6c10ce/led_16/config", "homeassistant/light/hmbridge_6c10ce/light/config", "homeassistant/climate/hmbridge_6c10ce/config"} {
+		if _, ok := all[k]; !ok {
+			t.Errorf("AllStaleDiscoveryMessages lacks %s", k)
+		}
+	}
+	for _, m := range DiscoveryMessages(TopicConfig{}, sw) {
+		if _, ok := all[m.Topic]; ok {
+			t.Errorf("AllStaleDiscoveryMessages removes live %s", m.Topic)
+		}
+	}
 	// RemovalMessages covers them all.
 	rm := topicsOf(RemovalMessages(TopicConfig{}, "6c10ce"))
 	for _, k := range []string{"homeassistant/device_automation/hmbridge_6c10ce/button_8_press_short/config", "homeassistant/select/hmbridge_6c10ce/led_16/config", "homeassistant/light/hmbridge_6c10ce/light/config"} {
@@ -183,6 +201,8 @@ func TestParseActuatorCommands(t *testing.T) {
 		{"hmbridge/7564ea/set/led_17", "off", Command{}, true},
 		{"hmbridge/7564ea/set/led_0", "off", Command{}, true},
 		{"hmbridge/7564ea/set/led_x", "off", Command{}, true},
+		{"hmbridge/7564ea/set/led_03", "off", Command{}, true},
+		{"hmbridge/7564ea/set/led_+3", "off", Command{}, true},
 		{"hmbridge/7564ea/set/led_1", "blue", Command{}, true},
 		{"hmbridge/group/wohnzimmer/set/switch", "ON", Command{}, true},
 	} {

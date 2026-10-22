@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: BSD-3-Clause -->
+
 # Recording OpenCCU's radio traffic with hmsniff
 
 `hmsniff` records what OpenCCU and its radio module (RPI-RF-MOD or
@@ -13,11 +15,12 @@ what every one of your devices reports.
 ## Run it
 
 1. Check the Pi's architecture on OpenCCU: `uname -m`
-   (`aarch64` → `hmsniff-arm64`, `armv7l` → `hmsniff-armv7`).
+   (`aarch64` → `hmsniff-<version>-linux-arm64`, `armv7l` →
+   `hmsniff-<version>-linux-armv7`, from `make dist` or a release).
 2. Copy the binary to OpenCCU's `/tmp` (RAM, nothing is written to the SD card):
 
    ```sh
-   scp hmsniff-arm64 root@<openccu-ip>:/tmp/hmsniff
+   scp dist/hmsniff-*-linux-arm64 root@<openccu-ip>:/tmp/hmsniff   # or *-linux-armv7
    ```
 
 3. On OpenCCU:
@@ -39,13 +42,19 @@ what every one of your devices reports.
 
 ## What is (not) in the log
 
-* Key material is never written. Frames that look like an AES key being
+* Key material is never written to hmsniff's own log. Frames that look like an AES key being
   loaded into the module are replaced by `<… redacted …>`.
 * AES responses of the devices are redacted too (with the matching challenge,
   they would allow an offline attack on a weak key passphrase). `-no-redact`
   keeps them.
 * Device types and serial numbers come from OpenCCU's `/etc/config/rfd/*.dev`;
   your device names (from the web UI) are not included.
+* The kernel's own log is **not** redacted: while the raw-uart dump is on, the
+  driver logs every frame to the kernel log (`dmesg`, and syslog if it keeps
+  kernel messages), including frames that load an AES key into the module,
+  e.g. when rfd or multimacd (re)starts. Keep recordings short, don't share
+  `dmesg` output or syslog files from that time, and reboot (or clear the kernel
+  log with `dmesg -c`) afterwards if a key may have been loaded meanwhile.
 
 ## Good to know
 

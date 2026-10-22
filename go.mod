@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Frederic Jung
+// SPDX-License-Identifier: BSD-3-Clause
+
 module github.com/fjaeckel/hmgo
 
 go 1.27.0

@@ -51,7 +51,10 @@ type buttonState struct {
 	known   bool
 	counter byte
 	phase   phase
-	last    time.Time
+	// synthReleased: the long press was closed by a synthetic release
+	// (its real release may still arrive).
+	synthReleased bool
+	last          time.Time
 }
 
 // Tracker turns the KEY_EVENT frames of one remote into presses. It is
@@ -71,6 +74,10 @@ type buttonState struct {
 //     followed by a frame with another counter, gets a synthetic
 //     press_long_release, so that an automation dimming while the button
 //     is held always stops.
+//   - long frames with the counter of a long press that is still open
+//     or was only released synthetically belong to that press even
+//     after DuplicateWindow (frames lost while the button was held):
+//     they never start a second press_long.
 type Tracker struct {
 	DuplicateWindow time.Duration // 0: DefaultDuplicateWindow
 	ReleaseTimeout  time.Duration // 0: DefaultReleaseTimeout
@@ -103,7 +110,11 @@ func (t *Tracker) Process(ev *KeyEvent, now time.Time) []Press {
 		t.buttons[ev.Channel] = b
 	}
 	btn := int(ev.Channel)
-	same := b.known && b.counter == ev.Counter && now.Sub(b.last) < t.dupWindow()
+	sameCounter := b.known && b.counter == ev.Counter
+	same := sameCounter && now.Sub(b.last) < t.dupWindow()
+	// samePress: a long frame continuing the current long press, however
+	// long the gap (the counter only changes with a new press).
+	samePress := same || sameCounter && (b.phase == phaseLong || b.phase == phaseReleased && b.synthReleased)
 	defer func() {
 		b.known, b.counter, b.last = true, ev.Counter, now
 	}()
@@ -112,7 +123,7 @@ func (t *Tracker) Process(ev *KeyEvent, now time.Time) []Press {
 	closeOpen := func() {
 		if b.phase == phaseLong {
 			out = append(out, Press{Button: btn, Type: PressLongRelease, Synthetic: true})
-			b.phase = phaseReleased
+			b.phase, b.synthReleased = phaseReleased, true
 		}
 	}
 	switch {
@@ -125,7 +136,7 @@ func (t *Tracker) Process(ev *KeyEvent, now time.Time) []Press {
 		b.phase = phaseShort
 
 	case !ev.BiDi: // long press, held
-		if same && (b.phase == phaseLong || b.phase == phaseReleased) {
+		if samePress && (b.phase == phaseLong || b.phase == phaseReleased) {
 			return nil // repeat (or a late one after the release)
 		}
 		closeOpen()
@@ -134,15 +145,18 @@ func (t *Tracker) Process(ev *KeyEvent, now time.Time) []Press {
 
 	default: // long press released
 		switch {
-		case same && b.phase == phaseReleased:
-			return nil // retransmitted release
-		case same && b.phase == phaseLong:
+		case samePress && b.phase == phaseReleased:
+			// retransmitted release, or the real release of a press
+			// already released synthetically
+			b.synthReleased = false
+			return nil
+		case samePress && b.phase == phaseLong:
 		default:
 			closeOpen()
 			out = append(out, Press{Button: btn, Type: PressLong, Synthetic: true})
 		}
 		out = append(out, Press{Button: btn, Type: PressLongRelease})
-		b.phase = phaseReleased
+		b.phase, b.synthReleased = phaseReleased, false
 	}
 	return out
 }
@@ -153,7 +167,7 @@ func (t *Tracker) Expire(now time.Time) []Press {
 	var out []Press
 	for ch, b := range t.buttons {
 		if b.phase == phaseLong && now.Sub(b.last) >= t.releaseTimeout() {
-			b.phase = phaseReleased
+			b.phase, b.synthReleased = phaseReleased, true
 			out = append(out, Press{Button: int(ch), Type: PressLongRelease, Synthetic: true})
 		}
 	}

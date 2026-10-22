@@ -19,7 +19,8 @@
 // Every source is optional; what is missing is reported on stderr and
 // left for the user to fill in. The configuration is printed to stdout
 // (or -out). The security passphrase and the MQTT settings are
-// placeholders ("CHANGE-ME") that must be filled in.
+// placeholders ("CHANGE-ME") that must be filled in: hmbridge (and its
+// -check_config) rejects a configuration that still contains them.
 package main
 
 import (
@@ -28,9 +29,9 @@ import (
 	"fmt"
 	"net/http"
 	"os"
-	"runtime/debug"
 	"time"
 
+	"github.com/fjaeckel/hmgo/internal/buildinfo"
 	"github.com/fjaeckel/hmgo/licenses"
 )
 
@@ -48,20 +49,7 @@ var (
 	showVersion = flag.Bool("version", false, "print the version and exit")
 )
 
-func version() string {
-	v := "devel"
-	if bi, ok := debug.ReadBuildInfo(); ok {
-		if bi.Main.Version != "" && bi.Main.Version != "(devel)" {
-			v = bi.Main.Version
-		}
-		for _, s := range bi.Settings {
-			if s.Key == "vcs.revision" && len(s.Value) >= 12 {
-				v += "+" + s.Value[:12]
-			}
-		}
-	}
-	return v
-}
+func version() string { return buildinfo.Version() }
 
 func main() {
 	flag.Usage = func() {
@@ -72,8 +60,9 @@ while OpenCCU is running (device names come from ReGaHss, AES settings
 from rfd). Nothing on OpenCCU is changed, and no keys are read.
 
 Afterwards fill in security.passphrase (OpenCCU's system security key)
-and the mqtt settings, review the devices and groups, and check the
-result with: hmbridge -config config.json -check_config
+and the mqtt settings (the CHANGE-ME placeholders; hmbridge rejects them),
+review the devices and groups, and check the result with:
+hmbridge -config config.json -check_config
 
 Flags:
 `)

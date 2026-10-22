@@ -222,6 +222,13 @@ func TestValidationErrors(t *testing.T) {
 		{"device in two groups", wrap(`,"groups":[{"name":"g","members":["a"]},{"name":"h","members":["38f59c"]}]`, dev), "already a member"},
 		{"dup group", wrap(`,"groups":[{"name":"g","members":["a"]},{"name":"G","members":["b"]}]`, dev+`,{"name":"b","model":"HM-CC-RT-DN","address":"38F59D"}`), "duplicate group"},
 		{"group no name", wrap(`,"groups":[{"members":["a"]}]`, dev), "name is required"},
+		{"placeholder passphrase", wrap(`,"security":{"passphrase":"CHANGE-ME","index":2}`, dev), "security.passphrase: still the CHANGE-ME"},
+		{"placeholder previous", wrap(`,"security":{"passphrase":"topsecret","index":2,"previous":{"passphrase":"CHANGE-ME-PREVIOUS"}}`, dev), "security.previous.passphrase: still the CHANGE-ME"},
+		{"placeholder key", wrap(`,"security":{"key":"CHANGE-ME"}`, dev), "security.key: still the CHANGE-ME"},
+		{"placeholder central", `{"central_address":"CHANGE-ME","devices":[` + dev + `]}`, "central_address: still the CHANGE-ME"},
+		{"placeholder broker", wrap(`,"mqtt":{"broker":"CHANGE-ME"}`, dev), "mqtt.broker: still the CHANGE-ME"},
+		{"placeholder username", wrap(`,"mqtt":{"username":"CHANGE-ME","password":"secret"}`, dev), "mqtt.username: still the CHANGE-ME"},
+		{"placeholder password", wrap(`,"mqtt":{"username":"ha","password":"CHANGE-ME"}`, dev), "mqtt.password: still the CHANGE-ME"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			_, err := Parse([]byte(tt.json))
@@ -398,6 +405,9 @@ func TestNewModelValidation(t *testing.T) {
 		{dev(`{"name":"sw","model":"HM-LC-Sw1-Pl-DN-R1","address":"6A9D15"}`) + `,"groups":[{"name":"g","members":["rt","sw"]}]}`, "takes only thermostats and window contacts"},
 		{dev(`{"name":"sw","model":"HM-LC-Sw1-Pl-DN-R1","address":"6A9D15","stale_after":"10s"}`) + `}`, "stale_after"},
 		{dev(`{"name":"sw","model":"HM-LC-Sw1-Pl-DN-R1","address":"6A9D15"}`) + `,"status_poll_interval":"1m"}`, "status_poll_interval"},
+		// An actuator is only heard from when polled: stale_after must exceed the poll interval.
+		{dev(`{"name":"sw","model":"HM-LC-Sw1-Pl-DN-R1","address":"6A9D15","stale_after":"30m"}`) + `}`, "stale_after 30m0s must be longer than status_poll_interval 1h0m0s"},
+		{dev(`{"name":"led","model":"HM-OU-LED16","address":"7564EA","stale_after":"2h"}`) + `,"status_poll_interval":"2h"}`, "must be longer than status_poll_interval"},
 		{dev(`{"name":"x","model":"HM-RCV-50","address":"458087"}`) + `}`, "unsupported model"},
 	} {
 		_, err := Parse([]byte(tc.cfg))
