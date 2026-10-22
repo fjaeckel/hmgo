@@ -1,5 +1,5 @@
 // Copyright (c) 2026 Frederic Jung
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: BSD-3-Clause
 
 // Command hmbridge bridges classic HomeMatic (BidCoS-RF) thermostats and
 // window contacts to Home Assistant via MQTT, using an HM-MOD-RPI-PCB

@@ -1,5 +1,5 @@
 // Copyright (c) 2026 Frederic Jung
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: BSD-3-Clause
 
 // Command hmsniff passively records the traffic between OpenCCU and its
 // radio module (RPI-RF-MOD or HM-MOD-RPI-PCB) and decodes it.

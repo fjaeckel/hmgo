@@ -172,17 +172,14 @@ describes the architecture and the radio protocol.
 
 ## License
 
-hmbridge is licensed file by file (each file has an SPDX header); see
-[LICENSE](LICENSE):
+BSD-3-Clause, see [LICENSE](LICENSE). hmbridge is a fork of Michael
+Stapelberg's [hmgo](https://github.com/stapelberg/hmgo) (Copyright (c) 2017
+Michael Stapelberg); files that come from hmgo carry his copyright line in
+their header. Michael Stapelberg does not endorse this fork.
 
-* **MIT**, Copyright (c) 2026 Frederic Jung: everything written for
-  hmbridge.
-* **BSD-3-Clause**, Copyright (c) 2017 Michael Stapelberg (with
-  modifications by Frederic Jung): the files that come from or contain code
-  of [hmgo](https://github.com/stapelberg/hmgo), which hmbridge is a fork of.
-  Michael Stapelberg does not endorse this fork.
-
-`hmbridge -license` and `hmsniff -license` print both licenses. Protocol
+`hmbridge -license` and `hmsniff -license` print the license. Protocol
 knowledge comes from [FHEM](https://fhem.de/) (HMUARTLGW, CUL_HM),
 [Homegear](https://homegear.eu/) and [RFNETHM](https://github.com/tostmann/RFNETHM);
-no code from these GPL projects is included.
+no code from these GPL projects is included. The AES test vectors in
+`internal/bidcos/aes/testdata` were produced by running FHEM's code; they are
+data, not code.

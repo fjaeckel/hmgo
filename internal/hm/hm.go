@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Frederic Jung.
 // SPDX-License-Identifier: BSD-3-Clause
 //
-// Derived from hmgo (https://github.com/stapelberg/hmgo); see licenses/.
+// Derived from hmgo (https://github.com/stapelberg/hmgo); see LICENSE.
 
 // Package hm contains the parts of the HomeMatic device models that are
 // shared between device types: the StandardDevice base type, response

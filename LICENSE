@@ -1,26 +1,28 @@
-hmbridge is licensed under two licenses, file by file. Each source file
-names its license in an SPDX-License-Identifier header.
+Copyright (c) 2017 Michael Stapelberg. All rights reserved.
+Copyright (c) 2026 Frederic Jung. All rights reserved.
 
-* MIT (licenses/MIT.txt), Copyright (c) 2026 Frederic Jung:
-  everything written for hmbridge — the bridge, the Home Assistant and
-  configuration layers, the RPI-RF-MOD support, software AES, hmsniff,
-  documentation, and all other files without a BSD-3-Clause header.
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are
+met:
 
-* BSD-3-Clause (licenses/BSD-3-Clause-hmgo.txt),
-  Copyright (c) 2017 Michael Stapelberg, with modifications
-  Copyright (c) 2026 Frederic Jung:
-  files that come from or contain code of hmgo
-  (https://github.com/stapelberg/hmgo), which hmbridge is a fork of.
-  They are marked "SPDX-License-Identifier: BSD-3-Clause". This also
-  applies to grafana_screenshot.png and contrib/wireshark,
-  contrib/prometheus/hmgo.rules, which are unchanged from hmgo.
+   * Redistributions of source code must retain the above copyright
+notice, this list of conditions and the following disclaimer.
+   * Redistributions in binary form must reproduce the above
+copyright notice, this list of conditions and the following disclaimer
+in the documentation and/or other materials provided with the
+distribution.
+   * Neither the name of Michael Stapelberg, the name of Frederic Jung,
+nor the names of contributors may be used to endorse or promote products
+derived from this software without specific prior written permission.
 
-Both licenses permit use, modification and redistribution; binaries
-include both license texts (run "hmbridge -license"). Michael Stapelberg
-does not endorse this fork; the BSD-3-Clause license forbids using his name
-to promote derived products.
-
-Protocol knowledge comes from FHEM, Homegear and RFNETHM (all GPL); no code
-from these projects is included. The AES test vectors in
-internal/bidcos/aes/testdata were produced by running FHEM's code; they are
-data, not code.
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+"AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.

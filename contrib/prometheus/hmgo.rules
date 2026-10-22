@@ -1,6 +1,6 @@
 # Copyright (c) 2017 Michael Stapelberg. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
-# From hmgo (https://github.com/stapelberg/hmgo); see licenses/.
+# From hmgo (https://github.com/stapelberg/hmgo); see LICENSE.
 # Old Prometheus 1.x rule format; see hmbridge.rules.yml for current rules.
 
 ALERT BidCoSDeviceUnreachable

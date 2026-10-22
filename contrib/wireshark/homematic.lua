@@ -1,6 +1,6 @@
 -- Copyright (c) 2017 Michael Stapelberg. All rights reserved.
 -- SPDX-License-Identifier: BSD-3-Clause
--- From hmgo (https://github.com/stapelberg/hmgo); see licenses/.
+-- From hmgo (https://github.com/stapelberg/hmgo); see LICENSE.
 
 local p_bidcos = Proto("bidcos", "BidCos");
 

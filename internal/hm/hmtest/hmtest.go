@@ -1,5 +1,5 @@
 // Copyright (c) 2026 Frederic Jung
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: BSD-3-Clause
 
 // Package hmtest provides helpers for testing device models without a
 // radio module.

@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Frederic Jung.
 // SPDX-License-Identifier: BSD-3-Clause
 //
-// Derived from hmgo (https://github.com/stapelberg/hmgo); see licenses/.
+// Derived from hmgo (https://github.com/stapelberg/hmgo); see LICENSE.
 
 package thermal
 

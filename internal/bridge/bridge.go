@@ -1,5 +1,5 @@
 // Copyright (c) 2026 Frederic Jung
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: BSD-3-Clause
 
 // Package bridge connects the radio module (uartgw) with Home Assistant
 // (ha): it decodes frames received from the configured devices into
