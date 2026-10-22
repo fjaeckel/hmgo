@@ -1,3 +1,9 @@
+// Copyright (c) 2017 Michael Stapelberg. All rights reserved.
+// Copyright (c) 2026 Frederic Jung.
+// SPDX-License-Identifier: BSD-3-Clause
+//
+// Derived from hmgo (https://github.com/stapelberg/hmgo); see licenses/.
+
 // Package heating implements the HM-CC-RT-DN radiator thermostat.
 //
 // Frames the device sends to the central (eQ-3 rftypes rf_cc_rt_dn.xml,

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Frederic Jung
+// SPDX-License-Identifier: MIT
+
 package uartgw
 
 // This file implements the RPI-RF-MOD (and other modules running eQ-3's

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Frederic Jung
+// SPDX-License-Identifier: MIT
+
 // Command hmbridge bridges classic HomeMatic (BidCoS-RF) thermostats and
 // window contacts to Home Assistant via MQTT, using an HM-MOD-RPI-PCB
 // radio module on a Raspberry Pi instead of a CCU.
@@ -33,6 +36,7 @@ import (
 	"github.com/fjaeckel/hmgo/internal/hmkey"
 	"github.com/fjaeckel/hmgo/internal/serial"
 	"github.com/fjaeckel/hmgo/internal/uartgw"
+	"github.com/fjaeckel/hmgo/licenses"
 )
 
 var (
@@ -40,6 +44,7 @@ var (
 	checkConfig = flag.Bool("check_config", false, "validate the configuration and exit")
 	debugFrames = flag.Bool("debug", false, "log every frame exchanged with the radio module (keys are redacted)")
 	showVersion = flag.Bool("version", false, "print the version and exit")
+	showLicense = flag.Bool("license", false, "print the licenses and exit")
 )
 
 func version() string {
@@ -66,6 +71,10 @@ func init() { prometheus.MustRegister(buildInfo) }
 
 func main() {
 	flag.Parse()
+	if *showLicense {
+		fmt.Print(licenses.Text())
+		return
+	}
 	if *showVersion {
 		fmt.Println("hmbridge", version(), runtime.Version())
 		return

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Frederic Jung
+// SPDX-License-Identifier: MIT
+
 package bridge
 
 // State persistence, designed to be gentle on a Raspberry Pi's SD card:

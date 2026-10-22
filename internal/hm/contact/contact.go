@@ -1,3 +1,9 @@
+// Copyright (c) 2017 Michael Stapelberg. All rights reserved.
+// Copyright (c) 2026 Frederic Jung.
+// SPDX-License-Identifier: BSD-3-Clause
+//
+// Derived from hmgo (https://github.com/stapelberg/hmgo); see licenses/.
+
 // Package contact implements the classic HomeMatic window/door contacts
 // (eQ-3 “threeStateSensor” family):
 //

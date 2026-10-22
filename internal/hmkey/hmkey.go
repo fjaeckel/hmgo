@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Frederic Jung
+// SPDX-License-Identifier: MIT
+
 // Package hmkey describes HomeMatic BidCoS AES keys.
 //
 // A BidCoS device authenticates messages with a 128-bit AES key that is

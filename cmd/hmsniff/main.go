@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Frederic Jung
+// SPDX-License-Identifier: MIT
+
 // Command hmsniff passively records the traffic between OpenCCU and its
 // radio module (RPI-RF-MOD or HM-MOD-RPI-PCB) and decodes it.
 //
@@ -29,6 +32,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/fjaeckel/hmgo/licenses"
 )
 
 var (
@@ -42,6 +47,7 @@ var (
 	noRedact = flag.Bool("no-redact", false, "don't redact AES responses (key material is redacted regardless)")
 	maxSize  = flag.Int64("max-size", 50<<20, "stop writing the log file beyond this many bytes (protects RAM on OpenCCU)")
 	dumpPath = flag.String("dump-control", "", "path of the dump_traffic sysfs file (default: autodetect)")
+	license  = flag.Bool("license", false, "print the licenses and exit")
 )
 
 // hexLineRe matches a raw-uart dump line: "...raw-uart...: RX: fd 00 0e ...".
@@ -53,6 +59,10 @@ func main() {
 		flag.PrintDefaults()
 	}
 	flag.Parse()
+	if *license {
+		fmt.Print(licenses.Text())
+		return
+	}
 	if err := run(); err != nil {
 		fmt.Fprintln(os.Stderr, "hmsniff:", err)
 		os.Exit(1)

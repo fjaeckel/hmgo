@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Frederic Jung
+// SPDX-License-Identifier: MIT
+
 // Package bidcosaes implements BidCoS AES message authentication
 // ("AES signing") in software, for radio modules that do not handle it
 // themselves.

@@ -1,3 +1,7 @@
+-- Copyright (c) 2017 Michael Stapelberg. All rights reserved.
+-- SPDX-License-Identifier: BSD-3-Clause
+-- From hmgo (https://github.com/stapelberg/hmgo); see licenses/.
+
 local p_bidcos = Proto("bidcos", "BidCos");
 
 local f_typ = ProtoField.uint8("bidcos.typ", "Type", base.DEC, { [5] = "APP_RECV" })

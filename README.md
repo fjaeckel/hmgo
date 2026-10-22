@@ -172,6 +172,17 @@ describes the architecture and the radio protocol.
 
 ## License
 
-BSD-3-Clause, see [LICENSE](LICENSE). Based on hmgo by Michael Stapelberg.
-Protocol knowledge from [FHEM](https://fhem.de/) (HMUARTLGW, CUL_HM) and
-[Homegear](https://homegear.eu/).
+hmbridge is licensed file by file (each file has an SPDX header); see
+[LICENSE](LICENSE):
+
+* **MIT**, Copyright (c) 2026 Frederic Jung: everything written for
+  hmbridge.
+* **BSD-3-Clause**, Copyright (c) 2017 Michael Stapelberg (with
+  modifications by Frederic Jung): the files that come from or contain code
+  of [hmgo](https://github.com/stapelberg/hmgo), which hmbridge is a fork of.
+  Michael Stapelberg does not endorse this fork.
+
+`hmbridge -license` and `hmsniff -license` print both licenses. Protocol
+knowledge comes from [FHEM](https://fhem.de/) (HMUARTLGW, CUL_HM),
+[Homegear](https://homegear.eu/) and [RFNETHM](https://github.com/tostmann/RFNETHM);
+no code from these GPL projects is included.

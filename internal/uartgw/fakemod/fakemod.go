@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Frederic Jung
+// SPDX-License-Identifier: MIT
+
 // Package fakemod emulates a HM-MOD-RPI-PCB radio module (classic
 // firmware 1.x, or optionally the dual-coprocessor firmware as seen by
 // the classic protocol) or an RPI-RF-MOD (dual-coprocessor firmware,

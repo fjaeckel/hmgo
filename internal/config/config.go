@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Frederic Jung
+// SPDX-License-Identifier: MIT
+
 // Package config loads and validates the hmbridge JSON configuration.
 //
 // See example.json in this directory for a documented example. All

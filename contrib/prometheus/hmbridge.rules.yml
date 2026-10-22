@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Frederic Jung
+# SPDX-License-Identifier: MIT
+
 groups:
   - name: hmbridge
     rules:

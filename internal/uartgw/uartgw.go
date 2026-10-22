@@ -1,3 +1,9 @@
+// Copyright (c) 2017 Michael Stapelberg. All rights reserved.
+// Copyright (c) 2026 Frederic Jung.
+// SPDX-License-Identifier: BSD-3-Clause
+//
+// Derived from hmgo (https://github.com/stapelberg/hmgo); see licenses/.
+
 // Package uartgw implements communicating with a HM-MOD-RPI-PCB
 // HomeMatic radio module (“UARTGW”) running the classic (BidCoS-only)
 // firmware 1.x.

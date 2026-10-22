@@ -1,3 +1,8 @@
+# Copyright (c) 2017 Michael Stapelberg. All rights reserved.
+# SPDX-License-Identifier: BSD-3-Clause
+# From hmgo (https://github.com/stapelberg/hmgo); see licenses/.
+# Old Prometheus 1.x rule format; see hmbridge.rules.yml for current rules.
+
 ALERT BidCoSDeviceUnreachable
   IF (time() - hm_LastContact{address=~"390f17|3906eb|3906da|390f27"}) > (60 * 60)
   FOR 15m

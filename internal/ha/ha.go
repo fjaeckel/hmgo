@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Frederic Jung
+// SPDX-License-Identifier: MIT
+
 // Package ha exposes HomeMatic thermostats, window contacts and heating
 // groups to Home Assistant via MQTT.
 //
