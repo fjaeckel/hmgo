@@ -331,8 +331,8 @@ type Config struct {
 	// (sent by AddPeer). nil: none (not needed, see DualInit).
 	DualPeerInit func(p Peer) []InitStep
 
-	// DualFirmwareVersion is reported by FirmwareVersion for the
-	// RPI-RF-MOD, whose version query is not known (default "unknown").
+	// DualFirmwareVersion overrides the firmware version the RPI-RF-MOD
+	// reports (FirmwareVersion).
 	DualFirmwareVersion string
 
 	// Rand is the source of AES challenges (nil: crypto/rand).

@@ -45,11 +45,18 @@ import (
 )
 
 // COMMON (dst 0xfe) commands (from RFNETHM: HMU_PL_IDENTIFY,
-// HMU_PL_CHANGE_APP).
+// HMU_PL_CHANGE_APP; restart capture: SGTIN).
 const (
 	commonIdentify  = 0x01 // reply: [0x05 0x01 tag…] or [0x00 tag…]
 	commonChangeApp = 0x03 // bootloader → app; announced ~2.2s later
+	commonSGTIN     = 0x04 // reply: [0x05 0x01 sgtin(12)] (restart capture line 29)
+	commonReply     = 0x05
 )
+
+// dstHMIPCrypto is used by OpenCCU's HMIPServer at its start (restart
+// capture lines 96-104), apparently for Homematic IP key handling;
+// hmbridge ignores it like dstHMIP.
+const dstHMIPCrypto = 0x0c
 
 // LLMAC (dst 0x03) commands (from RFNETHM, confirmed by the capture).
 const (
@@ -58,11 +65,18 @@ const (
 	llmacSend = 0x06 // host → module: [0x06 t_hi t_lo mode msg…]
 
 	llmacStatusOK = 0x01 // LLMAC_ACK: transmitted
+
+	// Queries multimacd sends at its start (restart capture lines
+	// 20-43), answered with an LLMAC_ACK [0x01 0x01 data…].
+	llmacGetClock  = 0x02 // data: module clock (15-bit ms), e.g. 6e d7
+	llmacGetSerial = 0x07 // data: serial number, e.g. “QEQ0684602”
+	// 0x08 (data 00 00 00, perhaps an unset address) is not sent.
 )
 
 // TRX (dst 0x01 “APP”) commands multimacd sends while running
 // (capture).
 const (
+	trxFirmware    = 0x02 // reply [0x04 0x01 major minor patch ?(6)], e.g. 04 04 16 = 4.4.22 (restart capture line 26)
 	trxStatus      = 0x03 // every 10s, e.g. line 30: reply [0x04 0x01 xx], xx 0x02..0x0c
 	trxUnknown0A   = 0x0a // every 5min (line 324), reply [0x04 0x01 0x03]; not used by hmbridge
 	trxReply       = 0x04
@@ -208,9 +222,9 @@ var (
 			Namespace: metricsNamespace,
 			Subsystem: metricsSubsystem,
 			Name:      "module_info",
-			Help:      "Radio module kind and announced application (always 1).",
+			Help:      "Radio module kind, announced application and (RPI-RF-MOD) SGTIN (always 1).",
 		},
-		[]string{"kind", "app"})
+		[]string{"kind", "app", "sgtin"})
 )
 
 func init() {
@@ -293,8 +307,11 @@ type DualConn struct {
 	debug           bool
 	peerInit        func(Peer) []InitStep
 
-	tag      string
-	firmware string
+	tag         string
+	firmware    string
+	serial      string
+	sgtin       string
+	cfgFirmware string
 
 	sem      chan struct{} // serializes user requests
 	wq, uq   chan queued   // normal / urgent writes
@@ -378,7 +395,7 @@ func openDual(rw io.ReadWriter, cfg Config, p *framePump, d detection) (*DualCon
 		rand:            cfg.Rand,
 		debug:           cfg.Debug,
 		peerInit:        cfg.DualPeerInit,
-		firmware:        cfg.DualFirmwareVersion,
+		cfgFirmware:     cfg.DualFirmwareVersion,
 		sem:             make(chan struct{}, 1),
 		wq:              make(chan queued, writeQueueSize),
 		uq:              make(chan queued, writeQueueSize),
@@ -425,9 +442,6 @@ func openDual(rw io.ReadWriter, cfg Config, p *framePump, d detection) (*DualCon
 	if c.rand == nil {
 		c.rand = rand.Reader
 	}
-	if c.firmware == "" {
-		c.firmware = "unknown"
-	}
 
 	go c.readLoop()
 	go c.writeLoop()
@@ -455,7 +469,7 @@ func openDual(rw io.ReadWriter, cfg Config, p *framePump, d detection) (*DualCon
 	infoGauge.Reset()
 	infoGauge.WithLabelValues(c.firmware, c.SerialNumber()).Set(1)
 	moduleInfo.Reset()
-	moduleInfo.WithLabelValues(KindRPIRFMod, c.tag).Set(1)
+	moduleInfo.WithLabelValues(KindRPIRFMod, c.tag, c.sgtin).Set(1)
 	if c.softAES && c.signer == nil {
 		log.Printf("uartgw: no AES signer configured; messages of AES peers will fail authentication")
 	}
@@ -465,13 +479,22 @@ func openDual(rw io.ReadWriter, cfg Config, p *framePump, d detection) (*DualCon
 	return c, nil
 }
 
-// FirmwareVersion returns Config.DualFirmwareVersion or "unknown": the
-// firmware's version query is not known yet.
+// FirmwareVersion returns the module's firmware version, e.g. “4.4.22”
+// (Config.DualFirmwareVersion overrides it).
 func (c *DualConn) FirmwareVersion() string { return c.firmware }
 
-// SerialNumber returns "unknown": the firmware's serial number query is
-// not known yet.
-func (c *DualConn) SerialNumber() string { return "unknown" }
+// SerialNumber returns the module's serial number, e.g. “QEQ0684602”,
+// or "unknown" if the module did not report it.
+func (c *DualConn) SerialNumber() string {
+	if c.serial == "" {
+		return "unknown"
+	}
+	return c.serial
+}
+
+// SGTIN returns the module's SGTIN (Homematic IP device ID, 24 hex
+// digits), or "" if the module did not report it.
+func (c *DualConn) SGTIN() string { return c.sgtin }
 
 // Kind returns KindRPIRFMod.
 func (c *DualConn) Kind() string { return KindRPIRFMod }
@@ -549,7 +572,8 @@ func diff15(a, b uint16) int {
 	return d
 }
 
-// moduleTimeLocked estimates the module clock from the last LLMAC_RECV.
+// moduleTimeLocked estimates the module clock from the last LLMAC_RECV
+// or clock query (LLMAC 02).
 // LLMAC_ACK timestamps are not used: they are the transmission time,
 // which for burst sends lies ~380ms before the ack arrives. c.mu must
 // be held.
@@ -833,6 +857,15 @@ func (c *DualConn) trxPollLoop() {
 		} else {
 			log.Printf("uartgw: unexpected TRX status reply: %v", f)
 		}
+		// Keep the module clock estimate fresh without radio traffic.
+		c.mu.Lock()
+		stale := !c.clockValid || c.now().Sub(c.clockAt) >= c.trxPollInterval
+		c.mu.Unlock()
+		if stale {
+			if err := c.queryClock(); err != nil && c.Err() == nil {
+				log.Printf("uartgw: refreshing the module clock: %v", err)
+			}
+		}
 	}
 }
 
@@ -920,7 +953,7 @@ func (c *DualConn) dispatch(f frame) {
 			log.Printf("uartgw: module did not transmit our ACK/challenge: %v", f)
 		}
 
-	case f.dst == dstHMIP:
+	case f.dst == dstHMIP, f.dst == dstHMIPCrypto:
 		// Homematic IP traffic (OpenCCU's HMIPServer); not ours.
 		dualEvents.WithLabelValues("hmip_ignored").Inc()
 
@@ -1139,6 +1172,12 @@ func (c *DualConn) aesTimeout(k aesKey, h *heldMsg) {
 
 // ---- initialization ----
 
+// init brings the module into the application and reads its identity
+// like multimacd does at its start (restart capture lines 20-43):
+// IDENTIFY → [CHANGE_APP if in the bootloader] → APP 02 (firmware) →
+// COMMON 04 (SGTIN) → LLMAC 07 (serial) → LLMAC 02 (clock). Nothing
+// else is configured: no address, peers or keys (the module receives
+// everything, frames arrive before rfd even starts, lines 44-57).
 func (c *DualConn) init(cfg Config, d detection) error {
 	tag := d.tag
 	if tag == "" {
@@ -1161,39 +1200,133 @@ func (c *DualConn) init(cfg Config, d detection) error {
 	} else if !isAppTag(tag) {
 		return fmt.Errorf("%w: unknown application %q", ErrUnknownModule, tag)
 	}
-	// The module keeps no BidCoS state worth resetting: it has no
-	// address or peer configuration (capture: it receives everything,
-	// including device-to-device traffic, line ~180). So unlike Conn, a
-	// running application is not rebooted.
+	// A running application is not rebooted (unlike Conn): the module
+	// keeps no BidCoS state, and multimacd does not reboot it either
+	// (restart capture line 20: IDENTIFY answered with DualCoPro_App,
+	// no CHANGE_APP).
 	c.tag = tag
-
-	// Verify (non-fatal, like RFNETHM boot_probe “Verify auf
-	// COMMON-Pfad”).
-	if t, err := c.identify(); err != nil {
-		if c.Err() != nil {
-			return c.Err()
-		}
-		log.Printf("uartgw: verifying the application: %v", err)
-	} else if !isAppTag(t) {
-		return fmt.Errorf("uartgw: module reports %q after entering the application", t)
-	} else {
-		c.tag = t
-	}
 
 	c.mu.Lock()
 	c.entered = true
 	c.mu.Unlock()
 
-	// No initialization is needed for receiving and sending: the
-	// capture shows no address or peer configuration, and the module
-	// receives all traffic. Config.DualInit stays as a hook (e.g. for
-	// whatever multimacd sends at its start, which the capture did not
-	// include; see docs/SNIFFING.md).
+	// Required: firmware version and module clock (they also prove the
+	// application answers).
+	if err := c.queryFirmware(); err != nil {
+		return fmt.Errorf("uartgw: getting the firmware version: %w", err)
+	}
+	// Optional: SGTIN and serial number.
+	if err := c.querySGTIN(); err != nil {
+		if c.Err() != nil {
+			return c.Err()
+		}
+		log.Printf("uartgw: getting the SGTIN: %v", err)
+	}
+	if err := c.querySerial(); err != nil {
+		if c.Err() != nil {
+			return c.Err()
+		}
+		log.Printf("uartgw: getting the serial number: %v", err)
+	}
+	if err := c.queryClock(); err != nil {
+		return fmt.Errorf("uartgw: getting the module clock: %w", err)
+	}
+	log.Printf("uartgw: RPI-RF-MOD %s, firmware %s, serial %s, SGTIN %s", c.tag, c.firmware, c.SerialNumber(), c.sgtin)
+
+	// Config.DualInit stays as a hook; nothing else is needed for
+	// receiving and sending.
 	for _, s := range cfg.DualInit {
 		if err := c.runStep(s); err != nil {
 			return err
 		}
 	}
+	return nil
+}
+
+// query performs one of the startup queries with a short timeout.
+func (c *DualConn) query(dst byte, cmd byte) (frame, error) {
+	timeout := c.timeout
+	if timeout > time.Second {
+		timeout = time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout+time.Second)
+	defer cancel()
+	return c.request(ctx, dst, []byte{cmd}, timeout)
+}
+
+// queryFirmware: APP 02 → [0x04 0x01 major minor patch …].
+func (c *DualConn) queryFirmware() error {
+	f, err := c.query(dstApp, trxFirmware)
+	if err != nil {
+		return err
+	}
+	if f.cmd != trxReply || len(f.payload) < 4 || f.payload[0] != 0x01 {
+		return fmt.Errorf("unexpected reply %v", f)
+	}
+	fw := fmt.Sprintf("%d.%d.%d", f.payload[1], f.payload[2], f.payload[3])
+	if c.debug {
+		// The remaining bytes (01 00 01 01 42 00 on 4.4.22) are unknown.
+		log.Printf("uartgw: firmware %s, further version data %x", fw, f.payload[4:])
+	}
+	c.firmware = fw
+	if c.cfgFirmware != "" {
+		c.firmware = c.cfgFirmware
+	}
+	return nil
+}
+
+// querySGTIN: COMMON 04 → [0x05 0x01 sgtin(12)].
+func (c *DualConn) querySGTIN() error {
+	f, err := c.query(dstDual, commonSGTIN)
+	if err != nil {
+		return err
+	}
+	if f.cmd != commonReply || len(f.payload) < 2 || f.payload[0] != 0x01 {
+		return fmt.Errorf("unexpected reply %v", f)
+	}
+	c.sgtin = fmt.Sprintf("%X", f.payload[1:])
+	return nil
+}
+
+// llmacQuery performs an LLMAC query, returning the data after the
+// LLMAC_ACK status.
+func (c *DualConn) llmacQuery(cmd byte) ([]byte, error) {
+	f, err := c.query(dstLLMAC, cmd)
+	if err != nil {
+		return nil, err
+	}
+	if f.cmd != llmacAck || len(f.payload) < 1 || f.payload[0] != llmacStatusOK {
+		return nil, fmt.Errorf("unexpected reply %v", f)
+	}
+	return f.payload[1:], nil
+}
+
+// querySerial: LLMAC 07 → [0x01 0x01 serial…].
+func (c *DualConn) querySerial() error {
+	b, err := c.llmacQuery(llmacGetSerial)
+	if err != nil {
+		return err
+	}
+	c.serial = string(b)
+	return nil
+}
+
+// queryClock: LLMAC 02 → [0x01 0x01 t_hi t_lo], the module's 15-bit ms
+// clock (verified against LLMAC_RECV timestamps). It initializes the
+// clock estimate before any frame was received, and refreshes it when
+// no radio traffic arrives.
+func (c *DualConn) queryClock() error {
+	b, err := c.llmacQuery(llmacGetClock)
+	if err != nil {
+		return err
+	}
+	if len(b) < 2 {
+		return fmt.Errorf("short clock reply %x", b)
+	}
+	ts := (uint16(b[0])<<8 | uint16(b[1])) & (modulePeriod - 1)
+	c.mu.Lock()
+	c.clockTs, c.clockAt, c.clockValid = ts, c.now(), true
+	c.mu.Unlock()
 	return nil
 }
 

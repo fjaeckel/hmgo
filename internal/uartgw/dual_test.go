@@ -168,8 +168,8 @@ func TestOpenModuleDetect(t *testing.T) {
 				if dc.Application() != fakemod.TagDualApp {
 					t.Errorf("Application = %q", dc.Application())
 				}
-				if dc.FirmwareVersion() != "unknown" {
-					t.Errorf("FirmwareVersion = %q", dc.FirmwareVersion())
+				if dc.FirmwareVersion() != "4.4.22" || dc.SerialNumber() != "FAKE000001" || dc.SGTIN() != "3014F711A0001F5A4993DA3A" {
+					t.Errorf("FirmwareVersion %q, SerialNumber %q, SGTIN %q", dc.FirmwareVersion(), dc.SerialNumber(), dc.SGTIN())
 				}
 			} else {
 				if _, ok := m.(*Conn); !ok {
@@ -822,6 +822,7 @@ func TestDualIgnoredFrames(t *testing.T) {
 	// HMIP traffic and unsolicited TRX frames (capture lines 940, 1094).
 	mod.WriteRaw(fakemod.Frame{Dst: fakemod.DstHMIP, Cnt: 0x02, Cmd: 0x07, Payload: []byte{0x80, 0x10, 0x00, 0x8e}}.Encode())
 	mod.WriteRaw(fakemod.Frame{Dst: fakemod.DstApp, Cnt: 0x01, Cmd: 0x0b, Payload: []byte{0x00, 0x01}}.Encode())
+	mod.WriteRaw(fakemod.Frame{Dst: 0x0c, Cnt: 0x11, Cmd: 0x03, Payload: []byte{0x01}}.Encode())
 	expectNoRecv(t, c, 100*time.Millisecond)
 	if c.Err() != nil {
 		t.Fatal(c.Err())
@@ -915,4 +916,90 @@ func TestDualConcurrentSendRecv(t *testing.T) {
 	}
 	// n Sends + n software ACKs.
 	waitSent(t, mod, 2*n)
+}
+
+// requests returns the (dst, cmd) of the frames the host sent.
+func requests(mod *fakemod.Module) [][2]byte {
+	var res [][2]byte
+	for _, f := range mod.Frames() {
+		res = append(res, [2]byte{f.Dst, f.Cmd})
+	}
+	return res
+}
+
+func TestDualStartupSequence(t *testing.T) {
+	// Like multimacd (restart capture lines 20-43), minus LLMAC 08.
+	for _, tt := range []struct {
+		name string
+		opts fakemod.Options
+		want [][2]byte
+	}{
+		{"app running", fakemod.Options{StartInApp: true},
+			[][2]byte{{0xfe, 0x01}, {0x01, 0x02}, {0xfe, 0x04}, {0x03, 0x07}, {0x03, 0x02}}},
+		{"bootloader", fakemod.Options{},
+			[][2]byte{{0xfe, 0x03}, {0x01, 0x02}, {0xfe, 0x04}, {0x03, 0x07}, {0x03, 0x02}}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			_, mod := openDualTest(t, tt.opts, Config{})
+			if got := requests(mod); fmt.Sprint(got) != fmt.Sprint(tt.want) {
+				t.Errorf("requests %x, want %x", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestDualStartupOptionalQueries(t *testing.T) {
+	c, _ := openDualTest(t, fakemod.Options{
+		DualIgnore: func(dst, cmd byte) bool {
+			return (dst == 0xfe && cmd == 0x04) || (dst == 0x03 && cmd == 0x07)
+		},
+	}, Config{Timeout: 100 * time.Millisecond, DualFirmwareVersion: "9.9.9"})
+	if c.SerialNumber() != "unknown" || c.SGTIN() != "" {
+		t.Errorf("SerialNumber %q, SGTIN %q", c.SerialNumber(), c.SGTIN())
+	}
+	if c.FirmwareVersion() != "9.9.9" {
+		t.Errorf("FirmwareVersion %q, want the override", c.FirmwareVersion())
+	}
+}
+
+func TestDualStartupRequiredQueries(t *testing.T) {
+	for _, q := range [][2]byte{{0x01, 0x02}, {0x03, 0x02}} {
+		t.Run(fmt.Sprintf("%x", q), func(t *testing.T) {
+			mod, rw := fakemod.New(fakemod.Options{DualCoPro: true, StartInApp: true,
+				DualIgnore: func(dst, cmd byte) bool { return dst == q[0] && cmd == q[1] }})
+			defer mod.Close()
+			_, err := OpenModule(rw, dualCfg(Config{Timeout: 100 * time.Millisecond}))
+			if !errors.Is(err, ErrTimeout) {
+				t.Fatalf("OpenModule: got %v, want ErrTimeout", err)
+			}
+		})
+	}
+}
+
+func TestDualClockFromQuery(t *testing.T) {
+	c, mod := openDualTest(t, fakemod.Options{ClockOffset: 0x1234}, Config{TRXPollInterval: 30 * time.Millisecond})
+	// Without any received frame, the estimate comes from LLMAC 02.
+	c.mu.Lock()
+	est, ok := c.moduleTimeLocked()
+	c.mu.Unlock()
+	if d := diff15(est, mod.Clock()); !ok || d < -50 || d > 50 {
+		t.Errorf("module clock estimate %04x (valid %v), module %04x", est, ok, mod.Clock())
+	}
+	// Without radio traffic, the TRX poll refreshes it.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		n := 0
+		for _, r := range requests(mod) {
+			if r == [2]byte{0x03, 0x02} {
+				n++
+			}
+		}
+		if n >= 3 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("clock queried %d times", n)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }

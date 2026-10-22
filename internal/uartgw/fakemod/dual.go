@@ -41,6 +41,13 @@ const (
 	TagDualApp        = "DualCoPro_App"
 )
 
+// DefaultSGTIN is the SGTIN of the RPI-RF-MOD in the restart capture.
+var DefaultSGTIN = []byte{0x30, 0x14, 0xf7, 0x11, 0xa0, 0x00, 0x1f, 0x5a, 0x49, 0x93, 0xda, 0x3a}
+
+// dualVersionTail are the bytes after the version in the APP 02 reply
+// of firmware 4.4.22 (meaning unknown).
+var dualVersionTail = []byte{0x01, 0x00, 0x01, 0x01, 0x42, 0x00}
+
 // LLMACSent is a BidCoS message transmitted via LLMAC_SEND.
 type LLMACSent struct {
 	Msg  []byte    // cnt flags cmd src dst payload
@@ -111,6 +118,28 @@ func (m *Module) handleDualCoPro(f Frame) error {
 	m.mu.Lock()
 	inApp := m.inApp
 	m.mu.Unlock()
+
+	if m.opts.DualIgnore != nil && m.opts.DualIgnore(f.Dst, f.Cmd) {
+		return nil
+	}
+
+	// Replies captured from multimacd's start (OpenCCU, RPI-RF-MOD
+	// firmware 4.4.22).
+	switch {
+	case f.Dst == DstApp && f.Cmd == 0x02 && inApp: // firmware version
+		fw := m.opts.Firmware
+		p := append([]byte{0x01, fw[0], fw[1], fw[2]}, dualVersionTail...)
+		return m.write(Frame{Dst: DstApp, Cnt: f.Cnt, Cmd: 0x04, Payload: p})
+	case f.Dst == DstCommon && f.Cmd == 0x04: // SGTIN
+		return m.write(Frame{Dst: DstCommon, Cnt: f.Cnt, Cmd: 0x05, Payload: append([]byte{0x01}, m.opts.SGTIN...)})
+	case f.Dst == DstLLMAC && f.Cmd == 0x07 && inApp: // serial number
+		return m.write(Frame{Dst: DstLLMAC, Cnt: f.Cnt, Cmd: LLMACAck, Payload: append([]byte{LLMACStatusOK}, m.opts.Serial...)})
+	case f.Dst == DstLLMAC && f.Cmd == 0x02 && inApp: // clock
+		ts := m.Clock()
+		return m.write(Frame{Dst: DstLLMAC, Cnt: f.Cnt, Cmd: LLMACAck, Payload: []byte{LLMACStatusOK, byte(ts >> 8), byte(ts)}})
+	case f.Dst == DstLLMAC && f.Cmd == 0x08 && inApp: // unknown
+		return m.write(Frame{Dst: DstLLMAC, Cnt: f.Cnt, Cmd: LLMACAck, Payload: []byte{LLMACStatusOK, 0x00, 0x00, 0x00}})
+	}
 
 	switch {
 	case f.Dst == DstCommon && f.Cmd == 0x01: // IDENTIFY

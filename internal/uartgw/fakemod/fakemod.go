@@ -82,10 +82,12 @@ type Options struct {
 	// announcement), emulating a module which does not respond.
 	Mute bool
 
-	// Firmware is the reported firmware version (default 1.4.1).
+	// Firmware is the reported firmware version (default 1.4.1;
+	// DualCoPro: 4.4.22).
 	Firmware [3]byte
 
 	// Serial is the reported serial number (default “FAKE000001”).
+	// DualCoPro reports it via LLMAC 07.
 	Serial string
 
 	// Credits is the raw duty cycle value reported by OS get credits
@@ -134,6 +136,14 @@ type Options struct {
 	// LLMACAckStatus (DualCoPro) returns the LLMAC_ACK status for a
 	// transmitted BidCoS message (default 0x01 OK; NoAck: no ack).
 	LLMACAckStatus func(msg []byte) byte
+
+	// SGTIN (DualCoPro) is reported via COMMON 04 (default
+	// DefaultSGTIN).
+	SGTIN []byte
+
+	// DualIgnore (DualCoPro), if non-nil, makes the module ignore the
+	// requests for which it returns true (dst and first payload byte).
+	DualIgnore func(dst, cmd byte) bool
 
 	// ClockOffset (DualCoPro) is the module clock at start.
 	ClockOffset uint16
@@ -220,6 +230,12 @@ type Module struct {
 func New(opts Options) (*Module, io.ReadWriteCloser) {
 	if opts.Firmware == ([3]byte{}) {
 		opts.Firmware = [3]byte{1, 4, 1}
+		if opts.DualCoPro {
+			opts.Firmware = [3]byte{4, 4, 22}
+		}
+	}
+	if opts.SGTIN == nil {
+		opts.SGTIN = DefaultSGTIN
 	}
 	if opts.Serial == "" {
 		opts.Serial = "FAKE000001"

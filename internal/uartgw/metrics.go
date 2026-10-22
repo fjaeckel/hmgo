@@ -159,6 +159,8 @@ func dstLabel(dst byte) string {
 		return "hmip"
 	case dstLLMAC:
 		return "llmac"
+	case dstHMIPCrypto:
+		return "hmip_crypto"
 	case dstDual:
 		return "dual"
 	case dstDualErr:
