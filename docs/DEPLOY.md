@@ -73,7 +73,13 @@ On a Raspberry Pi OS Lite installation:
    `/etc/hmbridge/config.json`, and `contrib/systemd/hmbridge.service` to
    `/etc/systemd/system/`. Create the user:
    `sudo useradd --system --no-create-home --groups dialout,gpio hmbridge`.
-4. `sudo systemctl enable --now hmbridge` and watch
+4. A Raspberry Pi has no battery-backed clock. Make sure NTP works
+   (`timedatectl` shows "System clock synchronized: yes"); hmbridge only hands
+   out the time to the devices once it is. Optionally
+   `sudo systemctl enable systemd-time-wait-sync` so that services ordered
+   after `time-sync.target` (like hmbridge) start only with a synchronised
+   clock.
+5. `sudo systemctl enable --now hmbridge` and watch
    `journalctl -u hmbridge -f`.
 
 Keep the default `"serial_port": "/dev/serial0"` and `"reset": "gpio"` (the
@@ -87,7 +93,12 @@ names and addresses; set `"http_listen": "127.0.0.1:8013"` to keep them local.
 
 Make sure the MQTT integration is set up in Home Assistant. Each thermostat
 appears as a device with a climate entity and sensors as soon as hmbridge
-connects. The status page on port 8013 lists configured devices and every
+connects. A device that stops reporting (empty battery, out of range) becomes
+unavailable in Home Assistant after its `stale_after` time (30 minutes for
+thermostats, 6 hours for the HM-Sec-SCo, 50 hours for other contacts); its
+"Last seen" sensor stays visible. hmbridge keeps the last known state in
+`/var/lib/hmbridge/state.json`, so a restart does not blank Home Assistant
+until every window contact has reported again. The status page on port 8013 lists configured devices and every
 radio address that talked to the central but is not configured — handy for
 finding device addresses.
 

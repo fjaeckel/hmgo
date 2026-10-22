@@ -129,10 +129,13 @@ func entities() []entity {
 			"icon":           "mdi:thermostat-auto",
 			"value_template": textTemplate("control_mode", "None"),
 		})},
-		{"sensor", "boost_minutes", rtOnly, numSensor("Boost remaining", "boost_minutes", "duration", "min",
+		// Both models report the remaining boost time in minutes
+		// (BOOST_STATE, unit "min" in eQ-3's rftypes XML).
+		{"sensor", "boost_minutes", thermostats, numSensor("Boost remaining", "boost_minutes", "duration", "min",
 			with(diagnostic, map[string]any{"icon": "mdi:rocket-launch"}))},
-		{"sensor", "boost_state", tcOnly, numSensor("Boost state", "boost_state", "", "",
-			with(diagnostic, map[string]any{"icon": "mdi:rocket-launch"}))},
+		// Former TC-only raw boost sensor: matches nothing, so
+		// StaleDiscoveryMessages removes it from existing installations.
+		{"sensor", "boost_state", func(DeviceDesc) bool { return false }, nil},
 		{"sensor", "last_command", thermostats, with(diagnostic, map[string]any{
 			"name":           "Last command",
 			"icon":           "mdi:send-check-outline",
@@ -172,6 +175,8 @@ type node struct {
 	cmdTopic   func(what string) string
 	device     map[string]any
 	humidity   bool // climate shows current humidity
+	// deviceAvail is the per-device availability topic ("" for groups).
+	deviceAvail string
 }
 
 func deviceNode(cfg TopicConfig, d DeviceDesc) node {
@@ -192,11 +197,12 @@ func deviceNode(cfg TopicConfig, d DeviceDesc) node {
 		dev["serial_number"] = d.Serial
 	}
 	return node{
-		id:         nodeID(addr),
-		stateTopic: cfg.StateTopic(addr),
-		cmdTopic:   func(what string) string { return cfg.CommandTopic(addr, what) },
-		device:     dev,
-		humidity:   d.Kind == WallThermostat,
+		id:          nodeID(addr),
+		stateTopic:  cfg.StateTopic(addr),
+		cmdTopic:    func(what string) string { return cfg.CommandTopic(addr, what) },
+		device:      dev,
+		humidity:    d.Kind == WallThermostat,
+		deviceAvail: cfg.DeviceAvailabilityTopic(addr),
 	}
 }
 
@@ -229,8 +235,13 @@ func entityTopic(cfg TopicConfig, component, id, key string) string {
 	return cfg.prefix() + "/" + component + "/" + id + "/" + key + "/config"
 }
 
-// common sets keys shared by all entities of a node.
-func common(cfg TopicConfig, n node, component, uid string, m map[string]any) {
+// bridgeAvailabilityOnly lists entities that stay available while their
+// device is silent, so that one can still see when it was last heard.
+var bridgeAvailabilityOnly = map[string]bool{"last_seen": true, "auth_status": true}
+
+// common sets keys shared by all entities of a node. key is the entity
+// key ("" for the climate entity).
+func common(cfg TopicConfig, n node, component, uid, key string, m map[string]any) {
 	m["unique_id"] = uid
 	// default_entity_id is honoured since HA 2025.10. object_id is not
 	// sent: it raises a deprecation repair on 2025.10 – 2026.3 and is
@@ -241,9 +252,17 @@ func common(cfg TopicConfig, n node, component, uid string, m map[string]any) {
 		"name":        "hmbridge",
 		"support_url": "https://github.com/fjaeckel/hmgo",
 	}
-	m["availability_topic"] = cfg.AvailabilityTopic()
 	m["payload_available"] = PayloadOnline
 	m["payload_not_available"] = PayloadOffline
+	if n.deviceAvail == "" || bridgeAvailabilityOnly[key] {
+		m["availability_topic"] = cfg.AvailabilityTopic()
+		return
+	}
+	m["availability"] = []map[string]any{
+		{"topic": cfg.AvailabilityTopic()},
+		{"topic": n.deviceAvail},
+	}
+	m["availability_mode"] = "all"
 }
 
 func climateConfig(cfg TopicConfig, n node) map[string]any {
@@ -278,7 +297,7 @@ func climateConfig(cfg TopicConfig, n node) map[string]any {
 		m["current_humidity_topic"] = st
 		m["current_humidity_template"] = numTemplate("humidity")
 	}
-	common(cfg, n, "climate", n.id, m)
+	common(cfg, n, "climate", n.id, "", m)
 	return m
 }
 
@@ -296,8 +315,11 @@ func retained(topic string, payload []byte) Message {
 
 func entityMessage(cfg TopicConfig, n node, e entity) Message {
 	m := e.config
+	if m == nil {
+		m = map[string]any{}
+	}
 	m["state_topic"] = n.stateTopic
-	common(cfg, n, e.component, n.id+"_"+e.key, m)
+	common(cfg, n, e.component, n.id+"_"+e.key, e.key, m)
 	return retained(entityTopic(cfg, e.component, n.id, e.key), mustJSON(m))
 }
 
@@ -327,7 +349,7 @@ func RemovalMessages(cfg TopicConfig, addr string) []Message {
 	for _, e := range entities() {
 		msgs = append(msgs, retained(entityTopic(cfg, e.component, id, e.key), nil))
 	}
-	return append(msgs, retained(cfg.StateTopic(addr), nil))
+	return append(msgs, retained(cfg.StateTopic(addr), nil), retained(cfg.DeviceAvailabilityTopic(addr), nil))
 }
 
 // StaleDiscoveryMessages returns removal messages for the entities that

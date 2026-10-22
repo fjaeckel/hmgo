@@ -65,7 +65,7 @@ func init() {
 // messageKind classifies a published topic for metrics.
 func (c TopicConfig) messageKind(topic string) string {
 	switch {
-	case topic == c.AvailabilityTopic():
+	case topic == c.AvailabilityTopic(), strings.HasPrefix(topic, c.base()+"/") && strings.HasSuffix(topic, "/availability"):
 		return "availability"
 	case strings.HasPrefix(topic, c.prefix()+"/"):
 		return "discovery"

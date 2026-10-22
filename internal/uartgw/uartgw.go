@@ -190,6 +190,19 @@ var (
 	// state (keys, HMID, peers) is lost; the Conn is unusable.
 	ErrModuleReset = errors.New("uartgw: radio module was reset unexpectedly")
 
+	// ErrModuleUnresponsive means the module stopped acknowledging
+	// requests (Config.MaxAckTimeouts consecutive requests timed out)
+	// without announcing a reset, i.e. it is wedged. The Conn is
+	// unusable; the module needs to be re-initialized (reopened).
+	// c.f. HMUARTLGW_CheckCmdResp in FHEM: “did not respond after all,
+	// reopening”.
+	ErrModuleUnresponsive = errors.New("uartgw: radio module stopped responding")
+
+	// ErrFirmwareTooOld is returned (wrapped) by Open when the module
+	// runs a firmware version older than 1.0.7, which does not
+	// understand the burst byte in AppSend requests.
+	ErrFirmwareTooOld = errors.New("uartgw: radio module firmware is too old")
+
 	// ErrClosed is returned after Close was called.
 	ErrClosed = errors.New("uartgw: connection closed")
 )
@@ -203,6 +216,7 @@ const (
 	defaultRetryWindow     = 3 * time.Second
 	defaultRetryBackoff    = 200 * time.Millisecond
 	defaultCreditsInterval = 60 * time.Second
+	defaultMaxAckTimeouts  = 3
 	recvBufferSize         = 64
 )
 
@@ -227,6 +241,14 @@ type Config struct {
 	// CreditsInterval is how often the duty cycle credits are polled
 	// for the duty cycle metric (default 60s, negative disables).
 	CreditsInterval time.Duration
+
+	// MaxAckTimeouts is the number of consecutive requests the module
+	// may leave unacknowledged (ErrTimeout, including credits polling)
+	// before the connection fails with ErrModuleUnresponsive (default 3,
+	// like FHEM’s CreditFailed < 3; negative disables). Any matched ack
+	// resets the count. A device not answering (ErrNoResponse) and
+	// requests aborted via their context do not count.
+	MaxAckTimeouts int
 
 	// CSMACA enables CSMA/CA (carrier sense multiple access with
 	// collision avoidance, “listen before talk”) in the module
@@ -278,6 +300,7 @@ type Conn struct {
 	retryWindow     time.Duration
 	retryBackoff    time.Duration
 	creditsInterval time.Duration
+	maxAckTimeouts  int // <= 0: disabled
 	debug           bool
 
 	firmware string
@@ -306,6 +329,7 @@ type Conn struct {
 	err         error    // first fatal error
 	recv        chan []byte
 	lastSendLen [2]int // lengths of the two most recently sent packets
+	ackTimeouts int    // consecutive requests the module did not ack
 }
 
 // Open performs the init handshake on the module and starts the reader
@@ -336,6 +360,7 @@ func Open(rw io.ReadWriter, cfg Config) (*Conn, error) {
 		retryWindow:     defaultRetryWindow,
 		retryBackoff:    defaultRetryBackoff,
 		creditsInterval: cfg.CreditsInterval,
+		maxAckTimeouts:  cfg.MaxAckTimeouts,
 		debug:           cfg.Debug,
 		sem:             make(chan struct{}, 1),
 		announce:        make(chan string, 8),
@@ -353,6 +378,9 @@ func Open(rw io.ReadWriter, cfg Config) (*Conn, error) {
 	}
 	if c.creditsInterval == 0 {
 		c.creditsInterval = defaultCreditsInterval
+	}
+	if c.maxAckTimeouts == 0 {
+		c.maxAckTimeouts = defaultMaxAckTimeouts
 	}
 	c.fr.altInits = c.altCRCInits
 
@@ -534,6 +562,7 @@ func (c *Conn) dispatch(f frame) {
 		p := c.cur
 		if p != nil && p.cnt == f.cnt {
 			c.cur = nil
+			c.ackTimeouts = 0 // the module is alive
 		} else {
 			p = nil
 		}
@@ -696,6 +725,9 @@ func (c *Conn) do(ctx context.Context, dst, cmd byte, payload []byte, timeout ti
 		}
 		f, err := c.wait(ctx, p, timeout)
 		if err != nil {
+			if errors.Is(err, ErrTimeout) {
+				c.ackTimeout(err)
+			}
 			return frame{}, err
 		}
 		status := f.payload[0]
@@ -729,6 +761,20 @@ func (c *Conn) do(ctx context.Context, dst, cmd byte, payload []byte, timeout ti
 			t.Stop()
 			return frame{}, c.Err()
 		}
+	}
+}
+
+// ackTimeout records that the module did not acknowledge a request
+// (err) and fails the connection with ErrModuleUnresponsive after
+// maxAckTimeouts consecutive ones.
+func (c *Conn) ackTimeout(err error) {
+	ackTimeouts.Inc()
+	c.mu.Lock()
+	c.ackTimeouts++
+	n := c.ackTimeouts
+	c.mu.Unlock()
+	if c.maxAckTimeouts > 0 && n >= c.maxAckTimeouts {
+		c.fail(fmt.Errorf("%w: %d consecutive requests were not acknowledged (last: %v)", ErrModuleUnresponsive, n, err))
 	}
 }
 
@@ -1025,12 +1071,30 @@ func (c *Conn) getFirmwareVersion(ctx context.Context) error {
 	}
 	v := f.payload[4:7]
 	c.firmware = fmt.Sprintf("%d.%d.%d", v[0], v[1], v[2])
+	fw := uint32(v[0])<<16 | uint32(v[1])<<8 | uint32(v[2])
+	// bidcos.Packet.Encode always includes the burst byte in AppSend
+	// requests, which FHEM only sends if ($hash->{Helper}{FW} >
+	// 0x010006).
+	if fw <= 0x010006 {
+		return firmwareTooOldError(c.firmware)
+	}
 	// c.f. FHEM: $fw .= " (outdated)" if ($hash->{Helper}{FW} < 0x010401);
-	if uint32(v[0])<<16|uint32(v[1])<<8|uint32(v[2]) < 0x010401 {
+	if fw < 0x010401 {
 		log.Printf("uartgw: radio module firmware %s is outdated, please update to 1.4.1", c.firmware)
 	}
 	return nil
 }
+
+// firmwareTooOldError is the firmware version of a module whose
+// firmware is too old; it matches ErrFirmwareTooOld.
+type firmwareTooOldError string
+
+func (e firmwareTooOldError) Error() string {
+	return fmt.Sprintf("radio module firmware %s is too old; hmbridge needs 1.4.1 or newer (1.0.7 at the very least) — "+
+		"update it with OpenCCU or the eQ-3 flash tool", string(e))
+}
+
+func (e firmwareTooOldError) Is(target error) bool { return target == ErrFirmwareTooOld }
 
 func (c *Conn) getSerialNumber(ctx context.Context) error {
 	// on the wire: FD000300030B9239

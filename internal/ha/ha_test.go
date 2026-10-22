@@ -183,8 +183,8 @@ func TestDiscoveryMessages(t *testing.T) {
 			d: DeviceDesc{Addr: "1a2b3c", Name: "Flur", Model: "HM-TC-IT-WM-W-EU", Kind: WallThermostat},
 			want: []string{"climate/hmbridge_1a2b3c/config", "sensor/hmbridge_1a2b3c/humidity/config",
 				"binary_sensor/hmbridge_1a2b3c/window_open/config", "binary_sensor/hmbridge_1a2b3c/comm_reporting/config",
-				"sensor/hmbridge_1a2b3c/boost_state/config", "sensor/hmbridge_1a2b3c/battery_voltage/config"},
-			notWant: []string{"valve_position", "fault", "boost_minutes"},
+				"sensor/hmbridge_1a2b3c/boost_minutes/config", "sensor/hmbridge_1a2b3c/battery_voltage/config"},
+			notWant: []string{"valve_position", "fault", "boost_state"},
 		},
 	} {
 		msgs := DiscoveryMessages(cfg, tc.d)
@@ -199,9 +199,24 @@ func TestDiscoveryMessages(t *testing.T) {
 			}
 			v := decode(t, m)
 			byTopic[strings.TrimPrefix(m.Topic, "homeassistant/")] = v
-			for _, k := range []string{"unique_id", "default_entity_id", "device", "availability_topic", "origin"} {
+			for _, k := range []string{"unique_id", "default_entity_id", "device", "origin"} {
 				if _, ok := v[k]; !ok {
 					t.Errorf("%s: missing %s", m.Topic, k)
+				}
+			}
+			// Availability: bridge AND device, except for last_seen /
+			// auth_status, which stay available while the device is silent.
+			addr := strings.ToLower(tc.d.Addr)
+			if strings.Contains(m.Topic, "/last_seen/") || strings.Contains(m.Topic, "/auth_status/") {
+				if v["availability_topic"] != "hmbridge/bridge/availability" || v["availability"] != nil {
+					t.Errorf("%s: availability = %v / %v, want bridge only", m.Topic, v["availability_topic"], v["availability"])
+				}
+			} else {
+				av, _ := v["availability"].([]any)
+				if v["availability_topic"] != nil || len(av) != 2 || v["availability_mode"] != "all" ||
+					av[0].(map[string]any)["topic"] != "hmbridge/bridge/availability" ||
+					av[1].(map[string]any)["topic"] != "hmbridge/"+addr+"/availability" {
+					t.Errorf("%s: availability = %v (mode %v), want bridge+device, mode all", m.Topic, v["availability"], v["availability_mode"])
 				}
 			}
 			uid := v["unique_id"].(string)
@@ -252,7 +267,6 @@ func TestDiscoveryMessages(t *testing.T) {
 			"mode_command_topic":        "hmbridge/" + addr + "/set/mode",
 			"preset_mode_command_topic": "hmbridge/" + addr + "/set/preset",
 			"mode_state_topic":          "hmbridge/" + addr + "/state",
-			"availability_topic":        "hmbridge/bridge/availability",
 			"min_temp":                  4.5, "max_temp": 30.5, "temp_step": 0.5,
 			"temperature_unit": "C", "optimistic": false,
 		} {

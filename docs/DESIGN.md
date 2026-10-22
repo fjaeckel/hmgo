@@ -206,9 +206,29 @@ loop responsive:
   bridge mutex, so an older snapshot (e.g. from a reconnect) can never
   overwrite a newer one, and a slow broker never blocks the radio side.
 
+* **last command wins:** a newer command for a device moves to the back of
+  the queue, and a retry is dropped if any newer command for that device
+  was queued since (otherwise a retried “22 °C” could undo a later “off”).
+
 Time requests (cmd 0x3F) from the devices are answered with Homegear's
-format (UTC offset + seconds since 2000), and the module's clock is set
-every `time_sync_interval`.
+format (UTC offset + seconds since 2000) as priority jobs, and the
+module's clock is set every `time_sync_interval` — both only while the
+kernel reports the system clock as NTP-synchronised (`require_synced_clock`).
+
+Robustness:
+
+* **availability:** each device has a retained `<base>/<addr>/availability`
+  topic; entities are available only while the bridge and the device are
+  online. A device is offline once silent for longer than its stale
+  timeout (30m thermostats, 6h HM-Sec-SCo, 50h other contacts).
+* **state file:** the last known state is restored at startup, and an
+  empty state is never published, so restarts don't blank Home Assistant.
+* **AES:** for AES devices, frames not addressed to the central (which the
+  module does not authenticate) never change the state.
+* **wedged module:** after 3 consecutive requests the module never
+  acknowledged, the connection fails (`uartgw.ErrModuleUnresponsive`) and
+  the process exits for systemd to restart it. Module firmware ≤ 1.0.6
+  is refused (`uartgw.ErrFirmwareTooOld`).
 
 ## Running alongside OpenCCU
 

@@ -747,3 +747,205 @@ func TestCreditsPolling(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 }
+
+func noBiDiPacket(cnt byte) []byte {
+	pkt := bidiPacket(cnt)
+	pkt.Flags = bidcos.RepeatEnable
+	return pkt.Encode()
+}
+
+// switchableOnSend returns an OnSend which swallows requests (NoAck)
+// while *wedged is true.
+func switchableOnSend(mu *sync.Mutex, wedged *bool) func([]byte) (byte, []byte) {
+	return func(msg []byte) (byte, []byte) {
+		mu.Lock()
+		defer mu.Unlock()
+		if *wedged {
+			return fakemod.NoAck, nil
+		}
+		return fakemod.DefaultOnSend(msg)
+	}
+}
+
+func TestModuleUnresponsive(t *testing.T) {
+	c, _ := open(t, fakemod.Options{
+		OnSend: func([]byte) (byte, []byte) { return fakemod.NoAck, nil },
+	}, Config{Timeout: 50 * time.Millisecond, CreditsInterval: -1})
+	before := testutil.ToFloat64(ackTimeouts)
+	for i := 1; i <= defaultMaxAckTimeouts; i++ {
+		if _, err := c.Send(context.Background(), noBiDiPacket(byte(i))); !errors.Is(err, ErrTimeout) {
+			t.Fatalf("Send %d: got %v, want ErrTimeout", i, err)
+		}
+		if i < defaultMaxAckTimeouts && c.Err() != nil {
+			t.Fatalf("connection failed after %d timeouts: %v", i, c.Err())
+		}
+	}
+	select {
+	case _, ok := <-c.Recv():
+		if ok {
+			t.Fatal("unexpected frame")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Recv not closed after the module stopped responding")
+	}
+	if err := c.Err(); !errors.Is(err, ErrModuleUnresponsive) {
+		t.Errorf("Err() = %v, want ErrModuleUnresponsive", err)
+	}
+	if _, err := c.Send(context.Background(), noBiDiPacket(9)); !errors.Is(err, ErrModuleUnresponsive) {
+		t.Errorf("Send after failure: %v, want ErrModuleUnresponsive", err)
+	}
+	if got := testutil.ToFloat64(ackTimeouts) - before; got != defaultMaxAckTimeouts {
+		t.Errorf("ack timeouts = %v, want %d", got, defaultMaxAckTimeouts)
+	}
+	if got := testutil.ToFloat64(upGauge); got != 0 {
+		t.Errorf("up gauge = %v, want 0", got)
+	}
+}
+
+func TestModuleUnresponsiveResetByAck(t *testing.T) {
+	var mu sync.Mutex
+	wedged := false
+	c, _ := open(t, fakemod.Options{OnSend: switchableOnSend(&mu, &wedged)},
+		Config{Timeout: 50 * time.Millisecond, CreditsInterval: -1})
+	setWedged := func(v bool) {
+		mu.Lock()
+		wedged = v
+		mu.Unlock()
+	}
+	cnt := byte(0)
+	for round := 0; round < 3; round++ {
+		// MaxAckTimeouts-1 timeouts, then a success.
+		setWedged(true)
+		for i := 0; i < defaultMaxAckTimeouts-1; i++ {
+			cnt++
+			if _, err := c.Send(context.Background(), noBiDiPacket(cnt)); !errors.Is(err, ErrTimeout) {
+				t.Fatalf("Send: got %v, want ErrTimeout", err)
+			}
+		}
+		setWedged(false)
+		cnt++
+		if _, err := c.Send(context.Background(), noBiDiPacket(cnt)); err != nil {
+			t.Fatalf("Send after timeouts: %v", err)
+		}
+		if err := c.Err(); err != nil {
+			t.Fatalf("connection failed: %v", err)
+		}
+	}
+}
+
+func TestModuleUnresponsiveIgnoresNoResponse(t *testing.T) {
+	c, _ := open(t, fakemod.Options{
+		OnSend: func([]byte) (byte, []byte) { return fakemod.AckEUnknown, nil },
+	}, Config{CreditsInterval: -1})
+	for i := 1; i <= 2*defaultMaxAckTimeouts; i++ {
+		if _, err := c.Send(context.Background(), bidiPacket(byte(i)).Encode()); !errors.Is(err, ErrNoResponse) {
+			t.Fatalf("Send: got %v, want ErrNoResponse", err)
+		}
+	}
+	if err := c.Err(); err != nil {
+		t.Errorf("connection failed: %v", err)
+	}
+}
+
+func TestModuleUnresponsiveIgnoresContext(t *testing.T) {
+	c, _ := open(t, fakemod.Options{
+		OnSend: func([]byte) (byte, []byte) { return fakemod.NoAck, nil },
+	}, Config{Timeout: time.Second, CreditsInterval: -1})
+	for i := 1; i <= 2*defaultMaxAckTimeouts; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+		_, err := c.Send(ctx, noBiDiPacket(byte(i)))
+		cancel()
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Send: got %v, want context.DeadlineExceeded", err)
+		}
+	}
+	if err := c.Err(); err != nil {
+		t.Errorf("connection failed: %v", err)
+	}
+}
+
+func TestModuleUnresponsiveDisabled(t *testing.T) {
+	c, _ := open(t, fakemod.Options{
+		OnSend: func([]byte) (byte, []byte) { return fakemod.NoAck, nil },
+	}, Config{Timeout: 30 * time.Millisecond, CreditsInterval: -1, MaxAckTimeouts: -1})
+	for i := 1; i <= 2*defaultMaxAckTimeouts; i++ {
+		if _, err := c.Send(context.Background(), noBiDiPacket(byte(i))); !errors.Is(err, ErrTimeout) {
+			t.Fatalf("Send: got %v, want ErrTimeout", err)
+		}
+	}
+	if err := c.Err(); err != nil {
+		t.Errorf("connection failed: %v", err)
+	}
+}
+
+func TestModuleUnresponsiveCreditsPolling(t *testing.T) {
+	var mu sync.Mutex
+	wedged := false
+	c, _ := open(t, fakemod.Options{
+		OnOS: func(cmd byte, payload []byte) (byte, bool) {
+			mu.Lock()
+			defer mu.Unlock()
+			if cmd == 0x08 && wedged { // get credits
+				return fakemod.NoAck, true
+			}
+			return 0, false
+		},
+	}, Config{Timeout: 30 * time.Millisecond, CreditsInterval: 10 * time.Millisecond})
+	mu.Lock()
+	wedged = true
+	mu.Unlock()
+	select {
+	case _, ok := <-c.Recv():
+		if ok {
+			t.Fatal("unexpected frame")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Recv not closed after credits polling timed out repeatedly")
+	}
+	if err := c.Err(); !errors.Is(err, ErrModuleUnresponsive) {
+		t.Errorf("Err() = %v, want ErrModuleUnresponsive", err)
+	}
+}
+
+func TestOpenFirmwareVersion(t *testing.T) {
+	for _, tt := range []struct {
+		fw      [3]byte
+		wantErr bool
+	}{
+		{[3]byte{0, 9, 9}, true},
+		{[3]byte{1, 0, 0}, true},
+		{[3]byte{1, 0, 6}, true},
+		{[3]byte{1, 0, 7}, false},
+		{[3]byte{1, 4, 0}, false},
+		{[3]byte{1, 4, 1}, false},
+		{[3]byte{2, 0, 0}, false},
+	} {
+		version := fmt.Sprintf("%d.%d.%d", tt.fw[0], tt.fw[1], tt.fw[2])
+		t.Run(version, func(t *testing.T) {
+			mod, rw := fakemod.New(fakemod.Options{Firmware: tt.fw})
+			defer mod.Close()
+			c, err := Open(rw, Config{HMID: testHMID, Timeout: time.Second, AnnounceWait: 200 * time.Millisecond, CreditsInterval: -1})
+			if tt.wantErr {
+				if !errors.Is(err, ErrFirmwareTooOld) {
+					t.Fatalf("Open: got %v, want ErrFirmwareTooOld", err)
+				}
+				for _, want := range []string{version, "1.4.1", "1.0.7"} {
+					if !strings.Contains(err.Error(), want) {
+						t.Errorf("error %q does not mention %q", err, want)
+					}
+				}
+				if _, hmidSet := mod.HMID(); hmidSet {
+					t.Error("HMID configured on a module with too old firmware")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Open: %v", err)
+			}
+			defer c.Close()
+			if got := c.FirmwareVersion(); got != version {
+				t.Errorf("FirmwareVersion = %q, want %q", got, version)
+			}
+		})
+	}
+}

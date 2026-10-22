@@ -65,6 +65,14 @@ var (
 		},
 		[]string{"kind"})
 
+	ackTimeouts = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Subsystem: metricsSubsystem,
+			Name:      "ack_timeouts_total",
+			Help:      "Requests the radio module did not acknowledge in time (module-level timeouts, not devices failing to answer).",
+		})
+
 	staleAcks = prometheus.NewCounter(
 		prometheus.CounterOpts{
 			Namespace: metricsNamespace,
@@ -128,6 +136,7 @@ func init() {
 		acks,
 		sendRetries,
 		sendErrors,
+		ackTimeouts,
 		staleAcks,
 		recvDropped,
 		requestDuration,

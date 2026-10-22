@@ -113,6 +113,20 @@ type Config struct {
 	// if the debug log shows duplicate answers.
 	AnswerTimeRequests *bool `json:"answer_time_requests,omitempty"`
 
+	// RequireSyncedClock makes hmbridge answer time requests and set the
+	// radio module's clock only while the kernel reports the system
+	// clock as synchronised (NTP). A Raspberry Pi has no RTC: after a
+	// power cut it may run with a stale clock until NTP is reachable,
+	// and the devices would shift their week programs. Default true;
+	// set false on systems without NTP whose clock is set otherwise.
+	RequireSyncedClock *bool `json:"require_synced_clock,omitempty"`
+
+	// StateFile stores the last known device state, so that a restart
+	// does not blank Home Assistant until every device has reported
+	// again (window contacts report only every few hours). Default
+	// "/var/lib/hmbridge/state.json"; "" disables it.
+	StateFile *string `json:"state_file,omitempty"`
+
 	Devices []Device `json:"devices"`
 	Groups  []Group  `json:"groups,omitempty"`
 
@@ -177,6 +191,11 @@ type Device struct {
 	// after the CCU's key change still uses security.previous.index).
 	// Must be the index of the current or previous key.
 	KeyIndexOverride *int `json:"key_index,omitempty"`
+	// StaleAfter is how long the device may stay silent before Home
+	// Assistant shows it as unavailable (Go duration). Default: 30m for
+	// thermostats (they report every few minutes), 6h for the
+	// HM-Sec-SCo, 50h for the other contacts (they report about daily).
+	StaleAfter Duration `json:"stale_after,omitempty"`
 
 	addr     [3]byte
 	keyIndex byte
@@ -269,11 +288,11 @@ type Duration struct {
 func (d *Duration) UnmarshalJSON(b []byte) error {
 	var s string
 	if err := json.Unmarshal(b, &s); err != nil {
-		return fmt.Errorf("time_sync_interval: duration must be a string like \"1h\" or \"30m\"")
+		return fmt.Errorf("duration must be a string like \"1h\" or \"30m\"")
 	}
 	v, err := time.ParseDuration(s)
 	if err != nil {
-		return fmt.Errorf("time_sync_interval: %v", err)
+		return fmt.Errorf("invalid duration %q (use e.g. \"30m\" or \"1h\")", s)
 	}
 	d.Duration = v
 	d.set = true
@@ -506,6 +525,9 @@ func (c *Config) resolve() error {
 				return fmt.Errorf("%s: aes_channels: channel %d out of range 1..%d for %s (channel 0 is the maintenance channel)", where, ch, d.Channels(), d.Model)
 			}
 		}
+		if d.StaleAfter.set && d.StaleAfter.Duration < time.Minute {
+			return fmt.Errorf("%s: stale_after %v is too short (minimum 1m)", where, d.StaleAfter.Duration)
+		}
 		d.keyIndex = c.current.Index
 		if d.KeyIndexOverride != nil {
 			ki := *d.KeyIndexOverride
@@ -573,6 +595,38 @@ func (c *Config) resolve() error {
 		g.thermostats = append(tcs, rts...)
 	}
 	return nil
+}
+
+// DefaultStateFile is where the last known device state is kept.
+const DefaultStateFile = "/var/lib/hmbridge/state.json"
+
+// StateFilePath returns the resolved state file path ("" = disabled).
+func (c *Config) StateFilePath() string {
+	if c.StateFile == nil {
+		return DefaultStateFile
+	}
+	return *c.StateFile
+}
+
+// RequiresSyncedClock reports whether time is only handed out while the
+// system clock is NTP-synchronised (default true).
+func (c *Config) RequiresSyncedClock() bool {
+	return c.RequireSyncedClock == nil || *c.RequireSyncedClock
+}
+
+// StaleTimeout returns how long the device may be silent before it is
+// reported unavailable.
+func (d Device) StaleTimeout() time.Duration {
+	if d.StaleAfter.Duration > 0 {
+		return d.StaleAfter.Duration
+	}
+	switch d.Model {
+	case ModelRTDN, ModelTC:
+		return 30 * time.Minute
+	case ModelSCo:
+		return 6 * time.Hour
+	}
+	return 50 * time.Hour
 }
 
 // AnswersTimeRequests reports whether hmbridge answers time requests

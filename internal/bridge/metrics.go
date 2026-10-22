@@ -73,6 +73,22 @@ var (
 		Namespace: "hmbridge", Subsystem: "device", Name: "messages_to_other_address_total",
 		Help: "Messages from the device addressed to neither the central nor broadcast (direct links, or a wrong central_address).",
 	}, []string{"address", "name"})
+	metricAvailable = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: "hmbridge", Subsystem: "device", Name: "available",
+		Help: "1 while the device reports regularly, 0 once it has been silent for longer than stale_after.",
+	}, deviceLabels)
+	metricUnauthenticated = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "hmbridge", Subsystem: "device", Name: "unauthenticated_ignored_total",
+		Help: "Messages from AES devices that were not addressed to the central (so not authenticated) and were ignored.",
+	}, []string{"address", "name"})
+	metricClockSynced = prometheus.NewGauge(prometheus.GaugeOpts{
+		Namespace: "hmbridge", Name: "system_clock_synced",
+		Help: "1 if the kernel reports the system clock as NTP-synchronised.",
+	})
+	metricTimeRequestsSkipped = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: "hmbridge", Name: "time_requests_skipped_total",
+		Help: "Device time requests not answered because the system clock was not synchronised.",
+	})
 	metricDecodeErrors = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: "hmbridge", Subsystem: "device", Name: "decode_errors_total",
 		Help: "Messages from the device that could not be decoded.",
@@ -103,6 +119,7 @@ func init() {
 		metricWindowOpen, metricCurrentTemp, metricTargetTemp,
 		metricValve, metricHumidity, metricSabotage, metricFault,
 		metricAuth, metricDecodeErrors, metricForeignDest,
+		metricAvailable, metricUnauthenticated, metricClockSynced, metricTimeRequestsSkipped,
 		metricFrames, metricUnknownSenders, metricCommands, metricQueueLength,
 	)
 }

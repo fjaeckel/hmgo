@@ -40,10 +40,16 @@ const (
 )
 
 type job struct {
-	key  string // coalescing key: a newer job with the same key replaces an older queued one
-	seq  uint64 // assigned by the queue
-	kind jobKind
-	dev  *device
+	key string // coalescing key: a newer job with the same key replaces an older queued one
+	// target groups jobs whose retries a newer job supersedes (all
+	// climate jobs of one device). Empty for jobs that are never retried.
+	target string
+	seq    uint64 // assigned by the queue
+	kind   jobKind
+	dev    *device
+	// priority jobs (time responses) jump the queue: a device listens
+	// for the answer only briefly.
+	priority bool
 
 	action  climateAction
 	temp    float64
@@ -59,23 +65,54 @@ type jobResult struct {
 }
 
 // jobQueue is a FIFO queue of jobs that coalesces jobs with the same key:
-// pushing a job whose key is already queued replaces the queued job in
-// place. This keeps a slider being dragged in Home Assistant from
-// queueing dozens of radio transmissions.
+// pushing a job whose key is already queued replaces the queued job and
+// moves it to the back, so the most recent command always runs last.
+// This keeps a slider being dragged in Home Assistant from queueing
+// dozens of radio transmissions.
+//
+// Retries: a failed climate job may be retried later, but only if no
+// newer job for the same target (device) was pushed in the meantime —
+// of any kind. Otherwise a retried “22 °C” could undo a later “off”.
 type jobQueue struct {
-	mu      sync.Mutex
-	order   []string
-	jobs    map[string]job
-	lastSeq map[string]uint64
-	seq     uint64
-	signal  chan struct{}
+	mu         sync.Mutex
+	order      []string
+	jobs       map[string]job
+	lastTarget map[string]uint64 // target → seq of the newest pushed job
+	seq        uint64
+	signal     chan struct{}
 }
 
 func newJobQueue() *jobQueue {
 	return &jobQueue{
-		jobs:    make(map[string]job),
-		lastSeq: make(map[string]uint64),
-		signal:  make(chan struct{}, 1),
+		jobs:       make(map[string]job),
+		lastTarget: make(map[string]uint64),
+		signal:     make(chan struct{}, 1),
+	}
+}
+
+// insert adds j, replacing a queued job with the same key. Caller holds q.mu.
+func (q *jobQueue) insert(j job) {
+	if _, queued := q.jobs[j.key]; queued {
+		for i, k := range q.order {
+			if k == j.key {
+				q.order = append(q.order[:i], q.order[i+1:]...)
+				break
+			}
+		}
+	}
+	if j.priority {
+		q.order = append([]string{j.key}, q.order...)
+	} else {
+		q.order = append(q.order, j.key)
+	}
+	q.jobs[j.key] = j
+	metricQueueLength.Set(float64(len(q.order)))
+}
+
+func (q *jobQueue) wake() {
+	select {
+	case q.signal <- struct{}{}:
+	default:
 	}
 }
 
@@ -84,40 +121,28 @@ func (q *jobQueue) push(j job) uint64 {
 	q.mu.Lock()
 	q.seq++
 	j.seq = q.seq
-	if _, queued := q.jobs[j.key]; !queued {
-		q.order = append(q.order, j.key)
+	if j.target != "" {
+		q.lastTarget[j.target] = j.seq
 	}
-	q.jobs[j.key] = j
-	q.lastSeq[j.key] = j.seq
-	metricQueueLength.Set(float64(len(q.order)))
+	q.insert(j)
 	q.mu.Unlock()
-	select {
-	case q.signal <- struct{}{}:
-	default:
-	}
+	q.wake()
 	return j.seq
 }
 
-// retry re-enqueues j unless a newer job with the same key was pushed in
-// the meantime (which supersedes the retry).
+// retry re-enqueues j unless a newer job for the same target was pushed
+// in the meantime (which supersedes the retry).
 func (q *jobQueue) retry(j job) bool {
 	q.mu.Lock()
 	// Check and re-insert under one lock, so that a newer job pushed
 	// concurrently can never be replaced by this stale retry.
-	if q.lastSeq[j.key] != j.seq {
+	if j.target == "" || q.lastTarget[j.target] != j.seq {
 		q.mu.Unlock()
 		return false
 	}
-	if _, queued := q.jobs[j.key]; !queued {
-		q.order = append(q.order, j.key)
-	}
-	q.jobs[j.key] = j
-	metricQueueLength.Set(float64(len(q.order)))
+	q.insert(j)
 	q.mu.Unlock()
-	select {
-	case q.signal <- struct{}{}:
-	default:
-	}
+	q.wake()
 	return true
 }
 
@@ -167,9 +192,15 @@ func (b *Bridge) worker(ctx context.Context) {
 func (b *Bridge) execute(ctx context.Context, j job) (any, error) {
 	switch j.kind {
 	case jobSetTime:
+		if !b.timeUsable() {
+			return nil, nil
+		}
 		return nil, b.radio.SetTime(ctx, b.now())
 
 	case jobTimeResponse:
+		if !b.timeUsable() {
+			return nil, nil
+		}
 		pkt := hm.TimestampResponse(j.reqNo, b.cfg.CentralAddr(), j.dev.cfg.Addr(), b.now())
 		_, err := b.bcs.Send(ctx, pkt)
 		return nil, err
@@ -261,6 +292,9 @@ func (b *Bridge) handleCommand(cmd ha.Command) {
 
 	for _, d := range targets {
 		action, temp, err := b.translate(d, cmd)
+		if errors.Is(err, errNoop) {
+			continue
+		}
 		if err != nil {
 			b.logf("command for %s: %v", what, err)
 			metricCommands.WithLabelValues(string(action), "rejected").Inc()
@@ -269,6 +303,7 @@ func (b *Bridge) handleCommand(cmd ha.Command) {
 		b.logf("%s: queueing %s %v (%s)", d.cfg.Name, action, temp, what)
 		b.queue.push(job{
 			key:    fmt.Sprintf("climate:%s:%s", d.desc.Addr, actionClass(action)),
+			target: "climate:" + d.desc.Addr,
 			kind:   jobClimate,
 			dev:    d,
 			action: action,
@@ -309,10 +344,15 @@ func (b *Bridge) translate(d *device, cmd ha.Command) (climateAction, float64, e
 		case ha.PresetBoost:
 			return actionBoost, 0, nil
 		case ha.PresetNone:
+			if d.state.ControlMode != "boost" {
+				return "", 0, errNoop
+			}
 			// Leaving boost: the devices have no “end boost” command, so
-			// return to the mode HA showed before boost (manual → heat
-			// at the last target, otherwise auto).
-			if d.preBoostMode == "manual" {
+			// return to the mode HA showed before boost.
+			switch d.preBoostHAMode {
+			case ha.ModeOff:
+				return actionManual, ha.MinTemp, nil
+			case ha.ModeHeat:
 				return actionManual, comfortTarget(d), nil
 			}
 			return actionAuto, 0, nil
@@ -321,6 +361,10 @@ func (b *Bridge) translate(d *device, cmd ha.Command) (climateAction, float64, e
 	}
 	return "", 0, fmt.Errorf("unsupported command kind %v", cmd.Kind)
 }
+
+// errNoop is returned by translate for commands that need no radio
+// transmission (e.g. preset none while not boosting).
+var errNoop = errors.New("nothing to do")
 
 // comfortTarget returns the temperature to use when switching to heat.
 func comfortTarget(d *device) float64 {
@@ -380,7 +424,7 @@ func (b *Bridge) handleResult(res jobResult) {
 		}
 	case actionManual:
 		if upd.ControlMode == "" {
-			setControl(&upd, "manual", j.temp, 0, d.desc.Kind == ha.RadiatorThermostat)
+			setControl(&upd, "manual", j.temp, 0)
 			upd.TargetTemperature = ptr(j.temp)
 		}
 	case actionAuto:
@@ -389,7 +433,7 @@ func (b *Bridge) handleResult(res jobResult) {
 			if d.state.TargetTemperature != nil {
 				target = *d.state.TargetTemperature
 			}
-			setControl(&upd, "auto", target, 0, d.desc.Kind == ha.RadiatorThermostat)
+			setControl(&upd, "auto", target, 0)
 		}
 	case actionBoost:
 		if upd.ControlMode == "" {
@@ -397,7 +441,7 @@ func (b *Bridge) handleResult(res jobResult) {
 			if d.state.TargetTemperature != nil {
 				target = *d.state.TargetTemperature
 			}
-			setControl(&upd, "boost", target, 5, d.desc.Kind == ha.RadiatorThermostat)
+			setControl(&upd, "boost", target, 5)
 		}
 	}
 	b.applyUpdate(d, upd)
@@ -409,12 +453,14 @@ func (b *Bridge) handleResult(res jobResult) {
 // to translate later commands. Caller holds b.mu.
 func (b *Bridge) applyUpdate(d *device, upd ha.State) {
 	prevMode := d.state.ControlMode
+	prevHAMode := d.state.Mode
 	d.state.Merge(upd)
+	b.stateDirty = true
 	if t := d.state.TargetTemperature; t != nil && *t > ha.MinTemp && *t < ha.MaxTemp {
 		d.lastOnTarget = *t
 	}
-	if d.state.ControlMode == "boost" && prevMode != "boost" && prevMode != "" {
-		d.preBoostMode = prevMode
+	if d.state.ControlMode == "boost" && prevMode != "boost" {
+		d.preBoostHAMode = prevHAMode // "" (unknown) leaves boost to auto
 	}
 	deriveState(d)
 	b.updateMetrics(d)

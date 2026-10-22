@@ -520,6 +520,24 @@ func (c TopicConfig) prefix() string {
 // AvailabilityTopic is the bridge availability topic (LWT).
 func (c TopicConfig) AvailabilityTopic() string { return c.base() + "/bridge/availability" }
 
+// DeviceAvailabilityTopic is the retained availability topic of a single
+// device ("online" while the device reports regularly, "offline" when it
+// has been silent for too long). Device entities are available only when
+// both the bridge and the device are online.
+func (c TopicConfig) DeviceAvailabilityTopic(addr string) string {
+	return c.base() + "/" + strings.ToLower(addr) + "/availability"
+}
+
+// DeviceAvailabilityMessage returns the retained availability message for
+// the device at addr.
+func DeviceAvailabilityMessage(cfg TopicConfig, addr string, online bool) Message {
+	p := PayloadOffline
+	if online {
+		p = PayloadOnline
+	}
+	return Message{Topic: cfg.DeviceAvailabilityTopic(addr), Payload: []byte(p), Retain: true, QoS: 1}
+}
+
 // StateTopic is the retained JSON state topic of a device.
 func (c TopicConfig) StateTopic(addr string) string {
 	return c.base() + "/" + strings.ToLower(addr) + "/state"

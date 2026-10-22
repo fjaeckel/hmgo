@@ -2,14 +2,22 @@ groups:
   - name: hmbridge
     rules:
       - alert: HomematicDeviceSilent
-        # Thermostats report every few minutes, window contacts at least
-        # hourly. Raise the threshold if a contact triggers this.
-        expr: time() - hmbridge_device_last_seen_timestamp_seconds > 2 * 3600
+        # hmbridge marks a device unavailable after its stale timeout
+        # (30m for thermostats, 6h for HM-Sec-SCo, 50h for other contacts;
+        # stale_after in the configuration).
+        expr: hmbridge_device_available == 0
         for: 15m
         labels: { severity: warning }
         annotations:
-          summary: "{{ $labels.name }} ({{ $labels.model }}) has not been heard for {{ $value | humanizeDuration }}"
+          summary: "{{ $labels.name }} ({{ $labels.model }}) has stopped reporting"
           description: "Battery empty, out of range, or the radio module is not receiving."
+
+      - alert: HomematicClockNotSynced
+        expr: hmbridge_system_clock_synced == 0
+        for: 30m
+        labels: { severity: warning }
+        annotations:
+          summary: "The Pi's clock is not NTP-synchronised; hmbridge does not answer the devices' time requests"
 
       - alert: HomematicBatteryLow
         expr: hmbridge_device_low_battery == 1

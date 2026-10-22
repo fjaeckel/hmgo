@@ -48,6 +48,8 @@ func TestEndToEnd(t *testing.T) {
 	cfg, err := config.Parse([]byte(fmt.Sprintf(`{
 	  "central_address": "1A2B3C",
 	  "reset": "none",
+	  "state_file": "",
+	  "require_synced_clock": false,
 	  "mqtt": {"broker": "tcp://127.0.0.1:%d"},
 	  "http_listen": "127.0.0.1:%d",
 	  "devices": [

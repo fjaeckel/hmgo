@@ -33,14 +33,14 @@ func stateFromEvent(d *device, ev any) ha.State {
 		if e.Fault == heating.NoFault || e.Fault == heating.Lowbat {
 			s.LowBattery = ptr(e.Fault == heating.Lowbat)
 		}
-		setControl(&s, e.Control.String(), e.SetTemperature, int(e.BoostState), true)
+		setControl(&s, e.Control.String(), e.SetTemperature, int(e.BoostState))
 
 	case *heating.AckStatusEvent:
 		s.TargetTemperature = ptr(e.SetTemperature)
 		s.LowBattery = ptr(e.LowBattery)
 		s.Fault = e.Fault.String()
 		if e.HasControl {
-			setControl(&s, e.Control.String(), e.SetTemperature, int(e.BoostState), true)
+			setControl(&s, e.Control.String(), e.SetTemperature, int(e.BoostState))
 		}
 
 	// HM-TC-IT-WM-W-EU
@@ -51,7 +51,7 @@ func stateFromEvent(d *device, ev any) ha.State {
 		s.CommReporting = ptr(e.CommunicationReporting)
 		s.WindowOpen = ptr(e.WindowOpenReporting)
 		s.BatteryVoltage = ptr(round1(e.BatteryState))
-		setControl(&s, e.Control.String(), e.SetTemperature, int(e.BoostState), false)
+		setControl(&s, e.Control.String(), e.SetTemperature, int(e.BoostState))
 
 	case *thermal.AckStatusEvent:
 		s.TargetTemperature = ptr(e.SetTemperature)
@@ -59,7 +59,7 @@ func stateFromEvent(d *device, ev any) ha.State {
 		s.CommReporting = ptr(e.CommunicationReporting)
 		s.WindowOpen = ptr(e.WindowOpenReporting)
 		if e.HasControl {
-			setControl(&s, e.Control.String(), e.SetTemperature, int(e.BoostState), false)
+			setControl(&s, e.Control.String(), e.SetTemperature, int(e.BoostState))
 		}
 
 	case *thermal.ThermalControlEvent:
@@ -76,14 +76,16 @@ func stateFromEvent(d *device, ev any) ha.State {
 
 	// window contacts
 	case *contact.Event:
-		switch e.State {
-		case contact.Closed:
+		// eQ-3 defines the SC/SCo/SC-2 STATE as a boolean (any non-zero
+		// value is open); only the RHS distinguishes tilted (0x64).
+		switch {
+		case e.State == contact.Closed:
 			s.WindowState = ha.WindowClosed
 			s.WindowOpen = ptr(false)
-		case contact.Tilted:
+		case e.State == contact.Tilted && ha.IsThreeState(d.cfg.Model):
 			s.WindowState = ha.WindowTilted
 			s.WindowOpen = ptr(true)
-		case contact.Open:
+		default:
 			s.WindowState = ha.WindowOpened
 			s.WindowOpen = ptr(true)
 		}
@@ -95,19 +97,14 @@ func stateFromEvent(d *device, ev any) ha.State {
 	return s
 }
 
-// setControl fills the control-mode related fields.
-func setControl(s *ha.State, controlMode string, target float64, boost int, boostIsMinutes bool) {
+// setControl fills the control-mode related fields. Both thermostat
+// models report the remaining boost time in minutes.
+func setControl(s *ha.State, controlMode string, target float64, boostMinutes int) {
 	s.ControlMode = controlMode
 	if controlMode == "boost" {
-		if boostIsMinutes {
-			s.BoostMinutes = ptr(boost)
-		} else {
-			s.BoostState = ptr(boost)
-		}
-	} else if boostIsMinutes {
-		s.BoostMinutes = ptr(0)
+		s.BoostMinutes = ptr(boostMinutes)
 	} else {
-		s.BoostState = ptr(0)
+		s.BoostMinutes = ptr(0)
 	}
 	mode, preset := ha.HAMode(controlMode, target)
 	s.Mode = mode
@@ -138,7 +135,6 @@ func groupState(g *group) ha.State {
 		s.Preset = c.state.Preset
 		s.ControlMode = c.state.ControlMode
 		s.BoostMinutes = c.state.BoostMinutes
-		s.BoostState = c.state.BoostState
 	}
 
 	var anyWindowKnown, windowOpen, anyBatKnown, lowBat bool

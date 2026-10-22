@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -31,6 +32,7 @@ var (
 const testConfig = `{
   "central_address": "1A2B3C",
   "reset": "none",
+  "state_file": "",
   "security": {"passphrase": "secret", "index": 1},
   "mqtt": {"broker": ""},
   "devices": [
@@ -92,6 +94,11 @@ type env struct {
 
 func newEnv(t *testing.T, cfgJSON string, modOpts fakemod.Options) *env {
 	t.Helper()
+	return newEnvWith(t, cfgJSON, modOpts, nil)
+}
+
+func newEnvWith(t *testing.T, cfgJSON string, modOpts fakemod.Options, opt func(*Options)) *env {
+	t.Helper()
 	cfg, err := config.Parse([]byte(cfgJSON))
 	if err != nil {
 		t.Fatal(err)
@@ -107,12 +114,17 @@ func newEnv(t *testing.T, cfgJSON string, modOpts fakemod.Options) *env {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { conn.Close() })
-	b, err := New(Options{
-		Config:     cfg,
-		Radio:      conn,
-		RetryDelay: 50 * time.Millisecond,
-		Logf:       t.Logf,
-	})
+	opts := Options{
+		Config:      cfg,
+		Radio:       conn,
+		RetryDelay:  50 * time.Millisecond,
+		Logf:        t.Logf,
+		ClockSynced: func() bool { return true },
+	}
+	if opt != nil {
+		opt(&opts)
+	}
+	b, err := New(opts)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -339,7 +351,14 @@ func TestCoalescing(t *testing.T) {
 	for _, temp := range []float64{19, 20, 21, 22} {
 		e.b.Commands() <- ha.Command{Addr: "38f59c", Kind: ha.SetTemperature, Temperature: temp}
 	}
-	e.waitFor("queued", func() bool { return e.b.queue.len() == 1 })
+	// Wait until the event loop has handled all four commands: the
+	// single queued job then carries the latest temperature.
+	e.waitFor("queued", func() bool {
+		e.b.queue.mu.Lock()
+		defer e.b.queue.mu.Unlock()
+		j, ok := e.b.queue.jobs["climate:38f59c:temperature"]
+		return len(e.b.queue.order) == 1 && ok && j.temp == 22
+	})
 	release()
 	e.waitFor("two commands", func() bool { return len(e.sentClimate(rtdn)) == 2 })
 	time.Sleep(100 * time.Millisecond)
@@ -546,12 +565,12 @@ func TestPerDeviceKeyIndex(t *testing.T) {
 
 func TestRetryDoesNotOverrideNewerCommand(t *testing.T) {
 	q := newJobQueue()
-	old := job{key: "climate:x:temperature", temp: 18}
+	old := job{key: "climate:x:temperature", target: "climate:x", temp: 18}
 	old.seq = q.push(old)
 	if _, ok := q.pop(); !ok {
 		t.Fatal("pop failed")
 	}
-	newer := job{key: "climate:x:temperature", temp: 22}
+	newer := job{key: "climate:x:temperature", target: "climate:x", temp: 22}
 	q.push(newer)
 	if q.retry(old) {
 		t.Error("retry of a superseded job was accepted")
@@ -591,4 +610,186 @@ func TestLastCommandReported(t *testing.T) {
 		lc, _ := e.state("hmbridge/38f59c/state")["last_command"].(string)
 		return strings.HasPrefix(lc, "failed: boost")
 	})
+}
+
+// Opus review regression tests.
+
+func TestStaleRetryDoesNotUndoOff(t *testing.T) {
+	var mu sync.Mutex
+	failed := false
+	e := newEnv(t, testConfig, fakemod.Options{
+		OnSend: func(m []byte) (byte, []byte) {
+			mu.Lock()
+			defer mu.Unlock()
+			if len(m) > 9 && m[2] == 0x11 && m[9] == 0x86 && !failed {
+				failed = true
+				return fakemod.AckEUnknown, nil // first set_temperature unanswered
+			}
+			return fakemod.DefaultOnSend(m)
+		},
+	})
+	e.b.Commands() <- ha.Command{Addr: "38f59c", Kind: ha.SetTemperature, Temperature: 22}
+	e.waitFor("failed attempt", func() bool { return len(e.sentClimate(rtdn)) == 1 })
+	e.b.Commands() <- ha.Command{Addr: "38f59c", Kind: ha.SetMode, Mode: ha.ModeOff}
+	e.waitFor("off sent", func() bool { return len(e.sentClimate(rtdn)) == 2 })
+	time.Sleep(300 * time.Millisecond) // > RetryDelay
+	sent := e.sentClimate(rtdn)
+	if len(sent) != 2 {
+		t.Fatalf("sent %d commands, want 2: the retry of 22 °C must be superseded by off", len(sent))
+	}
+	if sent[1][9] != 0x81 || sent[1][11] != 9 {
+		t.Errorf("last command = %x, want manual 4.5 (off)", sent[1][9:])
+	}
+}
+
+func TestLastCommandRunsLast(t *testing.T) {
+	q := newJobQueue()
+	q.push(job{key: "climate:x:temperature", target: "climate:x", temp: 22})
+	q.push(job{key: "climate:x:mode", target: "climate:x", action: actionManual, temp: 4.5})
+	q.push(job{key: "climate:x:temperature", target: "climate:x", temp: 23})
+	first, _ := q.pop()
+	second, _ := q.pop()
+	if first.key != "climate:x:mode" || second.temp != 23 {
+		t.Errorf("order = %s, %s(%v); want mode first, then the newest temperature", first.key, second.key, second.temp)
+	}
+}
+
+func TestLeaveBoostRestoresOff(t *testing.T) {
+	e := newEnv(t, testConfig, fakemod.Options{})
+	e.b.Commands() <- ha.Command{Addr: "38f59c", Kind: ha.SetMode, Mode: ha.ModeOff}
+	e.waitFor("off", func() bool { return e.state("hmbridge/38f59c/state")["mode"] == "off" })
+	e.b.Commands() <- ha.Command{Addr: "38f59c", Kind: ha.SetPreset, Preset: ha.PresetBoost}
+	e.waitFor("boost", func() bool { return e.state("hmbridge/38f59c/state")["preset"] == "boost" })
+	e.b.Commands() <- ha.Command{Addr: "38f59c", Kind: ha.SetPreset, Preset: ha.PresetNone}
+	e.waitFor("three commands", func() bool { return len(e.sentClimate(rtdn)) == 3 })
+	if m := e.sentClimate(rtdn)[2]; m[9] != 0x81 || m[11] != 9 {
+		t.Errorf("leaving boost sent %x, want manual 4.5 (back to off)", m[9:])
+	}
+	// preset none while not boosting sends nothing.
+	e.b.Commands() <- ha.Command{Addr: "38f59c", Kind: ha.SetPreset, Preset: ha.PresetNone}
+	e.b.Commands() <- ha.Command{Addr: "38f59c", Kind: ha.SetTemperature, Temperature: 20}
+	e.waitFor("set temperature", func() bool { return len(e.sentClimate(rtdn)) >= 4 })
+	if m := e.sentClimate(rtdn)[3]; m[9] != 0x86 {
+		t.Errorf("preset none outside boost sent %x", m[9:])
+	}
+}
+
+func TestAESDeviceIgnoresUnauthenticatedForeignFrames(t *testing.T) {
+	cfg := strings.Replace(testConfig, `"address": "4C5D6E"}`, `"address": "4C5D6E", "aes": true}`, 1)
+	e := newEnv(t, cfg, fakemod.Options{})
+	// A forged "open" EVENT broadcast (not challenged by the module).
+	e.inject(0x11, msg(0x07, 0x84, 0x41, sco, [3]byte{}, 0x01, 0x1c, 0xc8))
+	// Authenticated "closed" to the central is applied.
+	e.inject(0x12, msg(0x08, 0x84, 0x41, sco, central, 0x01, 0x1d, 0x00))
+	e.waitFor("closed", func() bool { return e.state("hmbridge/4c5d6e/state")["window_state"] == "closed" })
+	// The broadcast was processed first; if it had been applied, the
+	// message counter would be 2.
+	if n := e.state("hmbridge/4c5d6e/state")["messages_received"]; n != 1.0 {
+		t.Errorf("messages_received = %v, want 1 (the forged broadcast must be ignored)", n)
+	}
+}
+
+func TestContactNonStandardOpenValue(t *testing.T) {
+	e := newEnv(t, testConfig, fakemod.Options{})
+	e.inject(0x11, msg(0x07, 0x84, 0x41, sco, central, 0x01, 0x1c, 0x01))
+	e.waitFor("open", func() bool {
+		st := e.state("hmbridge/4c5d6e/state")
+		return st["window_open"] == true && st["window_state"] == "open"
+	})
+}
+
+func TestTimeRequestJumpsQueueAndNeedsSyncedClock(t *testing.T) {
+	block := make(chan struct{})
+	var once sync.Once
+	synced := false
+	var mu sync.Mutex
+	cfg, err := config.Parse([]byte(testConfig))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = cfg
+	e := newEnvWith(t, testConfig, fakemod.Options{
+		OnSend: func(m []byte) (byte, []byte) {
+			if len(m) > 2 && m[2] == 0x11 {
+				once.Do(func() { <-block })
+			}
+			return fakemod.DefaultOnSend(m)
+		},
+	}, func(o *Options) {
+		o.ClockSynced = func() bool { mu.Lock(); defer mu.Unlock(); return synced }
+	})
+	defer func() { close(block) }()
+
+	// Clock not synced: no answer.
+	e.inject(0x01, msg(0x41, 0xa6, 0x3f, tc, central))
+	e.inject(0x01, msg(0x05, 0xa6, 0x10, rtdn2, central, 0x0a, 0xb0, 0xe2, 0x08, 0x00, 0x00))
+	e.waitFor("later frame", func() bool { return e.state("hmbridge/38f5a1/state")["current_temperature"] != nil })
+
+	mu.Lock()
+	synced = true
+	mu.Unlock()
+	// Occupy the worker with a command and queue another one; the
+	// time response must go before the queued command.
+	e.b.Commands() <- ha.Command{Addr: "38f59c", Kind: ha.SetTemperature, Temperature: 21}
+	e.waitFor("worker busy", func() bool { return len(e.sentClimate(rtdn)) == 1 })
+	e.b.Commands() <- ha.Command{Addr: "38f5a1", Kind: ha.SetTemperature, Temperature: 21}
+	e.inject(0x01, msg(0x42, 0xa6, 0x3f, tc, central))
+	e.waitFor("queued", func() bool { return e.b.queue.len() == 2 })
+	j, _ := e.b.queue.pop()
+	if j.kind != jobTimeResponse || j.reqNo != 0x42 {
+		t.Errorf("first queued job = %+v, want the time response to request 42", j)
+	}
+	for _, m := range e.mod.Sent() {
+		if m[2] == 0x3f && m[0] == 0x41 {
+			t.Errorf("answered a time request while the clock was not synchronised")
+		}
+	}
+}
+
+func TestStatePersistedAndRestored(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	cfg := strings.Replace(testConfig, `"state_file": "",`, `"state_file": "`+path+`",`, 1)
+	e := newEnv(t, cfg, fakemod.Options{})
+	e.inject(0x11, msg(0x07, 0x84, 0x41, sco, central, 0x01, 0x1c, 0xc8))
+	e.inject(0x01, msg(0x05, 0xa6, 0x10, rtdn, central, 0x0a, 0xb0, 0xe2, 0x08, 0x25, 0x00))
+	e.waitFor("state", func() bool { return e.state("hmbridge/38f59c/state")["current_temperature"] != nil })
+	if err := e.b.saveState(path); err != nil {
+		t.Fatal(err)
+	}
+
+	// A new bridge starts from the saved state and publishes it at once;
+	// a device without saved state gets no (empty) state message.
+	e2 := newEnv(t, cfg, fakemod.Options{})
+	e2.waitFor("restored contact", func() bool { return e2.state("hmbridge/4c5d6e/state")["window_open"] == true })
+	e2.waitFor("restored thermostat", func() bool { return e2.state("hmbridge/38f59c/state")["valve_position"] == 37.0 })
+	e2.waitFor("group window", func() bool { return e2.state("hmbridge/group/wohnzimmer/state")["window_open"] == true })
+	if b := e2.pub.get("hmbridge/2a1b3c/state"); b != nil {
+		t.Errorf("published state for a device never heard: %s", b)
+	}
+	if st := e2.state("hmbridge/38f59c/state"); st["messages_received"] != nil {
+		t.Errorf("message counter restored: %v", st["messages_received"])
+	}
+}
+
+func TestDeviceAvailability(t *testing.T) {
+	var mu sync.Mutex
+	now := time.Date(2026, 10, 22, 8, 0, 0, 0, time.UTC)
+	clock := func() time.Time { mu.Lock(); defer mu.Unlock(); return now }
+	advance := func(d time.Duration) { mu.Lock(); now = now.Add(d); mu.Unlock() }
+	e := newEnvWith(t, testConfig, fakemod.Options{}, func(o *Options) {
+		o.Now = clock
+		o.HousekeepingInterval = 20 * time.Millisecond
+	})
+	avail := func(addr string) string { return string(e.pub.get("hmbridge/" + addr + "/availability")) }
+	e.waitFor("initially online", func() bool { return avail("38f59c") == "online" && avail("4c5d6e") == "online" })
+
+	e.inject(0x01, msg(0x05, 0xa6, 0x10, rtdn, central, 0x0a, 0xb0, 0xe2, 0x08, 0x25, 0x00))
+	e.waitFor("state", func() bool { return e.state("hmbridge/38f59c/state")["current_temperature"] != nil })
+	advance(31 * time.Minute)
+	e.waitFor("thermostats offline", func() bool { return avail("38f59c") == "offline" && avail("2a1b3c") == "offline" })
+	if avail("4c5d6e") != "online" {
+		t.Errorf("contact offline after 31 minutes; its timeout is 6h")
+	}
+	e.inject(0x01, msg(0x06, 0xa6, 0x10, rtdn, central, 0x0a, 0xb0, 0xe2, 0x08, 0x25, 0x00))
+	e.waitFor("back online", func() bool { return avail("38f59c") == "online" })
 }
