@@ -14,19 +14,20 @@ package bridge
 //     blocking radio handling), only when something significant changed
 //     (mode, target, window, battery, fault — not every temperature or
 //     RSSI report), at most every state_save_interval (default 15m),
-//     and once on a clean shutdown.
+//     and once on a clean shutdown. The file lives in state_dir and is
+//     handled by package store (atomic writes, no write if the content
+//     is unchanged, quarantine of a damaged file).
 
 import (
 	"encoding/json"
 	"fmt"
-	"os"
-	"path/filepath"
 	"slices"
 	"time"
 
 	"golang.org/x/sys/unix"
 
 	"github.com/fjaeckel/hmgo/internal/ha"
+	"github.com/fjaeckel/hmgo/internal/store"
 )
 
 // persistedDevice is the on-disk form of a device's state.
@@ -37,9 +38,11 @@ type persistedDevice struct {
 	LastOnLevel    float64  `json:"last_on_level,omitempty"`
 }
 
+// persistedState is the content of state.json. It deliberately has no
+// "saved at" time stamp, so that saving an unchanged state writes
+// nothing (the file's modification time tells when it was written).
 type persistedState struct {
 	Version int                        `json:"version"`
-	Saved   time.Time                  `json:"saved"`
 	Devices map[string]persistedDevice `json:"devices"` // by lowercase address
 }
 
@@ -107,18 +110,13 @@ func sanitizeActuatorState(st *ha.State) {
 }
 
 // loadState restores the last known device state from the state file. A
-// missing file is not an error.
-func (b *Bridge) loadState(path string) error {
-	data, err := os.ReadFile(path)
-	if os.IsNotExist(err) {
-		return nil
-	}
-	if err != nil {
-		return err
-	}
+// missing file is not an error; a damaged one is moved aside by the
+// store and reported.
+func (b *Bridge) loadState(f *store.File) error {
 	var ps persistedState
-	if err := json.Unmarshal(data, &ps); err != nil {
-		return fmt.Errorf("%s: %v (ignoring it)", path, err)
+	found, err := f.Load(&ps)
+	if err != nil || !found {
+		return err
 	}
 	n := 0
 	for _, d := range b.devices {
@@ -135,7 +133,7 @@ func (b *Bridge) loadState(path string) error {
 	for _, g := range b.groups {
 		g.state = groupState(g)
 	}
-	b.logf("restored the last known state of %d devices from %s (saved %v)", n, path, ps.Saved.Format(time.RFC3339))
+	b.logf("restored the last known state of %d devices from %s (saved %v)", n, f.Path(), f.ModTime().Format(time.RFC3339))
 	return nil
 }
 
@@ -208,12 +206,12 @@ func significantKey(d *device) string {
 		bl(st.On), f(st.Level), st.LEDs, d.lastOnLevel)
 }
 
-// saveState writes the current device state to path atomically. Caller
-// must not hold b.mu. On failure the state stays dirty, so the next
-// attempt writes it.
-func (b *Bridge) saveState(path string) error {
+// saveState writes the current device state to f (atomically, and only
+// if it differs from the file's content). Caller must not hold b.mu. On
+// failure the state stays dirty, so the next attempt writes it.
+func (b *Bridge) saveState(f *store.File) error {
 	b.mu.Lock()
-	ps := persistedState{Version: 1, Saved: b.now(), Devices: make(map[string]persistedDevice)}
+	ps := persistedState{Version: store.StateVersion, Devices: make(map[string]persistedDevice)}
 	for _, d := range b.devices {
 		if d.state.LastSeen.IsZero() {
 			continue
@@ -225,41 +223,13 @@ func (b *Bridge) saveState(path string) error {
 	b.stateDirty, b.significantDirty = false, false
 	b.mu.Unlock()
 
-	err := writeFileAtomic(path, ps)
+	_, err := f.Save(ps)
 	if err != nil {
 		b.mu.Lock()
 		b.stateDirty, b.significantDirty = true, true
 		b.mu.Unlock()
 	}
 	return err
-}
-
-func writeFileAtomic(path string, v any) error {
-	data, err := json.Marshal(v) // compact: fewer bytes written
-	if err != nil {
-		return err
-	}
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return err
-	}
-	tmp, err := os.CreateTemp(dir, ".state-*.json")
-	if err != nil {
-		return err
-	}
-	defer os.Remove(tmp.Name())
-	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Sync(); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tmp.Name(), path)
 }
 
 // saver writes the state file whenever the event loop asks for it, so
@@ -275,13 +245,13 @@ func (b *Bridge) saver(stop <-chan struct{}) {
 		}
 		if err := b.saveState(b.stateFile); err != nil {
 			if !failing {
-				b.logf("saving state to %s: %v (will retry; set state_file to a writable path or \"\" to disable)", b.stateFile, err)
+				b.logf("saving state to %s: %v (will retry; set state_dir to a writable directory or \"\" to disable)", b.stateFile.Path(), err)
 				failing = true
 			}
 			continue
 		}
 		if failing {
-			b.logf("saving state to %s works again", b.stateFile)
+			b.logf("saving state to %s works again", b.stateFile.Path())
 			failing = false
 		}
 	}
@@ -291,7 +261,7 @@ func (b *Bridge) saver(stop <-chan struct{}) {
 // significant changed and the save interval has passed. Runs on the
 // event loop.
 func (b *Bridge) requestSave(now time.Time) {
-	if b.stateFile == "" {
+	if b.stateFile == nil {
 		return
 	}
 	b.mu.Lock()

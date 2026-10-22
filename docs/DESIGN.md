@@ -59,7 +59,7 @@ Package ownership (one owner per package while building in parallel):
 | `internal/hm/...` | device models: event decoders (existing) + command encoders |
 | `internal/hm/devices` | model name → device model, shared by hmbridge and hmsniff |
 | `internal/hm/pairing` | pairing protocol: model ID table, DEVICE_INFO, CONFIG_* encoders |
-| `internal/devstore` | the devices file (devices paired with hmbridge) |
+| `internal/store` | persistence: the state directory with `state.json` and `devices.json` |
 | `internal/ha` | HA discovery payloads, state/command topics, MQTT client |
 | `internal/bridge` | glue: registry, event loop, command handling, status page |
 | `cmd/hmbridge` | main: flags, serial setup, GPIO reset, signal handling |
@@ -264,7 +264,8 @@ Robustness:
   separate goroutine writes it only after significant changes (mode, target,
   window, battery, fault; not temperature/valve/RSSI reports), at most every
   `state_save_interval` (15m), and on shutdown. An empty state is never
-  published. A restored boost that has expired is dropped.
+  published. A restored boost that has expired is dropped. The file is
+  `state.json` in the state directory (see **Persistence** below).
 * **availability** is measured from the device's last message, also across
   restarts, so a device that died before a restart is unavailable at once;
   groups are available while any of their thermostats is.
@@ -385,12 +386,49 @@ config-only devices (contacts, buttons, remotes, weather sensors) when their
 next DEVICE_INFO arrives within the pairing duration. Homegear's factory
 reset (`11 04 00`) is not used.
 
-**Devices file** (`internal/devstore`): JSON, written atomically (temp
-file, fsync, rename, directory fsync) only on pair/unpair/rename. Read in
-`bridge.New` after config.json's devices; an address or name conflict is
-resolved in favour of config.json and logged. Store devices may use key
-index 0 (`config.ResolveStoreDevice`). Renaming replaces the device entry
-(jobs of the old entry are applied to the new one by address).
+**Devices file** (`devices.json`, see **Persistence**): written only on
+pair/unpair/rename, synchronously but outside `b.mu` (a snapshot is taken
+under the lock; a sequence number keeps an older snapshot from being written
+after a newer one). Read in `bridge.New` after config.json's devices; an
+address or name conflict is resolved in favour of config.json and logged.
+Store devices may use key index 0 (`config.ResolveStoreDevice`); a record
+that does not resolve (e.g. its key index is no longer configured) is
+logged, shown on the status page and written back unchanged, so fixing the
+configuration brings it back. Renaming replaces the device entry (jobs of
+the old entry are applied to the new one by address).
+
+**Persistence** (`internal/store`). Everything hmbridge writes lives in
+one directory, `state_dir` (default `/var/lib/hmbridge`, absolute, `""`
+disables all files and pairing): `state.json` (device state fallback,
+compact) and `devices.json` (paired devices, indented). Further data
+(e.g. HmIP keys) becomes another file via `Store.File(FileSpec)`. Shared
+rules for every file:
+
+* atomic write: temporary file in the same directory, fsync, rename,
+  fsync of the directory; files 0600, the directory 0700 (created on the
+  first write);
+* no write if the bytes are unchanged (`state.json` has no "saved at"
+  stamp for that reason; its mtime is logged instead);
+* symbolic links at a file's path are never followed (Lstat +
+  `O_NOFOLLOW`), neither for reading nor writing;
+* envelope: a JSON object with `"version"`; an older version goes through
+  `FileSpec.Migrate`;
+* a damaged or unreadable file is renamed to `<name>.corrupt-<UTC time>`
+  (the newest three are kept) before anything can overwrite it, logged,
+  and hmbridge continues without the data (never blocks startup); a
+  damaged devices file is also shown on the status page;
+* a file with a newer version (after a downgrade), a symlink, or a damaged
+  file that cannot be moved aside is left alone and *blocks* writes
+  (`File.Blocked`): for `devices.json` this disables pairing, unpairing
+  and renaming, with the reason on the status page.
+
+Compatibility: the deprecated `state_file` and `devices_file` (logged at
+startup) still name exact paths (`""` disables that file); `state_dir`
+applies to files they don't name. On the first start with a `state_dir`
+other than the old default, `/var/lib/hmbridge/state.json` and
+`devices.json` are copied into it if the new file does not exist yet (the
+old files stay, and the copy is logged). The broker's retained messages
+remain the primary source of state after a restart (`SeedFromRetained`).
 
 **AES key exchange** (`bidcosaes.KeyExchangePayloads`): two messages, cmd
 0x04, each `AES-ECB(old key, 01 idx·2+half key[8] rnd(2) 7E296FA5)`

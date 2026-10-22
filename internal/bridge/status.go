@@ -148,7 +148,8 @@ th{background:#eee}.warn{color:#b00;font-weight:600}.muted{color:#888}
 <span class="muted">then press the config button of the device within the pairing time</span></form>
 {{if .LastResult}}<p>Last result ({{ago .LastResultAt}}): {{.LastResult}}</p>{{end}}
 {{range .UnpairWaiting}}<p class="warn">Press the config button of {{.}} to finish its unpairing.</p>{{end}}
-{{else}}<p class="muted">Pairing is disabled (devices_file is "").</p>{{end}}{{end}}
+{{else}}<p class="muted">Pairing is disabled ({{.DisabledReason}}).</p>{{end}}
+{{range .Warnings}}<p class="warn">{{.}}</p>{{end}}{{end}}
 
 <h2>Devices</h2>
 <div class="wrap"><table>

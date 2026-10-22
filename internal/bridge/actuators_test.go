@@ -17,6 +17,7 @@ import (
 
 	"github.com/fjaeckel/hmgo/internal/config"
 	"github.com/fjaeckel/hmgo/internal/ha"
+	"github.com/fjaeckel/hmgo/internal/store"
 	"github.com/fjaeckel/hmgo/internal/uartgw/fakemod"
 )
 
@@ -481,7 +482,7 @@ func TestRestoredActuatorStateSanitized(t *testing.T) {
 		t.Fatal(err)
 	}
 	b = newB()
-	if err := b.loadState(path); err != nil {
+	if err := b.loadState(store.Open(store.Options{StatePath: &path}).State()); err != nil {
 		t.Fatal(err)
 	}
 	if d := b.byAddr[dim]; d.state.Level != nil || d.lastOnLevel != 0 {

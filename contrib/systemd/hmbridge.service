@@ -20,9 +20,10 @@ ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
 ReadOnlyPaths=/etc/hmbridge
-# Last known device state (state_file), so a restart does not blank Home
-# Assistant until every device has reported again.
+# state_dir (default /var/lib/hmbridge): the paired devices and the last
+# known device state. systemd creates it, owned by hmbridge and private.
 StateDirectory=hmbridge
+StateDirectoryMode=0700
 
 [Install]
 WantedBy=multi-user.target

@@ -39,7 +39,7 @@ const (
 	PairingIdle        = "idle"
 	PairingActive      = "active"      // waiting for a device's config button
 	PairingConfiguring = "configuring" // configuring a device that announced itself
-	PairingDisabled    = "disabled"    // no devices_file
+	PairingDisabled    = "disabled"    // no state_dir (nowhere to keep paired devices)
 )
 
 // PairingState is the state of pairing mode.

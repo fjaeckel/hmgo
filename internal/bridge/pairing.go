@@ -40,6 +40,7 @@ package bridge
 import (
 	"context"
 	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"strings"
@@ -50,18 +51,26 @@ import (
 	"github.com/fjaeckel/hmgo/internal/bidcos"
 	bidcosaes "github.com/fjaeckel/hmgo/internal/bidcos/aes"
 	"github.com/fjaeckel/hmgo/internal/config"
-	"github.com/fjaeckel/hmgo/internal/devstore"
 	"github.com/fjaeckel/hmgo/internal/ha"
 	"github.com/fjaeckel/hmgo/internal/hm"
 	"github.com/fjaeckel/hmgo/internal/hm/pairing"
 	"github.com/fjaeckel/hmgo/internal/hmkey"
+	"github.com/fjaeckel/hmgo/internal/store"
 	"github.com/fjaeckel/hmgo/internal/uartgw"
 )
 
 // pairingMode is the pairing state. Written on the event loop under
 // b.mu, read under b.mu.
 type pairingMode struct {
-	enabled  bool
+	enabled bool
+	// disabledReason says why pairing is off (when !enabled).
+	disabledReason string
+	// warnings are problems with the devices file, for the status page.
+	warnings []string
+	// kept are devices file records that could not be used (e.g. their
+	// key index is no longer configured). They are written back
+	// unchanged, so that fixing the configuration brings them back.
+	kept     []store.Device
 	aes      string        // config.PairingAES*
 	duration time.Duration // default duration of pairing mode
 
@@ -88,6 +97,9 @@ type unpairWaiting struct {
 
 func (p *pairingMode) init(cfg *config.Config, override time.Duration, enabled bool) {
 	p.enabled = enabled
+	if !enabled {
+		p.disabledReason = `state_dir is ""`
+	}
 	p.aes = cfg.PairingAES()
 	p.duration = cfg.PairingDuration()
 	if override > 0 {
@@ -105,6 +117,10 @@ type PairingSnapshot struct {
 	Remaining    int       `json:"remaining_seconds"`
 	LastResult   string    `json:"last_result,omitempty"`
 	LastResultAt time.Time `json:"last_result_at,omitempty"`
+	// DisabledReason says why pairing is disabled.
+	DisabledReason string `json:"disabled_reason,omitempty"`
+	// Warnings are problems with the devices file.
+	Warnings []string `json:"warnings,omitempty"`
 	// UnpairWaiting lists devices whose config button must be pressed
 	// to complete their unpairing.
 	UnpairWaiting []string `json:"unpair_waiting,omitempty"`
@@ -141,6 +157,7 @@ func (b *Bridge) pairingSnapshotLocked(now time.Time) PairingSnapshot {
 	s := PairingSnapshot{
 		Enabled: b.pair.enabled, AES: b.pair.aes, Status: st.Status, Remaining: st.Remaining,
 		LastResult: st.LastResult, LastResultAt: st.LastResultAt,
+		DisabledReason: b.pair.disabledReason, Warnings: append([]string(nil), b.pair.warnings...),
 	}
 	for a, w := range b.pair.unpairWait {
 		s.UnpairWaiting = append(s.UnpairWaiting, fmt.Sprintf("%s (%x, %d s)", w.job.name, a[:], remainingSeconds(w.until, now)))
@@ -172,7 +189,7 @@ func (b *Bridge) startPairing(d time.Duration) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if !b.pair.enabled {
-		b.setResultLocked("pairing is disabled (devices_file is \"\")")
+		b.setResultLocked(fmt.Sprintf("pairing is disabled (%s)", b.pair.disabledReason))
 		metricPairing.WithLabelValues("disabled").Inc()
 		b.publishPairingLocked(b.now())
 		return
@@ -428,6 +445,21 @@ func (b *Bridge) removePeer(ctx context.Context, addr [3]byte) {
 func (b *Bridge) handlePairResult(p *pairJob, ev any, err error) {
 	now := b.now()
 	addr := fmt.Sprintf("%x", p.addr[:])
+	// The devices file is written after b.mu is released (deferred
+	// before the unlock, so it runs after it).
+	var save func() error
+	var savedMsg string
+	defer func() {
+		if save == nil {
+			return
+		}
+		if err := save(); err != nil {
+			b.mu.Lock()
+			b.setResultLocked(fmt.Sprintf("%s; WARNING: saving %s failed (%v), the device is lost on restart", savedMsg, b.store.DevicesPath(), err))
+			b.publishPairingLocked(b.now())
+			b.mu.Unlock()
+		}
+	}()
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.pair.busy = false
@@ -474,7 +506,7 @@ func (b *Bridge) handlePairResult(p *pairJob, ev any, err error) {
 		b.setResultLocked(fmt.Sprintf("pairing %s: %v", addr, err))
 		return
 	}
-	rec := devstore.FromConfig(rc, p.info.FirmwareString(), fmt.Sprintf("%04X", p.info.ModelID), now)
+	rec := store.DeviceFromConfig(rc, p.info.FirmwareString(), fmt.Sprintf("%04X", p.info.ModelID), now)
 	d, err := b.newDevice(rc, &rec)
 	if err != nil {
 		metricPairing.WithLabelValues("failed").Inc()
@@ -500,15 +532,14 @@ func (b *Bridge) handlePairResult(p *pairJob, ev any, err error) {
 		msg += fmt.Sprintf(", key index %d", out.keyIndex)
 	}
 	msg += ")"
-	if err := b.saveStoreLocked(); err != nil {
-		msg += fmt.Sprintf("; WARNING: saving %s failed (%v), the device is lost on restart", b.devicesFile, err)
-	}
+	save = b.devicesSaverLocked()
 	if len(out.notes) > 0 {
 		msg += "; " + strings.Join(out.notes, "; ")
 		metricPairing.WithLabelValues("paired_with_warnings").Inc()
 	} else {
 		metricPairing.WithLabelValues("paired").Inc()
 	}
+	savedMsg = msg
 	b.setResultLocked(msg)
 	b.publishNewDeviceLocked(d)
 	if isActuatorKind(d.desc.Kind) {
@@ -573,6 +604,8 @@ type unpairJob struct {
 // unpairDevice handles the “Unpair” command (event loop).
 func (b *Bridge) unpairDevice(addrHex string) {
 	now := b.now()
+	var save func() error
+	defer b.runDevicesSaver(&save) // after the unlock
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	defer b.publishPairingLocked(now)
@@ -597,9 +630,7 @@ func (b *Bridge) unpairDevice(addrHex string) {
 		model = pairing.Model{Name: d.cfg.Model, RX: pairing.ConfigOnly}
 	}
 	b.removeDeviceLocked(d)
-	if err := b.saveStoreLocked(); err != nil {
-		b.logf("saving %s: %v", b.devicesFile, err)
-	}
+	save = b.devicesSaverLocked()
 	j := unpairJob{addr: d.cfg.Addr(), name: d.cfg.Name, model: model}
 	if model.RX == pairing.ConfigOnly {
 		b.pair.unpairWait[j.addr] = unpairWaiting{until: now.Add(b.pair.duration), job: j}
@@ -672,6 +703,8 @@ func (b *Bridge) handleUnpairResult(u *unpairJob, err error) {
 // loop). The device entry is replaced (jobs of the old one are applied
 // to the new one, see handleResult).
 func (b *Bridge) renameDevice(addrHex, name string) {
+	var save func() error
+	defer b.runDevicesSaver(&save) // after the unlock
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	var d *device
@@ -716,17 +749,35 @@ func (b *Bridge) renameDevice(addrHex, name string) {
 	deleteDeviceMetrics(addrHex)
 	b.updateMetrics(nd)
 	b.logf("renamed %s (%s) to %s", d.cfg.Name, addrHex, name)
-	if err := b.saveStoreLocked(); err != nil {
-		b.logf("saving %s: %v", b.devicesFile, err)
-	}
+	save = b.devicesSaverLocked()
 	b.publishNewDeviceLocked(nd)
 }
 
-// loadStore adds the devices of the devices file (New).
-func (b *Bridge) loadStore() error {
-	recs, err := devstore.Load(b.devicesFile)
+// loadStore adds the devices of the devices file (New). A file that
+// cannot be read never leads to losing the paired devices: a damaged
+// one has been moved aside by the store (a copy is kept), and one that
+// must not be written (newer format version, symbolic link) disables
+// pairing, unpairing and renaming. Both are shown on the status page.
+func (b *Bridge) loadStore() {
+	recs, err := b.store.LoadDevices()
 	if err != nil {
-		return err
+		var ce *store.CorruptError
+		switch {
+		case b.store.DevicesBlocked() != nil:
+			b.pair.enabled = false
+			b.pair.disabledReason = fmt.Sprintf("the devices file cannot be used: %v", err)
+			b.pair.warnings = append(b.pair.warnings, b.pair.disabledReason)
+			b.logf("ERROR: paired devices not loaded, pairing disabled: %v", err)
+		case errors.As(err, &ce):
+			w := fmt.Sprintf("the devices file was damaged and paired devices were not loaded: %v; repair the moved file and copy it back while hmbridge is stopped", err)
+			b.pair.warnings = append(b.pair.warnings, w)
+			b.logf("ERROR: %s", w)
+		default:
+			w := fmt.Sprintf("paired devices not loaded: %v", err)
+			b.pair.warnings = append(b.pair.warnings, w)
+			b.logf("ERROR: %s", w)
+		}
+		return
 	}
 	n := 0
 	for i := range recs {
@@ -734,7 +785,10 @@ func (b *Bridge) loadStore() error {
 		dc := rec.Config()
 		rc, err := b.cfg.ResolveStoreDevice(dc)
 		if err != nil {
-			b.logf("devices file %s: ignoring %v", b.devicesFile, err)
+			w := fmt.Sprintf("devices file: not using %s (%s): %v; it stays in the file until the configuration is fixed", rec.Name, rec.Address, err)
+			b.logf("WARNING: %s", w)
+			b.pair.warnings = append(b.pair.warnings, w)
+			b.pair.kept = append(b.pair.kept, rec)
 			continue
 		}
 		if c := b.cfg.Device(rc.Addr()); c != nil {
@@ -762,25 +816,56 @@ func (b *Bridge) loadStore() error {
 	}
 	metricPairedDevices.Set(float64(n))
 	if n > 0 {
-		b.logf("loaded %d paired devices from %s", n, b.devicesFile)
+		b.logf("loaded %d paired devices from %s", n, b.store.DevicesPath())
 	}
-	return nil
 }
 
-// saveStoreLocked writes the devices file. Caller holds b.mu. It is
-// only called when a device is paired, unpaired or renamed.
-func (b *Bridge) saveStoreLocked() error {
-	var recs []devstore.Device
+// devicesSaverLocked snapshots the paired devices and returns the
+// function that writes them to the devices file. Caller holds b.mu; the
+// returned function must be called without it (the write fsyncs, which
+// may be slow on an SD card). It is only called when a device is
+// paired, unpaired or renamed. Successive snapshots are written in
+// order: an older one is never written after a newer one.
+func (b *Bridge) devicesSaverLocked() func() error {
+	var recs []store.Device
 	for _, d := range b.devices {
 		if d.stored != nil {
 			recs = append(recs, *d.stored)
 		}
 	}
 	metricPairedDevices.Set(float64(len(recs)))
-	if b.devicesFile == "" {
-		return errors.New("no devices_file configured")
+	// Records that could not be used are kept, unless their address
+	// has been paired again since.
+	for _, k := range b.pair.kept {
+		if a, err := hex.DecodeString(k.Address); err == nil && len(a) == 3 {
+			if _, taken := b.byAddr[[3]byte(a)]; taken {
+				continue
+			}
+		}
+		recs = append(recs, k)
 	}
-	return devstore.Save(b.devicesFile, recs)
+	b.devicesSeq++
+	seq := b.devicesSeq
+	return func() error {
+		b.devicesMu.Lock()
+		defer b.devicesMu.Unlock()
+		if seq < b.devicesWritten {
+			return nil // a newer snapshot has been written already
+		}
+		b.devicesWritten = seq
+		return b.store.SaveDevices(recs)
+	}
+}
+
+// runDevicesSaver calls *save (if set) and logs a failure. Deferred
+// before b.mu is locked, so that it runs after the unlock.
+func (b *Bridge) runDevicesSaver(save *func() error) {
+	if *save == nil {
+		return
+	}
+	if err := (*save)(); err != nil {
+		b.logf("saving %s: %v", b.store.DevicesPath(), err)
+	}
 }
 
 // deviceMetricVecs are the metrics with an "address" label.

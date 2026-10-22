@@ -9,14 +9,16 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/fjaeckel/hmgo/internal/devstore"
 	"github.com/fjaeckel/hmgo/internal/ha"
 	"github.com/fjaeckel/hmgo/internal/hm/pairing"
+	"github.com/fjaeckel/hmgo/internal/store"
 	"github.com/fjaeckel/hmgo/internal/uartgw/fakemod"
 )
 
@@ -25,18 +27,40 @@ var (
 	newPlug = [3]byte{0x6a, 0x9d, 0x15}
 )
 
-func pairingConfig(devicesFile string) string {
+// pairingConfig keeps paired devices (and the state file) in stateDir
+// ("" disables pairing).
+func pairingConfig(stateDir string) string {
 	return fmt.Sprintf(`{
   "central_address": "1A2B3C",
   "reset": "none",
-  "state_file": "",
-  "devices_file": %q,
+  "state_dir": %q,
   "security": {"passphrase": "secret", "index": 2},
   "mqtt": {"broker": ""},
   "devices": [
     {"name": "Wohnzimmer Fenster", "model": "HM-Sec-SCo", "address": "4C5D6E", "serial": "NEQ0000001", "aes": true}
   ]
-}`, devicesFile)
+}`, stateDir)
+}
+
+// loadDevices and saveDevices access the devices file at path.
+func loadDevices(path string) ([]store.Device, error) {
+	return store.Open(store.Options{DevicesPath: &path}).LoadDevices()
+}
+
+func saveDevices(path string, devs []store.Device) error {
+	return store.Open(store.Options{DevicesPath: &path}).SaveDevices(devs)
+}
+
+// waitDevices waits until the devices file at path satisfies ok.
+func (e *env) waitDevices(path, what string, ok func([]store.Device) bool) []store.Device {
+	e.t.Helper()
+	var devs []store.Device
+	e.waitFor(what, func() bool {
+		var err error
+		devs, err = loadDevices(path)
+		return err == nil && ok(devs)
+	})
+	return devs
 }
 
 func deviceInfo(addr [3]byte, dst [3]byte, modelID uint16, serial string) []byte {
@@ -77,7 +101,7 @@ func fastPairing(o *Options) {
 
 func TestPairNewContact(t *testing.T) {
 	file := filepath.Join(t.TempDir(), "devices.json")
-	e := newEnvWith(t, pairingConfig(file), fakemod.Options{}, fastPairing)
+	e := newEnvWith(t, pairingConfig(filepath.Dir(file)), fakemod.Options{}, fastPairing)
 	e.waitFor("bridge discovery", func() bool {
 		return e.state("homeassistant/button/hmbridge_bridge/pair/config")["command_topic"] == "hmbridge/bridge/set/pair"
 	})
@@ -117,10 +141,8 @@ func TestPairNewContact(t *testing.T) {
 	if !ok || peer.KeyIndex != 2 || fmt.Sprint(peer.AESChannels(2)) != "[1]" {
 		t.Errorf("module peer %+v (ok %v)", peer, ok)
 	}
-	devs, err := devstore.Load(file)
-	if err != nil || len(devs) != 1 {
-		t.Fatalf("devices file: %v %v", devs, err)
-	}
+	// The file is written right after the result (outside the lock).
+	devs := e.waitDevices(file, "devices file", func(d []store.Device) bool { return len(d) == 1 })
 	if d := devs[0]; d.Address != "4C5D70" || d.Model != "HM-Sec-SCo" || d.Serial != "NEQ0000002" || d.KeyIndex != 2 ||
 		fmt.Sprint(d.AESChannels) != "[1]" || d.Firmware != "1.4" || d.ModelID != "00C7" || d.Name != "HM-Sec-SCo NEQ0000002" {
 		t.Errorf("stored %+v", d)
@@ -146,7 +168,7 @@ func TestPairNewContact(t *testing.T) {
 
 func TestPairUnsupportedAndForeign(t *testing.T) {
 	file := filepath.Join(t.TempDir(), "devices.json")
-	e := newEnvWith(t, pairingConfig(file), fakemod.Options{}, fastPairing)
+	e := newEnvWith(t, pairingConfig(filepath.Dir(file)), fakemod.Options{}, fastPairing)
 	e.b.Commands() <- ha.Command{Kind: ha.StartPairing}
 	e.waitFor("pairing mode", func() bool { return e.pairingState()["active"] == true })
 
@@ -162,7 +184,7 @@ func TestPairUnsupportedAndForeign(t *testing.T) {
 	if n := len(e.mod.Sent()); n != 0 {
 		t.Errorf("%d messages sent", n)
 	}
-	if devs, _ := devstore.Load(file); len(devs) != 0 {
+	if devs, _ := loadDevices(file); len(devs) != 0 {
 		t.Errorf("stored %v", devs)
 	}
 	if st := e.pairingState(); st["active"] != true {
@@ -171,7 +193,7 @@ func TestPairUnsupportedAndForeign(t *testing.T) {
 }
 
 func TestPairingTimeout(t *testing.T) {
-	e := newEnvWith(t, pairingConfig(filepath.Join(t.TempDir(), "d.json")), fakemod.Options{}, func(o *Options) {
+	e := newEnvWith(t, pairingConfig(t.TempDir()), fakemod.Options{}, func(o *Options) {
 		fastPairing(o)
 		o.PairingDuration = 150 * time.Millisecond
 	})
@@ -190,7 +212,7 @@ func TestPairingTimeout(t *testing.T) {
 }
 
 func TestPairAlreadyKnown(t *testing.T) {
-	e := newEnvWith(t, pairingConfig(filepath.Join(t.TempDir(), "d.json")), fakemod.Options{}, fastPairing)
+	e := newEnvWith(t, pairingConfig(t.TempDir()), fakemod.Options{}, fastPairing)
 	e.b.Commands() <- ha.Command{Kind: ha.StartPairing}
 	e.waitFor("pairing mode", func() bool { return e.pairingState()["active"] == true })
 	// The contact from OpenCCU, already paired to our central address.
@@ -217,7 +239,7 @@ func TestPairAlreadyKnown(t *testing.T) {
 func TestUnpairRenameAndReload(t *testing.T) {
 	file := filepath.Join(t.TempDir(), "devices.json")
 	paired := time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)
-	err := devstore.Save(file, []devstore.Device{
+	err := saveDevices(file, []store.Device{
 		{Name: "Stehlampe", Model: "HM-LC-Sw1-Pl-DN-R1", Address: "6A9D15", KeyIndex: 0, Paired: paired},
 		{Name: "Bad Fenster", Model: "HM-Sec-SCo", Address: "4C5D70", Serial: "NEQ0000002", KeyIndex: 2, AESChannels: []int{1}, Paired: paired},
 		// Also in config.json: config.json wins.
@@ -228,7 +250,7 @@ func TestUnpairRenameAndReload(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	e := newEnvWith(t, pairingConfig(file), fakemod.Options{}, fastPairing)
+	e := newEnvWith(t, pairingConfig(filepath.Dir(file)), fakemod.Options{}, fastPairing)
 	names := map[string]bool{}
 	for _, d := range e.b.Snapshot().Devices {
 		names[d.Name+"/"+d.Address+"/"+fmt.Sprint(d.Paired)] = true
@@ -250,9 +272,9 @@ func TestUnpairRenameAndReload(t *testing.T) {
 	// Rename.
 	e.b.Commands() <- ha.Command{Kind: ha.Rename, Addr: "6a9d15", Name: "Leselampe"}
 	e.waitFor("renamed", func() bool { return string(e.pub.get("hmbridge/6a9d15/name")) == "Leselampe" })
-	if devs, _ := devstore.Load(file); devs[2].Name != "Leselampe" || !devs[2].Paired.Equal(paired) {
-		t.Errorf("stored after rename %+v", devs)
-	}
+	e.waitDevices(file, "stored after rename", func(devs []store.Device) bool {
+		return len(devs) == 3 && devs[2].Name == "Leselampe" && devs[2].Paired.Equal(paired)
+	})
 	// A name in use is refused.
 	e.b.Commands() <- ha.Command{Kind: ha.Rename, Addr: "6a9d15", Name: "Bad Fenster"}
 
@@ -283,21 +305,20 @@ func TestUnpairRenameAndReload(t *testing.T) {
 	}
 
 	// The entry shadowed by config.json is dropped on the next write.
-	devs, _ := devstore.Load(file)
-	if len(devs) != 1 || devs[0].Name != "wohnzimmer fenster 4C5D71" {
-		t.Errorf("stored after unpairing %+v", devs)
-	}
+	e.waitDevices(file, "stored after unpairing", func(devs []store.Device) bool {
+		return len(devs) == 1 && devs[0].Name == "wohnzimmer fenster 4C5D71"
+	})
 
 	// Restart: the devices file is read again.
 	e.stop()
-	e2 := newEnvWith(t, pairingConfig(file), fakemod.Options{}, fastPairing)
+	e2 := newEnvWith(t, pairingConfig(filepath.Dir(file)), fakemod.Options{}, fastPairing)
 	if n := len(e2.b.Snapshot().Devices); n != 2 {
 		t.Errorf("%d devices after restart", n)
 	}
 }
 
 func TestPairingStatusPageAndDisabled(t *testing.T) {
-	e := newEnvWith(t, pairingConfig(filepath.Join(t.TempDir(), "d.json")), fakemod.Options{}, fastPairing)
+	e := newEnvWith(t, pairingConfig(t.TempDir()), fakemod.Options{}, fastPairing)
 	srv := httptest.NewServer(e.b.StatusHandler(nil))
 	defer srv.Close()
 	post := func(origin string) int {
@@ -340,8 +361,8 @@ func TestPairingStatusPageAndDisabled(t *testing.T) {
 		t.Errorf("status page:\n%s", page.String())
 	}
 
-	// devices_file "": pairing is disabled.
-	d := newEnvWith(t, strings.Replace(pairingConfig(""), `"devices_file": ""`, `"devices_file": ""`, 1), fakemod.Options{}, fastPairing)
+	// state_dir "": pairing is disabled.
+	d := newEnvWith(t, pairingConfig(""), fakemod.Options{}, fastPairing)
 	d.b.Commands() <- ha.Command{Kind: ha.StartPairing}
 	d.waitFor("disabled", func() bool {
 		return d.pairingState()["status"] == "disabled" && strings.Contains(d.lastResult(), "pairing is disabled")
@@ -349,4 +370,125 @@ func TestPairingStatusPageAndDisabled(t *testing.T) {
 	if b := d.pub.get("homeassistant/button/hmbridge_bridge/pair/config"); len(b) != 0 {
 		t.Errorf("pair button published while disabled: %s", b)
 	}
+}
+
+// A damaged devices file is moved aside before anything is written, so
+// that the next pairing does not destroy the paired devices; the
+// problem is shown on the status page.
+func TestDamagedDevicesFileQuarantined(t *testing.T) {
+	dir := t.TempDir()
+	file := filepath.Join(dir, "devices.json")
+	damaged := `{"version":1,"devices":[{"name":"Stehlampe","model":"HM-LC-Sw1-Pl-DN-R1","address":"6A9D15","key_ind`
+	os.WriteFile(file, []byte(damaged), 0o600)
+	e := newEnvWith(t, pairingConfig(dir), fakemod.Options{}, fastPairing)
+	snap := e.b.Snapshot().Pairing
+	if !snap.Enabled || len(snap.Warnings) != 1 || !strings.Contains(snap.Warnings[0], "damaged") {
+		t.Errorf("pairing snapshot %+v", snap)
+	}
+	matches, _ := filepath.Glob(file + ".corrupt-*")
+	if len(matches) != 1 {
+		t.Fatalf("quarantined copies %q", matches)
+	}
+	if b, _ := os.ReadFile(matches[0]); string(b) != damaged {
+		t.Errorf("quarantined copy %q", b)
+	}
+	if _, err := os.Stat(file); !os.IsNotExist(err) {
+		t.Errorf("devices file still in place: %v", err)
+	}
+	rec := httptest.NewRecorder()
+	e.b.StatusHandler(nil).ServeHTTP(rec, httptest.NewRequest("GET", "/", nil))
+	if !strings.Contains(rec.Body.String(), "the devices file was damaged") {
+		t.Errorf("status page lacks the warning:\n%s", rec.Body.String())
+	}
+}
+
+// A devices file of a newer format version (after a downgrade) is left
+// alone: pairing is disabled instead of overwriting it.
+func TestNewerDevicesFileDisablesPairing(t *testing.T) {
+	dir := t.TempDir()
+	file := filepath.Join(dir, "devices.json")
+	newer := `{"version":99,"devices":[]}`
+	os.WriteFile(file, []byte(newer), 0o600)
+	e := newEnvWith(t, pairingConfig(dir), fakemod.Options{}, fastPairing)
+	snap := e.b.Snapshot().Pairing
+	if snap.Enabled || !strings.Contains(snap.DisabledReason, "newer hmbridge") {
+		t.Errorf("pairing snapshot %+v", snap)
+	}
+	e.b.Commands() <- ha.Command{Kind: ha.StartPairing}
+	e.waitFor("disabled", func() bool {
+		return e.pairingState()["status"] == "disabled" && strings.Contains(e.lastResult(), "newer hmbridge")
+	})
+	rec := httptest.NewRecorder()
+	e.b.StatusHandler(nil).ServeHTTP(rec, httptest.NewRequest("GET", "/", nil))
+	if !strings.Contains(rec.Body.String(), "Pairing is disabled (the devices file cannot be used") {
+		t.Errorf("status page:\n%s", rec.Body.String())
+	}
+	e.stop()
+	if b, _ := os.ReadFile(file); string(b) != newer {
+		t.Errorf("devices file changed: %s", b)
+	}
+}
+
+// Records that cannot be used (here: key index 1, no longer configured)
+// stay in the file across writes.
+func TestUnusableDeviceRecordsKept(t *testing.T) {
+	dir := t.TempDir()
+	file := filepath.Join(dir, "devices.json")
+	paired := time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)
+	orphan := store.Device{Name: "Alter Taster", Model: "HM-PB-2-WM55", Address: "73788E", Serial: "NEQ1234567", AESChannels: []int{1, 2}, KeyIndex: 1, Paired: paired}
+	if err := saveDevices(file, []store.Device{
+		{Name: "Stehlampe", Model: "HM-LC-Sw1-Pl-DN-R1", Address: "6A9D15", Paired: paired},
+		orphan,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	e := newEnvWith(t, pairingConfig(dir), fakemod.Options{}, fastPairing)
+	if snap := e.b.Snapshot().Pairing; len(snap.Warnings) != 1 || !strings.Contains(snap.Warnings[0], "Alter Taster (73788E)") {
+		t.Errorf("warnings %q", snap.Warnings)
+	}
+	if n := len(e.b.Snapshot().Devices); n != 2 {
+		t.Errorf("%d devices, want 2 (config + plug)", n)
+	}
+	e.waitFor("unpair button", func() bool { return e.state("homeassistant/button/hmbridge_6a9d15/unpair/config") != nil })
+	e.b.Commands() <- ha.Command{Kind: ha.Rename, Addr: "6a9d15", Name: "Leselampe"}
+	devs := e.waitDevices(file, "renamed", func(d []store.Device) bool { return len(d) == 2 && d[0].Name == "Leselampe" })
+	if !reflect.DeepEqual(devs[1], orphan) {
+		t.Errorf("unusable record changed: %+v", devs[1])
+	}
+}
+
+// Paired devices and state survive a restart with state_dir.
+func TestStateDirRestart(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "state")
+	paired := time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)
+	if err := saveDevices(filepath.Join(dir, "devices.json"), []store.Device{
+		{Name: "Stehlampe", Model: "HM-LC-Sw1-Pl-DN-R1", Address: "6A9D15", Paired: paired},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	e := newEnvWith(t, pairingConfig(dir), fakemod.Options{}, fastPairing)
+	e.inject(0x11, msg(0x07, 0x84, 0x41, sco, central, 0x01, 0x1c, 0xc8))
+	e.waitFor("window", func() bool { return e.state("hmbridge/4c5d6e/state")["window_open"] == true })
+	e.stop()
+	if got := entries(t, dir); fmt.Sprint(got) != "[devices.json state.json]" {
+		t.Errorf("state dir %v", got)
+	}
+	e2 := newEnvWith(t, pairingConfig(dir), fakemod.Options{}, fastPairing)
+	e2.waitFor("restored window", func() bool { return e2.state("hmbridge/4c5d6e/state")["window_open"] == true })
+	if e2.b.Snapshot().Devices[1].Name != "Stehlampe" {
+		t.Errorf("devices %+v", e2.b.Snapshot().Devices)
+	}
+}
+
+func entries(t *testing.T, dir string) []string {
+	t.Helper()
+	es, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, e := range es {
+		names = append(names, e.Name())
+	}
+	return names
 }

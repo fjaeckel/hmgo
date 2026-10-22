@@ -26,12 +26,12 @@ import (
 
 	"github.com/fjaeckel/hmgo/internal/bidcos"
 	"github.com/fjaeckel/hmgo/internal/config"
-	"github.com/fjaeckel/hmgo/internal/devstore"
 	"github.com/fjaeckel/hmgo/internal/ha"
 	"github.com/fjaeckel/hmgo/internal/hm"
 	"github.com/fjaeckel/hmgo/internal/hm/devices"
 	"github.com/fjaeckel/hmgo/internal/hm/power"
 	"github.com/fjaeckel/hmgo/internal/hm/remote"
+	"github.com/fjaeckel/hmgo/internal/store"
 	"github.com/fjaeckel/hmgo/internal/uartgw"
 )
 
@@ -96,6 +96,9 @@ type Options struct {
 	// Version is shown as hmbridge's software version in Home
 	// Assistant.
 	Version string
+	// Store is where state and paired devices are persisted (see
+	// package store). Nil: opened from Config (state_dir).
+	Store *store.Store
 }
 
 // Bridge is the hmbridge core. Create it with New, then call Setup once
@@ -113,10 +116,17 @@ type Bridge struct {
 	retries      int
 	clockSync    func() bool
 	housekeep    time.Duration
-	stateFile    string
-	devicesFile  string // "" = pairing disabled
-	pairTick     time.Duration
-	version      string
+	store        *store.Store
+	stateFile    *store.File // nil = no state file
+
+	// devicesMu orders the writes of the devices file; devicesSeq
+	// (guarded by mu) numbers the snapshots, devicesWritten (guarded by
+	// devicesMu) is the newest one written.
+	devicesMu      sync.Mutex
+	devicesSeq     uint64
+	devicesWritten uint64
+	pairTick       time.Duration
+	version        string
 
 	// Event-loop-only state (not guarded by mu).
 	clockWasSynced bool // result of the last clock sync check
@@ -183,7 +193,7 @@ type device struct {
 	lastOnLevel float64
 	// stored is the devices file record of a device paired with
 	// hmbridge (nil for devices of the configuration file).
-	stored *devstore.Device
+	stored *store.Device
 	// removed is set (on the event loop) once the device was unpaired
 	// or replaced (renamed); results of its pending jobs then go to the
 	// device now registered at its address, if any.
@@ -237,8 +247,7 @@ func New(opts Options) (*Bridge, error) {
 		retries:      opts.Retries,
 		clockSync:    opts.ClockSynced,
 		housekeep:    opts.HousekeepingInterval,
-		stateFile:    opts.Config.StateFilePath(),
-		devicesFile:  opts.Config.DevicesFilePath(),
+		store:        opts.Store,
 		pairTick:     opts.PairingTick,
 		version:      opts.Version,
 		saveInterval: opts.Config.StateSaveInterval(),
@@ -267,6 +276,10 @@ func New(opts Options) (*Bridge, error) {
 	if b.logf == nil {
 		b.logf = log.Printf
 	}
+	if b.store == nil {
+		b.store = store.OpenConfig(opts.Config, b.logf)
+	}
+	b.stateFile = b.store.State()
 	if b.debugf == nil {
 		b.debugf = func(string, ...any) {}
 	}
@@ -288,7 +301,7 @@ func New(opts Options) (*Bridge, error) {
 		b.pairTick = time.Second
 	}
 	b.bcs = bidcos.NewSender(opts.Radio, opts.Config.CentralAddr())
-	b.pair.init(opts.Config, opts.PairingDuration, b.devicesFile != "")
+	b.pair.init(opts.Config, opts.PairingDuration, b.store.PairingEnabled())
 
 	for i := range b.cfg.Devices {
 		d, err := b.newDevice(&b.cfg.Devices[i], nil)
@@ -298,10 +311,8 @@ func New(opts Options) (*Bridge, error) {
 		b.devices = append(b.devices, d)
 		b.byAddr[d.cfg.Addr()] = d
 	}
-	if b.devicesFile != "" {
-		if err := b.loadStore(); err != nil {
-			b.logf("devices file: %v", err)
-		}
+	if b.store.PairingEnabled() {
+		b.loadStore()
 	}
 
 	for _, rg := range b.cfg.ResolvedGroups() {
@@ -329,7 +340,7 @@ func New(opts Options) (*Bridge, error) {
 		b.groups = append(b.groups, g)
 		b.bySlug[slug] = g
 	}
-	if b.stateFile != "" {
+	if b.stateFile != nil {
 		if err := b.loadState(b.stateFile); err != nil {
 			b.logf("state file: %v", err)
 		}
@@ -339,7 +350,7 @@ func New(opts Options) (*Bridge, error) {
 
 // newDevice builds the registry entry for dc. stored is the devices
 // file record of a device paired with hmbridge (nil otherwise).
-func (b *Bridge) newDevice(dc *config.Device, stored *devstore.Device) (*device, error) {
+func (b *Bridge) newDevice(dc *config.Device, stored *store.Device) (*device, error) {
 	sd := hm.NewStandardDevice(b.bcs, dc.Addr(), dc.Name)
 	kind, ok := ha.KindForModel(dc.Model)
 	if !ok {
@@ -501,7 +512,7 @@ func (b *Bridge) Run(ctx context.Context) error {
 	defer func() {
 		cancel()
 		wg.Wait()
-		if b.stateFile == "" {
+		if b.stateFile == nil {
 			return
 		}
 		b.mu.Lock()
@@ -509,7 +520,7 @@ func (b *Bridge) Run(ctx context.Context) error {
 		b.mu.Unlock()
 		if dirty {
 			if err := b.saveState(b.stateFile); err != nil {
-				b.logf("saving state to %s: %v", b.stateFile, err)
+				b.logf("saving state to %s: %v", b.stateFile.Path(), err)
 			}
 		}
 	}()

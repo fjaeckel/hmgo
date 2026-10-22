@@ -133,9 +133,10 @@ What else to look at before the first run:
   yet: <name> (<model> <address>)`. OpenCCU's own radio (HM-RCV-50) is listed
   as `not a device`. The weather sensors have no AES, so they carry neither
   `aes` nor an "AES state unknown" note.
-* `serial_port` is `/dev/raw-uart` with `reset` `none`, and `state_file` is
-  `""`, which fits running hmbridge on OpenCCU's Pi (section 3a). For Raspberry
-  Pi OS (section 3b), remove those three lines to get the defaults.
+* `serial_port` is `/dev/raw-uart` with `reset` `none`, and `state_dir` is
+  `/usr/local/hmbridge/state` (OpenCCU's writable partition), which fits
+  running hmbridge on OpenCCU's Pi (section 3a). For Raspberry Pi OS (section
+  3b), remove those three lines to get the defaults.
 * To start small, delete devices and groups you don't want yet (and remove
   deleted devices from the groups' `members`).
 
@@ -161,9 +162,9 @@ monit summary 2>/dev/null   # OpenCCU restarts crashed services via monit
 
 Stop monit's supervision of those services and the services themselves, then
 run hmbridge with `"serial_port": "/dev/raw-uart"`, `"reset": "none"` and a
-writable `"state_file"` such as `"/usr/local/hmbridge/state.json"` (or `""`:
-the state is restored from the MQTT broker anyway). To
-return to OpenCCU, simply reboot the Pi.
+writable `"state_dir"` such as `"/usr/local/hmbridge/state"` (OpenCCU's root
+file system is read-only and `/var` is lost on reboot; see section 4,
+*Persistence*). To return to OpenCCU, simply reboot the Pi.
 
 ## 3b. Running on Raspberry Pi OS (final setup)
 
@@ -252,13 +253,39 @@ so their `stale_after` must be at least `status_poll_interval` plus 5 minutes.
 
 After a restart or reboot, hmbridge reads its last published state back from
 the MQTT broker, so Home Assistant isn't blank until every window contact has
-reported again; this needs no writes on the Pi. As a fallback for when the
-broker is unreachable at startup, it also keeps `/var/lib/hmbridge/state.json`.
-To spare the SD card, that file is only written after significant changes
-(mode, target temperature, window, battery, fault, switch/dimmer level, LED
-colors), at most every 15 minutes
-(`state_save_interval`), and on shutdown; ordinary temperature reports never
-cause a write. The status page on port 8013 lists configured devices and every
+reported again; this needs no writes on the Pi.
+
+**Persistence.** hmbridge keeps its own data as small JSON files in one
+directory, `state_dir` (default `/var/lib/hmbridge`; the systemd unit creates
+it with `StateDirectory=hmbridge`, mode 0700; on OpenCCU use
+`/usr/local/hmbridge/state`):
+
+| file | content | written |
+|---|---|---|
+| `state.json` | last known device state, the fallback when the broker is unreachable at startup | after significant changes (mode, target temperature, window, battery, fault, switch/dimmer level, LED colors), at most every `state_save_interval` (15 min), and on shutdown; ordinary temperature reports never cause a write |
+| `devices.json` | devices paired with hmbridge (section 5) | on pair, unpair and rename |
+
+To spare the SD card, a file is never rewritten with unchanged content.
+Writes are atomic (a power cut leaves the old or the new version), files are
+readable only by the hmbridge user (0600), and symbolic links are not
+followed. If a file is damaged, hmbridge renames it to
+`<name>.corrupt-<time>` (keeping the newest three), logs it, and starts
+without it; for `devices.json` the status page shows a warning — repair the
+copy and put it back while hmbridge is stopped. A `devices.json` written by a
+newer hmbridge (after a downgrade) is left untouched and pairing is disabled
+until you upgrade again or remove it. `"state_dir": ""` disables both files
+(and pairing). Back up `devices.json` together with `config.json`.
+
+*Upgrading:* the older options `state_file` and `devices_file` still work
+(they name exact paths and are logged as deprecated). When you set a
+`state_dir` other than `/var/lib/hmbridge`, hmbridge copies
+`/var/lib/hmbridge/state.json` and `devices.json` into it on the first start
+if they are not there yet, and leaves the old files in place. Files from
+other locations (e.g. `/usr/local/hmbridge/devices.json` from an older
+OpenCCU setup) are not copied: move them into `state_dir` yourself, while
+hmbridge is stopped, then remove `devices_file` from the configuration.
+
+The status page on port 8013 lists configured devices and every
 radio address that talked to the central but is not configured — handy for
 finding device addresses.
 
@@ -295,16 +322,18 @@ Messages you may see as the last result:
 | `pairing … failed: … NACK` | The device refused the configuration; factory-reset it and try again. |
 | `… AES key exchange failed …` | The device was paired but keeps the eQ-3 default key, without AES. Unpair it, factory-reset it and pair it again. |
 
-Paired devices are stored in `devices_file` (default
-`/var/lib/hmbridge/devices.json`), which hmbridge reads at startup together with
-`config.json`. It is written only when a device is paired, unpaired or renamed.
+Paired devices are stored in `devices.json` in `state_dir` (default
+`/var/lib/hmbridge/devices.json`, see section 4, *Persistence*), which hmbridge
+reads at startup together with `config.json`. It is written only when a device is paired, unpaired or renamed.
 If a device is in both files, `config.json` wins (logged at startup), and the
 entry disappears from the devices file the next time it is written. To manage a
 paired device in `config.json` instead (e.g. to put it into a heating group),
 copy name, model, address, serial, `aes_channels` and `key_index` from the
 devices file to `config.json`. On OpenCCU's Pi (section 3a), set
-`devices_file` to a writable path such as `/usr/local/hmbridge/devices.json`.
-`"devices_file": ""` disables pairing.
+`state_dir` to a writable path such as `/usr/local/hmbridge/state`.
+`"state_dir": ""` disables pairing. A paired device that hmbridge cannot use
+(e.g. its `key_index` is no longer configured) is reported in the log and on
+the status page and kept in the file.
 
 `pairing.aes`: `"system_key"` (the default when `security` is configured) or
 `"off"` (devices stay on the eQ-3 default key without AES).

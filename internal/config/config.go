@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -180,10 +181,17 @@ type Config struct {
 	// set false on systems without NTP whose clock is set otherwise.
 	RequireSyncedClock *bool `json:"require_synced_clock,omitempty"`
 
-	// StateFile stores the last known device state, so that a restart
-	// does not blank Home Assistant until every device has reported
-	// again (window contacts report only every few hours). Default
-	// "/var/lib/hmbridge/state.json"; "" disables it.
+	// StateDir is the directory where hmbridge keeps its data (see
+	// package store): state.json, the last known device state, so that
+	// a restart does not blank Home Assistant until every device has
+	// reported again when the broker's retained messages are not
+	// available; and devices.json, the devices paired with hmbridge.
+	// Default "/var/lib/hmbridge"; must be absolute; "" disables
+	// persistence (and pairing).
+	StateDir *string `json:"state_dir,omitempty"`
+
+	// StateFile is deprecated (use StateDir): an explicit path of the
+	// state file, "" disables only the state file.
 	StateFile *string `json:"state_file,omitempty"`
 
 	// StateSaveInterval is the minimum time between two writes of the
@@ -203,18 +211,18 @@ type Config struct {
 	// They are always asked once shortly after startup.
 	StatusPollIntervalSetting Duration `json:"status_poll_interval,omitempty"`
 
-	// DevicesFile stores the devices paired with hmbridge itself (see
-	// Pairing). Default "/var/lib/hmbridge/devices.json"; "" disables
-	// pairing. It is read at startup and merged with Devices (on a
-	// conflict, Devices wins) and only written when a device is paired,
-	// unpaired or renamed.
+	// DevicesFile is deprecated (use StateDir): an explicit path of the
+	// file with the devices paired with hmbridge itself (see Pairing),
+	// "" disables pairing. The devices file is read at startup and
+	// merged with Devices (on a conflict, Devices wins) and only written
+	// when a device is paired, unpaired or renamed.
 	DevicesFile *string `json:"devices_file,omitempty"`
 
 	// Pairing configures the teach-in of new devices.
 	Pairing *Pairing `json:"pairing,omitempty"`
 
 	// Devices are the devices defined in this file. Devices paired with
-	// hmbridge are kept in DevicesFile instead.
+	// hmbridge are kept in devices.json in StateDir instead.
 	Devices []Device `json:"devices"`
 	Groups  []Group  `json:"groups,omitempty"`
 
@@ -244,8 +252,14 @@ const (
 	PairingAESOff       = "off"
 )
 
-// DefaultDevicesFile is where paired devices are kept.
-const DefaultDevicesFile = "/var/lib/hmbridge/devices.json"
+// DefaultStateDir is where hmbridge keeps its data.
+const DefaultStateDir = "/var/lib/hmbridge"
+
+// File names in the state directory.
+const (
+	StateFileName   = "state.json"
+	DevicesFileName = "devices.json"
+)
 
 // DefaultPairingDuration is how long pairing mode stays on.
 const DefaultPairingDuration = 60 * time.Second
@@ -675,11 +689,22 @@ func (c *Config) resolve() error {
 	if p := c.StatusPollIntervalSetting.Duration; p < 0 || p > 0 && p < 5*time.Minute {
 		return fmt.Errorf("status_poll_interval: %v is too short (minimum 5m, or \"0s\" to disable)", p)
 	}
+	if c.StateDir != nil && *c.StateDir != "" {
+		if isPlaceholder(*c.StateDir) {
+			return placeholderError("state_dir")
+		}
+		if !filepath.IsAbs(*c.StateDir) {
+			return fmt.Errorf("state_dir: %q is not an absolute path", *c.StateDir)
+		}
+	}
+	if c.StateFile != nil && *c.StateFile != "" && isPlaceholder(*c.StateFile) {
+		return placeholderError("state_file")
+	}
 	if c.DevicesFile != nil && *c.DevicesFile != "" && isPlaceholder(*c.DevicesFile) {
 		return placeholderError("devices_file")
 	}
 	if len(c.Devices) == 0 && c.DevicesFilePath() == "" {
-		return fmt.Errorf("devices: at least one device is required (or keep devices_file enabled and pair devices with hmbridge)")
+		return fmt.Errorf("devices: at least one device is required (or set state_dir and pair devices with hmbridge)")
 	}
 	if p := c.Pairing; p != nil {
 		switch p.AES {
@@ -855,13 +880,53 @@ func (c *Config) ConfiguredDevice(addr [3]byte, name string) *Device {
 	return nil
 }
 
+// StateDirPath returns the resolved state directory ("" = none).
+func (c *Config) StateDirPath() string {
+	switch {
+	case c.StateDir == nil:
+		return DefaultStateDir
+	case *c.StateDir == "":
+		return ""
+	}
+	return filepath.Clean(*c.StateDir)
+}
+
+// filePath resolves a file of the state directory: the deprecated
+// explicit path if set, else <state_dir>/<name> ("" = disabled).
+func (c *Config) filePath(explicit *string, name string) string {
+	if explicit != nil {
+		return *explicit
+	}
+	if dir := c.StateDirPath(); dir != "" {
+		return filepath.Join(dir, name)
+	}
+	return ""
+}
+
 // DevicesFilePath returns the resolved devices file path ("" = pairing
 // disabled).
-func (c *Config) DevicesFilePath() string {
-	if c.DevicesFile == nil {
-		return DefaultDevicesFile
+func (c *Config) DevicesFilePath() string { return c.filePath(c.DevicesFile, DevicesFileName) }
+
+// Deprecations returns a message for every deprecated option in use
+// (hmbridge logs them once at startup).
+func (c *Config) Deprecations() []string {
+	var msgs []string
+	for _, o := range []struct {
+		key, name string
+		val       *string
+	}{{"state_file", StateFileName, c.StateFile}, {"devices_file", DevicesFileName, c.DevicesFile}} {
+		if o.val == nil {
+			continue
+		}
+		m := fmt.Sprintf("%s is deprecated: use state_dir (hmbridge keeps %s there)", o.key, o.name)
+		if *o.val == "" {
+			m += fmt.Sprintf("; %s \"\" still disables the file", o.key)
+		} else {
+			m += fmt.Sprintf("; %q is still used for now; to switch, move it to <state_dir>/%s and remove %s", *o.val, o.name, o.key)
+		}
+		msgs = append(msgs, m)
 	}
-	return *c.DevicesFile
+	return msgs
 }
 
 // PairingAES returns the resolved pairing AES mode: pairing.aes, or
@@ -884,16 +949,8 @@ func (c *Config) PairingDuration() time.Duration {
 	return DefaultPairingDuration
 }
 
-// DefaultStateFile is where the last known device state is kept.
-const DefaultStateFile = "/var/lib/hmbridge/state.json"
-
 // StateFilePath returns the resolved state file path ("" = disabled).
-func (c *Config) StateFilePath() string {
-	if c.StateFile == nil {
-		return DefaultStateFile
-	}
-	return *c.StateFile
-}
+func (c *Config) StateFilePath() string { return c.filePath(c.StateFile, StateFileName) }
 
 // DefaultStateSaveInterval is the default minimum time between writes.
 const DefaultStateSaveInterval = 15 * time.Minute

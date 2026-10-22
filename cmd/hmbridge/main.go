@@ -36,6 +36,7 @@ import (
 	"github.com/fjaeckel/hmgo/internal/ha"
 	"github.com/fjaeckel/hmgo/internal/hmkey"
 	"github.com/fjaeckel/hmgo/internal/serial"
+	"github.com/fjaeckel/hmgo/internal/store"
 	"github.com/fjaeckel/hmgo/internal/uartgw"
 	"github.com/fjaeckel/hmgo/licenses"
 )
@@ -75,6 +76,12 @@ func main() {
 	}
 	if *checkConfig {
 		fmt.Printf("%s: OK (%d devices, %d groups)\n", *configPath, len(cfg.Devices), len(cfg.Groups))
+		for _, m := range cfg.Deprecations() {
+			fmt.Printf("warning: %s\n", m)
+		}
+		if d := cfg.StateDirPath(); d != "" {
+			fmt.Printf("state directory: %s\n", d)
+		}
 		if p := cfg.DevicesFilePath(); p != "" {
 			fmt.Printf("paired devices are read from %s (pairing AES: %s)\n", p, cfg.PairingAES())
 		}
@@ -118,7 +125,16 @@ func run(ctx context.Context, cfg *config.Config, uart io.ReadWriteCloser) error
 		log.Printf("RPI-RF-MOD support is experimental: acknowledgements and AES are done in software, and parts of the module protocol are still unverified (see docs/SNIFFING.md)")
 	}
 
-	opts := bridge.Options{Config: cfg, Radio: conn, Debugf: debugf, HMIP: hmipMon, Version: version()}
+	for _, m := range cfg.Deprecations() {
+		log.Printf("config: %s", m)
+	}
+	st := store.OpenConfig(cfg, log.Printf)
+	if d := st.Dir(); d != "" {
+		log.Printf("state directory: %s", d)
+	} else {
+		log.Printf("state_dir is \"\": no state file, pairing disabled")
+	}
+	opts := bridge.Options{Config: cfg, Radio: conn, Debugf: debugf, HMIP: hmipMon, Version: version(), Store: st}
 	if testBridgeOptions != nil {
 		testBridgeOptions(&opts)
 	}

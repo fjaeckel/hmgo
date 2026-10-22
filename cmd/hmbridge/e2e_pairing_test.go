@@ -20,7 +20,8 @@ import (
 
 var e2eNewSCo = [3]byte{0x4c, 0x5d, 0x70}
 
-func pairingE2EConfig(t *testing.T, broker string, httpPort int, devicesFile string) *config.Config {
+// pairingE2EConfig keeps hmbridge's files in stateDir.
+func pairingE2EConfig(t *testing.T, broker string, httpPort int, stateDir string) *config.Config {
 	t.Helper()
 	httpListen := `""`
 	if httpPort != 0 {
@@ -29,13 +30,12 @@ func pairingE2EConfig(t *testing.T, broker string, httpPort int, devicesFile str
 	cfg, err := config.Parse([]byte(fmt.Sprintf(`{
 	  "central_address": "458086",
 	  "reset": "none",
-	  "state_file": "",
-	  "devices_file": %q,
+	  "state_dir": %q,
 	  "require_synced_clock": false,
 	  "security": {"passphrase": "geheim", "index": 2},
 	  "mqtt": {"broker": %q},
 	  "http_listen": %s
-	}`, devicesFile, broker, httpListen)))
+	}`, stateDir, broker, httpListen)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -98,7 +98,7 @@ func TestEndToEndPairing(t *testing.T) {
 	httpPort := freePort(t)
 	fastBridge(t)
 	file := filepath.Join(t.TempDir(), "devices.json")
-	cfg := pairingE2EConfig(t, broker, httpPort, file)
+	cfg := pairingE2EConfig(t, broker, httpPort, filepath.Dir(file))
 	ha := newFakeHA(t, broker, "fake-ha-pairing")
 	key := hmkey.FromPassphrase("geheim", 2)
 	dev := fakemod.NewDevice(e2eNewSCo, 0x00c7, "NEQ0000002")
@@ -189,7 +189,7 @@ func TestEndToEndPairing(t *testing.T) {
 func TestEndToEndPairingRPIRFMod(t *testing.T) {
 	broker := startBroker(t)
 	fastBridge(t)
-	cfg := pairingE2EConfig(t, broker, 0, filepath.Join(t.TempDir(), "devices.json"))
+	cfg := pairingE2EConfig(t, broker, 0, t.TempDir())
 	ha := newFakeHA(t, broker, "fake-ha-pairing-dual")
 	dev := fakemod.NewDevice(e2eNewSCo, 0x00c7, "NEQ0000002")
 	mod, rw := fakemod.New(fakemod.Options{DualCoPro: true, OnLLMACSend: dev.Handle})
@@ -232,7 +232,7 @@ func TestEndToEndPairingTimeout(t *testing.T) {
 		o.PairingTick = 20 * time.Millisecond
 	}
 	t.Cleanup(func() { testBridgeOptions = nil })
-	cfg := pairingE2EConfig(t, broker, 0, filepath.Join(t.TempDir(), "devices.json"))
+	cfg := pairingE2EConfig(t, broker, 0, t.TempDir())
 	ha := newFakeHA(t, broker, "fake-ha-pairing-timeout")
 	mod, rw := fakemod.New(fakemod.Options{})
 	defer mod.Close()

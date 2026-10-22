@@ -116,8 +116,11 @@ func TestGenerateAllSources(t *testing.T) {
 	if cfg.Radio != config.RadioRPIRFMod || cfg.SerialPort != "/dev/raw-uart" || cfg.Reset != "none" {
 		t.Errorf("radio/serial/reset = %q %q %q", cfg.Radio, cfg.SerialPort, cfg.Reset)
 	}
-	if cfg.StateFilePath() != "" {
-		t.Errorf("state_file = %q", cfg.StateFilePath())
+	if cfg.StateDirPath() != "/usr/local/hmbridge/state" || cfg.DevicesFilePath() != "/usr/local/hmbridge/state/devices.json" || len(cfg.Deprecations()) != 0 {
+		t.Errorf("state_dir = %q, devices file %q, deprecations %q", cfg.StateDirPath(), cfg.DevicesFilePath(), cfg.Deprecations())
+	}
+	if _, ok := raw["state_file"]; ok || raw["state_dir"] != "/usr/local/hmbridge/state" {
+		t.Errorf("state_dir %v, state_file %v", raw["state_dir"], raw["state_file"])
 	}
 	if cur, prev := cfg.Keys(); cur.Index != 2 || prev == nil || prev.Index != 1 {
 		t.Errorf("key indexes: current %v previous %v", cur, prev)

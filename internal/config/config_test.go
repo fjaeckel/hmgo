@@ -422,13 +422,53 @@ func TestNewModelValidation(t *testing.T) {
 	}
 }
 
+func TestStateDir(t *testing.T) {
+	parse := func(extra string) *Config {
+		t.Helper()
+		cfg, err := Parse([]byte(`{"central_address":"1A2B3C"` + extra + `}`))
+		if err != nil {
+			t.Fatalf("%s: %v", extra, err)
+		}
+		return cfg
+	}
+	for _, tc := range []struct {
+		extra, dir, state, devices string
+		deprecations               int
+	}{
+		{``, DefaultStateDir, "/var/lib/hmbridge/state.json", "/var/lib/hmbridge/devices.json", 0},
+		{`,"state_dir":"/usr/local/hmbridge/state/"`, "/usr/local/hmbridge/state", "/usr/local/hmbridge/state/state.json", "/usr/local/hmbridge/state/devices.json", 0},
+		{`,"state_dir":"","devices":[{"name":"a","model":"HM-CC-RT-DN","address":"38F59C"}]`, "", "", "", 0},
+		// Deprecated options: exact paths; state_dir wins for the rest.
+		{`,"state_file":"/srv/s.json"`, DefaultStateDir, "/srv/s.json", "/var/lib/hmbridge/devices.json", 1},
+		{`,"state_dir":"/d","state_file":""`, "/d", "", "/d/devices.json", 1},
+		{`,"state_dir":"/d","devices_file":"/e/dev.json","state_file":"/e/s.json"`, "/d", "/e/s.json", "/e/dev.json", 2},
+		{`,"state_dir":"","devices_file":"/e/dev.json"`, "", "", "/e/dev.json", 1},
+	} {
+		cfg := parse(tc.extra)
+		if cfg.StateDirPath() != tc.dir || cfg.StateFilePath() != tc.state || cfg.DevicesFilePath() != tc.devices {
+			t.Errorf("%s: dir %q state %q devices %q", tc.extra, cfg.StateDirPath(), cfg.StateFilePath(), cfg.DevicesFilePath())
+		}
+		if d := cfg.Deprecations(); len(d) != tc.deprecations {
+			t.Errorf("%s: deprecations %q", tc.extra, d)
+		}
+	}
+	for _, bad := range []string{`"state"`, `"./state"`, `"CHANGE-ME"`} {
+		if _, err := Parse([]byte(`{"central_address":"1A2B3C","state_dir":` + bad + `}`)); err == nil || !strings.Contains(err.Error(), "state_dir") {
+			t.Errorf("state_dir %s: %v", bad, err)
+		}
+	}
+	if _, err := Parse([]byte(`{"central_address":"1A2B3C","state_dir":""}`)); err == nil || !strings.Contains(err.Error(), "state_dir") {
+		t.Errorf("no devices and no state_dir: %v", err)
+	}
+}
+
 func TestPairingAndDevicesFile(t *testing.T) {
 	// No devices at all is fine while the devices file (pairing) is on.
 	cfg, err := Parse([]byte(`{"central_address":"1A2B3C"}`))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.DevicesFilePath() != DefaultDevicesFile || cfg.PairingAES() != PairingAESOff || cfg.PairingDuration() != DefaultPairingDuration {
+	if cfg.DevicesFilePath() != "/var/lib/hmbridge/devices.json" || cfg.PairingAES() != PairingAESOff || cfg.PairingDuration() != DefaultPairingDuration {
 		t.Errorf("defaults: %q %q %v", cfg.DevicesFilePath(), cfg.PairingAES(), cfg.PairingDuration())
 	}
 	cfg, err = Parse([]byte(`{"central_address":"1A2B3C","security":{"passphrase":"x","index":2},

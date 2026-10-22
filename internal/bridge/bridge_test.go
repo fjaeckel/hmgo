@@ -783,7 +783,7 @@ func TestStatePersistedAndRestored(t *testing.T) {
 	e.inject(0x11, msg(0x07, 0x84, 0x41, sco, central, 0x01, 0x1c, 0xc8))
 	e.inject(0x01, msg(0x05, 0xa6, 0x10, rtdn, central, 0x0a, 0xb0, 0xe2, 0x08, 0x25, 0x00))
 	e.waitFor("state", func() bool { return e.state("hmbridge/38f59c/state")["current_temperature"] != nil })
-	if err := e.b.saveState(path); err != nil {
+	if err := e.b.saveState(e.b.stateFile); err != nil {
 		t.Fatal(err)
 	}
 
@@ -932,10 +932,13 @@ func TestStateSaveFailureIsRetried(t *testing.T) {
 func TestRestoredStaleDeviceStartsUnavailable(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.json")
 	old := time.Now().Add(-2 * time.Hour)
-	writeFileAtomic(path, persistedState{Version: 1, Saved: old, Devices: map[string]persistedDevice{
+	data, _ := json.Marshal(persistedState{Version: 1, Devices: map[string]persistedDevice{
 		"38f59c": {State: ha.State{CurrentTemperature: ptr(20.5), LastSeen: old}},
 		"4c5d6e": {State: ha.State{WindowOpen: ptr(true), WindowState: "open", LastSeen: old}},
 	}})
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
 	cfg := strings.Replace(testConfig, `"state_file": "",`, `"state_file": "`+path+`",`, 1)
 	e := newEnv(t, cfg, fakemod.Options{})
 	avail := func(topic string) string { return string(e.pub.get(topic)) }
