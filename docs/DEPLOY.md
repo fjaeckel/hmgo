@@ -38,6 +38,18 @@ If the key was changed but some devices were never switched to the new key
 `security.previous` and give those devices `"key_index"` with the old index.
 hmbridge logs a hint when a device's messages fail AES authentication.
 
+If AES fails for a device ("message failed AES authentication" in the
+log), find out which key it really uses with `hmkeycheck`. It checks
+candidate keys offline against the AES handshakes recorded in an
+`hmbridge -debug` log and never prints key material:
+
+```sh
+hmkeycheck -keys /etc/config/keys hmbridge-test.log   # values from OpenCCU's key file
+hmkeycheck -stdin hmbridge-test.log                    # type passphrases, one per line, then Ctrl-D
+```
+
+The eQ-3 default key is always tried as well.
+
 ## 2. Configuration
 
 The easiest way is to let `hmgenconfig` write the configuration from your
