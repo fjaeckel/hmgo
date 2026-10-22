@@ -98,8 +98,8 @@ type Config struct {
 	Reset string `json:"reset"`
 	// Radio selects the radio module: "auto" (default, detected at
 	// startup), "hm-mod-rpi-pcb" or "rpi-rf-mod".
-	Radio string `json:"radio,omitempty"`
-	ResetGPIO  int     `json:"reset_gpio"`  // BCM GPIO number, default 18 (0 = default)
+	Radio     string `json:"radio,omitempty"`
+	ResetGPIO int    `json:"reset_gpio"` // BCM GPIO number, default 18 (0 = default)
 
 	// CentralAddress is the BidCoS address of the CCU to impersonate
 	// (6 hex digits, optional 0x prefix). Required.
