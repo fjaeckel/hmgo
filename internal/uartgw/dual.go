@@ -999,13 +999,44 @@ func (c *DualConn) deliverLocked(b []byte) {
 }
 
 // aesExempt lists commands which are never challenged. Conservative:
-// the real per-channel rules (channel in the payload of 0x10/0x40/0x41/
-// 0x5x/0x70 …) are not implemented; any other BiDi message of a peer
-// with AES channels is challenged.
+// per-channel rules are only applied where the channel is unambiguous
+// (aesChannelOf); any other BiDi message of a peer with AES channels is
+// challenged.
 func aesExempt(cmd byte) bool {
 	switch cmd {
 	case bidcosCmdDeviceInfo, bidcosCmdAck, bidcosCmdAESResponse, bidcosCmdTime:
 		return true
+	}
+	return false
+}
+
+// aesChannelOf returns the channel a message reports on, for the
+// commands where it is unambiguous: KEY_EVENT (0x40, remotes and push
+// buttons) and SENSOR_EVENT (0x41, contacts) carry it in the low 6 bits
+// of the first payload byte (eQ-3 rftypes: channelIndex 9:0.6).
+func aesChannelOf(cmd byte, payload []byte) (byte, bool) {
+	if (cmd == 0x40 || cmd == 0x41) && len(payload) > 0 {
+		return payload[0] & 0x3f, true
+	}
+	return 0, false
+}
+
+// aesRequired reports whether a BiDi message from peer must be
+// challenged: always, unless its channel is known (aesChannelOf) and
+// not among the peer's AES channels (e.g. a remote with AES on some
+// buttons only; the radio modules only challenge AES channels too).
+func aesRequired(peer Peer, cmd byte, payload []byte) bool {
+	if len(peer.AESChannels) == 0 || aesExempt(cmd) {
+		return false
+	}
+	ch, ok := aesChannelOf(cmd, payload)
+	if !ok {
+		return true
+	}
+	for _, c := range peer.AESChannels {
+		if c == ch {
+			return true
+		}
 	}
 	return false
 }
@@ -1083,7 +1114,7 @@ func (c *DualConn) handleRecv(f frame) {
 	}
 
 	// 3. Software AES: challenge before accepting the message.
-	if c.softAES && toUs && bidi && isPeer && len(peer.AESChannels) > 0 && !aesExempt(cmd) {
+	if c.softAES && toUs && bidi && isPeer && aesRequired(peer, cmd, msg[minMsgLen:]) {
 		k := aesKey{src, msgcnt}
 		if _, dup := c.held[k]; dup {
 			c.mu.Unlock()

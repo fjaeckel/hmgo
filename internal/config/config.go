@@ -32,13 +32,22 @@ const (
 	ModelSC   = "HM-Sec-SC"        // shutter contact (magnetic, 1st gen)
 	ModelSCo  = "HM-Sec-SCo"       // shutter contact (optical)
 	ModelRHS  = "HM-Sec-RHS"       // rotary handle sensor (closed/tilted/open)
+
+	ModelSwitch = "HM-LC-Sw1-Pl-DN-R1" // switch plug
+	ModelDimmer = "HM-LC-Dim1L-Pl-3"   // dimmer plug
+	ModelPB2    = "HM-PB-2-WM55"       // 2-button wall switch
+	ModelRC8    = "HM-RC-8"            // 8-button remote
+	ModelLED16  = "HM-OU-LED16"        // 16-LED status display
+	ModelWDSTH  = "HM-WDS10-TH-O"      // outdoor temperature/humidity sensor
+	ModelWDST   = "HM-WDS30-T-O"       // outdoor temperature sensor
 )
 
 // modelChannels maps each supported model to its highest channel
 // number (channel 0 is the maintenance channel and always exists).
 // Taken from the channel lists in eQ-3's rftypes XML
 // (rf_cc_rt_dn.xml, rf_tc_it_wm-w-eu.xml, rf_sc.xml, rf_sec_sco.xml,
-// rf_rhs.xml).
+// rf_rhs.xml, rf_s_644.xml, rf_dim_1l_644.xml, rf_pb-2-wm55*.xml,
+// rf_rc-4-2.xml, rf_ou_led16*.xml, rf_ash550.xml, rf_s550ia.xml).
 var modelChannels = map[string]int{
 	ModelRTDN: 6, // 1 weather rx, 2 climate rx, 3 window rx, 4 climate (control), 5 RT team, 6 remote
 	ModelTC:   7, // 1 weather tx, 2 thermal control (control), 3 window rx, 6 remote, 7 switch tx
@@ -46,12 +55,44 @@ var modelChannels = map[string]int{
 	ModelSC:   1,
 	ModelSCo:  1,
 	ModelRHS:  1,
+
+	ModelSwitch: 1,
+	ModelDimmer: 3, // 1 dimmer (physical), 2 and 3 virtual dimmer channels
+	ModelPB2:    2, // one KEY channel per button
+	ModelRC8:    8,
+	ModelLED16:  16, // one KEY channel per LED
+	ModelWDSTH:  1,
+	ModelWDST:   1,
+}
+
+// noAES lists the models without AES support (the weather sensors'
+// rftypes descriptions have no AES_ACTIVE parameter).
+var noAES = map[string]bool{
+	ModelWDSTH: true,
+	ModelWDST:  true,
 }
 
 // Models returns the supported model names.
 func Models() []string {
-	return []string{ModelRTDN, ModelTC, ModelSC2, ModelSC, ModelSCo, ModelRHS}
+	return []string{ModelRTDN, ModelTC, ModelSC2, ModelSC, ModelSCo, ModelRHS,
+		ModelSwitch, ModelDimmer, ModelPB2, ModelRC8, ModelLED16, ModelWDSTH, ModelWDST}
 }
+
+// SupportsAES reports whether model can use AES.
+func SupportsAES(model string) bool { return modelChannels[model] > 0 && !noAES[model] }
+
+// IsActuator reports whether model is a mains powered actuator that
+// hmbridge sends commands to and polls for its status (switch, dimmer,
+// LED display).
+func IsActuator(model string) bool {
+	return model == ModelSwitch || model == ModelDimmer || model == ModelLED16
+}
+
+// IsRemote reports whether model is a push button or remote control.
+func IsRemote(model string) bool { return model == ModelPB2 || model == ModelRC8 }
+
+// IsWeather reports whether model is an outdoor weather sensor.
+func IsWeather(model string) bool { return model == ModelWDSTH || model == ModelWDST }
 
 // ModelChannels returns the highest channel number of model, or 0 if
 // the model is unknown.
@@ -154,6 +195,14 @@ type Config struct {
 	// unreachable at startup.
 	StateSaveIntervalSetting Duration `json:"state_save_interval,omitempty"`
 
+	// StatusPollIntervalSetting is how often the mains powered actuators
+	// (switch, dimmer, LED display) are asked for their status (Go
+	// duration, default "1h", "0s" disables polling). They report only
+	// when something changes, so the poll is what tells whether they are
+	// still reachable (their default stale_after is three intervals).
+	// They are always asked once shortly after startup.
+	StatusPollIntervalSetting Duration `json:"status_poll_interval,omitempty"`
+
 	Devices []Device `json:"devices"`
 	Groups  []Group  `json:"groups,omitempty"`
 
@@ -219,13 +268,17 @@ type Device struct {
 	// Must be the index of the current or previous key.
 	KeyIndexOverride *int `json:"key_index,omitempty"`
 	// StaleAfter is how long the device may stay silent before Home
-	// Assistant shows it as unavailable (Go duration). Default: 30m for
-	// thermostats (they report every few minutes), 6h for the
-	// HM-Sec-SCo, 50h for the other contacts (they report about daily).
+	// Assistant shows it as unavailable (Go duration, "0s" = never).
+	// Default: 30m for thermostats (they report every few minutes), 1h
+	// for the weather sensors, 6h for the HM-Sec-SCo, 50h for the other
+	// contacts (they report about daily), three status poll intervals for
+	// the actuators, and never for remotes (they only send when a button
+	// is pressed).
 	StaleAfter Duration `json:"stale_after,omitempty"`
 
-	addr     [3]byte
-	keyIndex byte
+	addr         [3]byte
+	keyIndex     byte
+	staleDefault time.Duration
 }
 
 // KeyIndex returns the AES key index the device uses: key_index if set,
@@ -263,6 +316,16 @@ func (d Device) AESChannelList() []byte {
 		res = append(res, byte(c))
 	}
 	return res
+}
+
+// HasAESChannel reports whether AES is enforced on channel ch.
+func (d Device) HasAESChannel(ch byte) bool {
+	for _, c := range d.AESChannelList() {
+		if c == ch {
+			return true
+		}
+	}
+	return false
 }
 
 // Group is a CCU-style heating group: thermostats (RT-DN and/or TC)
@@ -534,6 +597,12 @@ func (c *Config) resolve() error {
 	if c.StateSaveIntervalSetting.set && c.StateSaveIntervalSetting.Duration < time.Minute {
 		return fmt.Errorf("state_save_interval: %v is too short (minimum 1m)", c.StateSaveIntervalSetting.Duration)
 	}
+	if !c.StatusPollIntervalSetting.set {
+		c.StatusPollIntervalSetting.Duration = DefaultStatusPollInterval
+	}
+	if p := c.StatusPollIntervalSetting.Duration; p < 0 || p > 0 && p < 5*time.Minute {
+		return fmt.Errorf("status_poll_interval: %v is too short (minimum 5m, or \"0s\" to disable)", p)
+	}
 	if len(c.Devices) == 0 {
 		return fmt.Errorf("devices: at least one device is required")
 	}
@@ -568,14 +637,18 @@ func (c *Config) resolve() error {
 		if d.Serial != "" && len(d.Serial) != 10 {
 			return fmt.Errorf("%s: serial %q: want 10 characters", where, d.Serial)
 		}
+		if d.AESEnabled() && !SupportsAES(d.Model) {
+			return fmt.Errorf("%s: %s does not support AES; remove aes/aes_channels", where, d.Model)
+		}
 		for _, ch := range d.AESChannels {
 			if ch < 1 || ch > d.Channels() {
 				return fmt.Errorf("%s: aes_channels: channel %d out of range 1..%d for %s (channel 0 is the maintenance channel)", where, ch, d.Channels(), d.Model)
 			}
 		}
-		if d.StaleAfter.set && d.StaleAfter.Duration < time.Minute {
-			return fmt.Errorf("%s: stale_after %v is too short (minimum 1m)", where, d.StaleAfter.Duration)
+		if d.StaleAfter.set && d.StaleAfter.Duration != 0 && d.StaleAfter.Duration < time.Minute {
+			return fmt.Errorf("%s: stale_after %v is too short (minimum 1m, or \"0s\" for never)", where, d.StaleAfter.Duration)
 		}
+		d.staleDefault = defaultStale(d.Model, c.StatusPollIntervalSetting.Duration)
 		d.keyIndex = c.current.Index
 		if d.KeyIndexOverride != nil {
 			ki := *d.KeyIndexOverride
@@ -633,8 +706,10 @@ func (c *Config) resolve() error {
 				tcs = append(tcs, idx)
 			case md == ModelRTDN:
 				rts = append(rts, idx)
-			default:
+			case IsContact(md):
 				g.contacts = append(g.contacts, idx)
+			default:
+				return fmt.Errorf("%s: member %q is a %s; a heating group takes only thermostats and window contacts", where, c.Devices[idx].Name, md)
 			}
 		}
 		if len(tcs)+len(rts) == 0 {
@@ -674,19 +749,43 @@ func (c *Config) RequiresSyncedClock() bool {
 	return c.RequireSyncedClock == nil || *c.RequireSyncedClock
 }
 
-// StaleTimeout returns how long the device may be silent before it is
-// reported unavailable.
-func (d Device) StaleTimeout() time.Duration {
-	if d.StaleAfter.Duration > 0 {
-		return d.StaleAfter.Duration
-	}
-	switch d.Model {
-	case ModelRTDN, ModelTC:
+// DefaultStatusPollInterval is the default status_poll_interval.
+const DefaultStatusPollInterval = time.Hour
+
+// StatusPollInterval returns how often actuators are polled (0 =
+// never, except once at startup).
+func (c *Config) StatusPollInterval() time.Duration { return c.StatusPollIntervalSetting.Duration }
+
+func defaultStale(model string, poll time.Duration) time.Duration {
+	switch {
+	case model == ModelRTDN, model == ModelTC:
 		return 30 * time.Minute
-	case ModelSCo:
+	case model == ModelSCo:
 		return 6 * time.Hour
+	case IsWeather(model):
+		return time.Hour // they report every ~3 minutes
+	case IsRemote(model):
+		return 0 // silent until a button is pressed
+	case IsActuator(model):
+		if poll <= 0 {
+			return 0
+		}
+		return 3*poll + 5*time.Minute
 	}
 	return 50 * time.Hour
+}
+
+// StaleTimeout returns how long the device may be silent before it is
+// reported unavailable; 0 means never.
+func (d Device) StaleTimeout() time.Duration {
+	if d.StaleAfter.set {
+		return d.StaleAfter.Duration
+	}
+	if d.staleDefault == 0 && d.addr == ([3]byte{}) {
+		// Not resolved (a Device built outside Parse).
+		return defaultStale(d.Model, DefaultStatusPollInterval)
+	}
+	return d.staleDefault
 }
 
 // AnswersTimeRequests reports whether hmbridge answers time requests

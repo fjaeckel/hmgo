@@ -33,6 +33,7 @@ type persistedDevice struct {
 	State          ha.State `json:"state"`
 	LastOnTarget   float64  `json:"last_on_target,omitempty"`
 	PreBoostHAMode string   `json:"pre_boost_ha_mode,omitempty"`
+	LastOnLevel    float64  `json:"last_on_level,omitempty"`
 }
 
 type persistedState struct {
@@ -73,6 +74,9 @@ func (b *Bridge) restore(d *device, st ha.State, lastOnTarget float64, preBoost 
 	}
 	d.lastOnTarget = lastOnTarget
 	d.preBoostHAMode = preBoost
+	if l := st.Level; l != nil && *l > 0 && d.desc.Kind == ha.Dimmer {
+		d.lastOnLevel = *l
+	}
 	deriveState(d)
 }
 
@@ -97,6 +101,9 @@ func (b *Bridge) loadState(path string) error {
 			continue
 		}
 		b.restore(d, pd.State, pd.LastOnTarget, pd.PreBoostHAMode)
+		if pd.LastOnLevel > 0 {
+			d.lastOnLevel = pd.LastOnLevel
+		}
 		n++
 	}
 	for _, g := range b.groups {
@@ -167,10 +174,12 @@ func significantKey(d *device) string {
 		}
 		return fmt.Sprint(*p)
 	}
-	return fmt.Sprintf("%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%.1f|%s",
+	return fmt.Sprintf("%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%.1f|%s|%s|%s|%v|%.1f",
 		st.Mode, st.Preset, st.ControlMode, f(st.TargetTemperature), st.WindowState,
 		bl(st.WindowOpen), bl(st.LowBattery), bl(st.Sabotage), st.Fault,
-		f(st.BatteryVoltage), d.lastOnTarget, d.preBoostHAMode)
+		f(st.BatteryVoltage), d.lastOnTarget, d.preBoostHAMode,
+		// switch/dimmer level and LED colors are state worth keeping
+		bl(st.On), f(st.Level), st.LEDs, d.lastOnLevel)
 }
 
 // saveState writes the current device state to path atomically. Caller
@@ -185,7 +194,7 @@ func (b *Bridge) saveState(path string) error {
 		}
 		var st ha.State
 		st.Merge(d.state)
-		ps.Devices[d.desc.Addr] = persistedDevice{State: st, LastOnTarget: d.lastOnTarget, PreBoostHAMode: d.preBoostHAMode}
+		ps.Devices[d.desc.Addr] = persistedDevice{State: st, LastOnTarget: d.lastOnTarget, PreBoostHAMode: d.preBoostHAMode, LastOnLevel: d.lastOnLevel}
 	}
 	b.stateDirty, b.significantDirty = false, false
 	b.mu.Unlock()
@@ -289,7 +298,8 @@ func (b *Bridge) checkAvailability(now time.Time) []ha.Message {
 		if ref.IsZero() {
 			ref = b.started
 		}
-		online := now.Sub(ref) < d.cfg.StaleTimeout()
+		stale := d.cfg.StaleTimeout()
+		online := stale == 0 || now.Sub(ref) < stale
 		if online != d.available || !d.availPublished {
 			if online != d.available {
 				if online {

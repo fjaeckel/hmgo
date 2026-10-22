@@ -121,9 +121,11 @@ What else to look at before the first run:
 * `groups` mirror OpenCCU's heating groups; members refer to device names.
   Groups without a supported thermostat are left out, and a device can only be
   in one group.
-* Devices hmbridge does not support yet (switches, dimmers, remotes, the
-  central itself …) are not in `devices`; they are listed in the top-level
-  `_comment` as `not supported yet: <name> (<model> <address>)`.
+* Devices hmbridge does not support yet (e.g. motion detectors) are not in
+  `devices`; they are listed in the top-level `_comment` as `not supported
+  yet: <name> (<model> <address>)`. OpenCCU's own radio (HM-RCV-50) is listed
+  as `not a device`. The weather sensors have no AES, so they carry neither
+  `aes` nor an "AES state unknown" note.
 * `serial_port` is `/dev/raw-uart` with `reset` `none`, and `state_file` is
   `""`, which fits running hmbridge on OpenCCU's Pi (section 3a). For Raspberry
   Pi OS (section 3b), remove those three lines to get the defaults.
@@ -185,11 +187,54 @@ names and addresses; set `"http_listen": "127.0.0.1:8013"` to keep them local.
 
 ## 4. Home Assistant
 
-Make sure the MQTT integration is set up in Home Assistant. Each thermostat
-appears as a device with a climate entity and sensors as soon as hmbridge
-connects. A device that stops reporting (empty battery, out of range) becomes
-unavailable in Home Assistant after its `stale_after` time (30 minutes for
-thermostats, 6 hours for the HM-Sec-SCo, 50 hours for other contacts); its
+Make sure the MQTT integration is set up in Home Assistant. Every configured
+device appears as a Home Assistant device as soon as hmbridge connects:
+
+| model | entities |
+|---|---|
+| HM-CC-RT-DN | climate (auto/heat/off, preset boost); sensors temperature, target temperature, valve position, battery voltage and estimate; battery low; diagnostic: control mode, boost remaining, fault, last command |
+| HM-TC-IT-WM-W-EU | as the HM-CC-RT-DN, plus humidity and window, without valve and fault |
+| HM-Sec-SCo, HM-Sec-SC-2, HM-Sec-SC | window, battery low, sabotage |
+| HM-Sec-RHS | as above, plus window state (closed/tilted/open) |
+| HM-LC-Sw1-Pl-DN-R1 | switch (named like the device); diagnostic: last command |
+| HM-LC-Dim1L-Pl-3 | light with brightness and transition (the transition becomes the dimmer's ramp time, default 0.5 s); diagnostic: fault (`load_failure`), last command |
+| HM-PB-2-WM55, HM-RC-8 | per button an event entity "Button n" with the event types `press_short`, `press_long`, `press_long_release`, and device triggers ("Button n" short press / long press / long release) for automations; battery low |
+| HM-OU-LED16 | per LED a select "LED n" (off, red, green, orange); diagnostic: last command |
+| HM-WDS10-TH-O | temperature, humidity, battery low |
+| HM-WDS30-T-O | temperature, battery low |
+
+All devices also have the diagnostic sensors last seen, RSSI and messages
+received (the last two disabled by default) and, except the weather sensors,
+AES authentication.
+
+Notes per device type:
+
+* **Switch, dimmer, LED display** are asked for their status shortly after
+  hmbridge starts and then every `status_poll_interval` (default 1 hour), so
+  Home Assistant knows their state and whether they are reachable. Of the LED
+  display only LED 1 is asked (asking all 16 would block the radio for long
+  if the display is unreachable); the other LEDs show the last color set by
+  Home Assistant or reported by the display, also across restarts. A command
+  the device does not answer is retried twice, then "Last command" shows
+  `failed: … (… did not respond)`.
+* **Remotes** report only button presses. A short press is `press_short`; a
+  held button gives `press_long` at once and `press_long_release` when it is
+  let go. If a button's channel uses AES, hmbridge only accepts authenticated
+  presses; the repeats sent while a button is held cannot be authenticated,
+  so on AES buttons `press_long` arrives together with `press_long_release`
+  (dimming while holding a button needs a button without AES). If the
+  release is never received, hmbridge sends `press_long_release` 5 seconds
+  after the last repeat. Presses are events, not state: nothing about them is
+  retained or saved. Use the device triggers or the event entities in
+  automations.
+* **Weather sensors** send every few minutes.
+
+A device that stops reporting (empty battery, out of range) becomes
+unavailable in Home Assistant after its `stale_after` time: 30 minutes for
+thermostats, 1 hour for weather sensors, 6 hours for the HM-Sec-SCo, 50
+hours for other contacts, three status poll intervals (3 h 5 min) for
+switches, dimmers and the LED display, and never for remotes (they are
+silent until a button is pressed; set `stale_after` to change that). Its
 "Last seen" sensor stays visible.
 
 After a restart or reboot, hmbridge reads its last published state back from
@@ -197,7 +242,8 @@ the MQTT broker, so Home Assistant isn't blank until every window contact has
 reported again; this needs no writes on the Pi. As a fallback for when the
 broker is unreachable at startup, it also keeps `/var/lib/hmbridge/state.json`.
 To spare the SD card, that file is only written after significant changes
-(mode, target temperature, window, battery, fault), at most every 15 minutes
+(mode, target temperature, window, battery, fault, switch/dimmer level, LED
+colors), at most every 15 minutes
 (`state_save_interval`), and on shutdown; ordinary temperature reports never
 cause a write. The status page on port 8013 lists configured devices and every
 radio address that talked to the central but is not configured — handy for

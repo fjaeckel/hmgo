@@ -1,7 +1,9 @@
 # hmbridge
 
 hmbridge replaces a HomeMatic CCU (OpenCCU/RaspberryMatic, CCU2/3) for
-**classic HomeMatic (BidCoS-RF)** heating devices. It drives an
+**classic HomeMatic (BidCoS-RF)** devices: thermostats, window contacts,
+switch and dimmer plugs, push buttons and remotes, the LED status display and
+outdoor weather sensors. It drives an
 **HM-MOD-RPI-PCB** radio module on a Raspberry Pi and exposes the devices to
 **Home Assistant** via MQTT discovery, with **Prometheus** metrics for
 everything.
@@ -13,9 +15,7 @@ heating groups.
 
 ## Features
 
-* **Supported devices:** HM-CC-RT-DN (radiator thermostat), HM-TC-IT-WM-W-EU
-  (wall thermostat), HM-Sec-SCo / HM-Sec-SC-2 / HM-Sec-SC (window contacts),
-  HM-Sec-RHS (window handle).
+* **Supported devices:** see the [table below](#supported-devices).
 * **No re-pairing.** hmbridge uses your CCU's radio address and AES key, so the
   devices keep talking to "their" central. Direct links between devices (wall
   thermostat ↔ valves, window contact → valve) are left untouched.
@@ -46,6 +46,26 @@ heating groups.
 * **Robust:** a slow or unreachable MQTT broker never stalls the radio side.
   Commands from Home Assistant are coalesced (dragging a slider sends one
   radio command, not twenty) and retried when a device does not answer.
+
+## Supported devices
+
+| model | device | Home Assistant |
+|---|---|---|
+| HM-CC-RT-DN | radiator thermostat | climate, temperatures, valve, battery, fault |
+| HM-TC-IT-WM-W-EU | wall thermostat | climate, temperature, humidity, battery |
+| HM-Sec-SCo, HM-Sec-SC-2, HM-Sec-SC | window contact | window, sabotage, low battery |
+| HM-Sec-RHS | window handle | window (closed/tilted/open), sabotage, low battery |
+| HM-LC-Sw1-Pl-DN-R1 | switch plug | switch |
+| HM-LC-Dim1L-Pl-3 | dimmer plug | light with brightness and transition (channel 1) |
+| HM-PB-2-WM55, HM-RC-8 | 2-button wall switch, 8-button remote | an event entity per button (press_short, press_long, press_long_release) and device triggers for automations, low battery |
+| HM-OU-LED16 | 16-LED status display | a select per LED (off, red, green, orange) |
+| HM-WDS10-TH-O, HM-WDS30-T-O | outdoor sensor | temperature (and humidity), low battery |
+
+Every device also gets diagnostic sensors (last seen, signal strength, AES
+result, outcome of the last command). [docs/DEPLOY.md](docs/DEPLOY.md#4-home-assistant)
+lists the entities per model. Switches, dimmers and the LED display are asked
+for their status after startup and every hour (`status_poll_interval`);
+remotes and weather sensors only send.
 
 ## Requirements
 
@@ -123,6 +143,10 @@ once the MQTT integration is set up. Topics, with base topic `hmbridge`:
 | `hmbridge/<address>/set/temperature` | e.g. `21.5` |
 | `hmbridge/<address>/set/mode` | `auto`, `heat`, `off` |
 | `hmbridge/<address>/set/preset` | `boost`, `none` |
+| `hmbridge/<address>/set/switch` | `ON`, `OFF` (switch and dimmer plugs) |
+| `hmbridge/<address>/set/light` | `{"state": "on", "brightness": 128, "transition": 2}` (dimmer) |
+| `hmbridge/<address>/set/led_<n>` | `off`, `red`, `green`, `orange` (LED display, n = 1 … 16) |
+| `hmbridge/<address>/event/button_<n>` | `{"event_type": "press_short", "button": 1}`, not retained (remotes) |
 | `hmbridge/group/<name>/…` | the same for heating groups |
 
 HomeMatic modes map to Home Assistant like this:
@@ -143,7 +167,7 @@ Everything is under `/metrics` on the status port (default `:8013`):
 
 | prefix | covers |
 |---|---|
-| `hmbridge_device_*` | Per device: last seen, RSSI, battery voltage and estimate, low battery, window, temperatures, valve, humidity, sabotage, faults, messages by AES result. |
+| `hmbridge_device_*` | Per device: last seen, RSSI, battery voltage and estimate, low battery, window, temperatures, valve, humidity, sabotage, faults, messages by AES result, switch/dimmer level (`level_percent`), LED colors (`led_color`), button presses (`button_presses_total` by button and type), status requests. |
 | `hmbridge_uartgw_*` | Radio module: frames, acks by status, retries, send errors, request latency, duty cycle, firmware info. |
 | `hmbridge_mqtt_*` | MQTT: connection state, publishes, commands, Home Assistant restarts. |
 | `hmbridge_commands_total`, `hmbridge_command_queue_length` | Commands from Home Assistant. |
@@ -154,8 +178,10 @@ Example alerting rules are in
 
 ## Limitations
 
-* No pairing of new devices and no editing of week programs or device
-  settings yet. Use the CCU for that, then switch back.
+* No pairing of new devices and no editing of week programs, device
+  settings or direct links yet. Use the CCU for that, then switch back.
+* Of the dimmer plug only the physical channel 1 is exposed (2 and 3 are
+  virtual channels).
 * Homematic IP is not supported (and the dual firmware is not either).
 * Commands to battery devices are sent as wake-up bursts, which use the radio's
   duty cycle (1 % airtime). Normal use is far below the limit; the duty cycle

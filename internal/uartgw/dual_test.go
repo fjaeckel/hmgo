@@ -1028,3 +1028,55 @@ func TestDualClockFromQuery(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 }
+
+// A remote with AES on button 1 only: a key event of button 2 is
+// acknowledged without a challenge, one of button 1 is challenged.
+func TestDualSoftwareAESPerChannel(t *testing.T) {
+	short2 := msgBytes(0x21, 0xa0, 0x40, testDevice, testHMID, 0x02, 0x05)
+	c, m := openDualTest(t, fakemod.Options{OnLLMACSend: func([]byte) [][]byte { return nil }}, Config{
+		Signer: fakeSigner{},
+		Rand:   bytes.NewReader(bytes.Repeat([]byte{0xa5}, 64)),
+	})
+	if err := c.AddPeer(context.Background(), Peer{Addr: testDevice, KeyIndex: 1, Channels: 3, AESChannels: []byte{1}}); err != nil {
+		t.Fatal(err)
+	}
+	m.InjectLLMACRecv(fakemod.DefaultRSSI, short2)
+	if got := recvOne(t, c); got[0] != 0x01 || !bytes.Equal(got[3:], short2) {
+		t.Errorf("received %x", got)
+	}
+	sent := waitSent(t, m, 1)
+	if want := msgBytes(0x21, 0x80, 0x02, testHMID, testDevice, 0x00); !bytes.Equal(sent[0], want) {
+		t.Errorf("sent %x, want plain ACK %x", sent[0], want)
+	}
+
+	short1 := msgBytes(0x22, 0xa0, 0x40, testDevice, testHMID, 0x01, 0x06)
+	m.InjectLLMACRecv(fakemod.DefaultRSSI, short1)
+	sent = waitSent(t, m, 2)
+	if want := msgBytes(0x22, 0xa0, 0x02, testHMID, testDevice, 0x04, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0x02); !bytes.Equal(sent[1], want) {
+		t.Errorf("sent %x, want challenge %x", sent[1], want)
+	}
+	// Not answered: delivered as AES failed after the hold timeout.
+	if got := recvOne(t, c); got[0] != 0x03 || !bytes.Equal(got[3:], short1) {
+		t.Errorf("received %x", got)
+	}
+
+	for _, tc := range []struct {
+		cmd     byte
+		payload []byte
+		want    bool
+	}{
+		{0x40, []byte{0x41, 0x01}, true},  // long press, button 1
+		{0x40, []byte{0xc2, 0x01}, false}, // long press, button 2, low battery
+		{0x41, []byte{0x81, 0x01, 0xc8}, true},
+		{0x10, []byte{0x06, 0x02, 0x00}, true}, // channel not parsed: challenged
+		{0x02, []byte{0x00}, false},
+		{0x40, nil, true},
+	} {
+		if got := aesRequired(Peer{AESChannels: []byte{1}}, tc.cmd, tc.payload); got != tc.want {
+			t.Errorf("aesRequired(%02x %x) = %v", tc.cmd, tc.payload, got)
+		}
+	}
+	if aesRequired(Peer{}, 0x40, []byte{0x01, 0x01}) {
+		t.Error("challenge for a peer without AES")
+	}
+}

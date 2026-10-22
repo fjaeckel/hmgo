@@ -31,6 +31,9 @@ const (
 	jobClimate jobKind = iota
 	jobTimeResponse
 	jobSetTime
+	jobLevel  // switch / dimmer level
+	jobLED    // HM-OU-LED16 LED color
+	jobStatus // status request to an actuator (never retried)
 )
 
 type climateAction string
@@ -40,6 +43,11 @@ const (
 	actionAuto           climateAction = "auto"
 	actionManual         climateAction = "manual"
 	actionBoost          climateAction = "boost"
+
+	// Actuator actions (also the "action" label of hmbridge_commands_total).
+	actionSwitch climateAction = "switch"
+	actionLight  climateAction = "light"
+	actionLED    climateAction = "led"
 )
 
 type job struct {
@@ -59,6 +67,11 @@ type job struct {
 	attempt int
 
 	reqNo byte // jobTimeResponse: message counter of the request
+
+	level float64 // jobLevel: percent
+	ramp  float64 // jobLevel: ramp time in seconds (dimmer)
+	led   int     // jobLED: 1 … 16
+	color string  // jobLED
 }
 
 type jobResult struct {
@@ -208,6 +221,9 @@ func (b *Bridge) execute(ctx context.Context, j job) (any, error) {
 		_, err := b.bcs.Send(ctx, pkt)
 		return nil, err
 
+	case jobLevel, jobLED, jobStatus:
+		return b.executeActuator(ctx, j)
+
 	case jobClimate:
 		switch dev := j.dev.dev.(type) {
 		case *heating.Thermostat:
@@ -260,6 +276,11 @@ func climateCall[E any](ctx context.Context, j job,
 // handleCommand translates a Home Assistant command into radio jobs.
 // Runs on the event loop.
 func (b *Bridge) handleCommand(cmd ha.Command) {
+	switch cmd.Kind {
+	case ha.SetSwitch, ha.SetLight, ha.SetLED:
+		b.handleActuatorCommand(cmd)
+		return
+	}
 	var targets []*device
 	var what string
 	switch {
@@ -394,6 +415,9 @@ func (b *Bridge) handleResult(res jobResult) {
 			b.logf("answering time request of %s: %v", j.dev.cfg.Name, res.err)
 		}
 		return
+	case jobStatus:
+		b.handleStatusResult(res)
+		return
 	}
 
 	d := j.dev
@@ -405,7 +429,7 @@ func (b *Bridge) handleResult(res jobResult) {
 			time.AfterFunc(b.retryDelay, func() { b.queue.retry(j) })
 			return
 		}
-		b.logf("%s: %s %v failed: %v", d.cfg.Name, j.action, j.temp, res.err)
+		b.logf("%s: %s failed: %v", d.cfg.Name, describeAction(j), res.err)
 		b.mu.Lock()
 		b.applyUpdate(d, ha.State{LastCommand: fmt.Sprintf("failed: %s (%v)", describeAction(j), res.err)})
 		b.mu.Unlock()
@@ -413,7 +437,11 @@ func (b *Bridge) handleResult(res jobResult) {
 		return
 	}
 	metricCommands.WithLabelValues(string(j.action), "ok").Inc()
-	b.logf("%s: %s %v acknowledged", d.cfg.Name, j.action, j.temp)
+	b.logf("%s: %s acknowledged", d.cfg.Name, describeAction(j))
+	if j.kind == jobLevel || j.kind == jobLED {
+		b.applyActuatorResult(res)
+		return
+	}
 
 	b.mu.Lock()
 	upd := stateFromEvent(d, res.ev)
@@ -463,6 +491,9 @@ func (b *Bridge) applyUpdate(d *device, upd ha.State) {
 	if t := d.state.TargetTemperature; t != nil && *t > ha.MinTemp && *t < ha.MaxTemp {
 		d.lastOnTarget = *t
 	}
+	if l := d.state.Level; l != nil && *l > 0 && d.desc.Kind == ha.Dimmer {
+		d.lastOnLevel = *l
+	}
 	if d.state.ControlMode == "boost" && prevMode != "boost" {
 		d.preBoostHAMode = prevHAMode // "" (unknown) leaves boost to auto
 	}
@@ -482,11 +513,23 @@ func isRetryable(err error) bool {
 		errors.Is(err, context.DeadlineExceeded)
 }
 
-// describeAction renders a climate job for the last_command sensor.
+// describeAction renders a job for the last_command sensor and the log.
 func describeAction(j job) string {
 	switch j.action {
 	case actionSetTemperature, actionManual:
 		return fmt.Sprintf("%s %.1f", j.action, j.temp)
+	case actionSwitch:
+		if j.level > 0 {
+			return "switch on"
+		}
+		return "switch off"
+	case actionLight:
+		if j.level == 0 {
+			return "light off"
+		}
+		return fmt.Sprintf("light %s %%", trimFloat(j.level))
+	case actionLED:
+		return fmt.Sprintf("led %d %s", j.led, j.color)
 	}
 	return string(j.action)
 }

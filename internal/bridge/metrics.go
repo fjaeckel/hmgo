@@ -4,6 +4,8 @@
 package bridge
 
 import (
+	"fmt"
+
 	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/fjaeckel/hmgo/internal/ha"
@@ -97,6 +99,23 @@ var (
 		Help: "Messages from the device that could not be decoded.",
 	}, []string{"address", "name"})
 
+	metricLevel = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: "hmbridge", Subsystem: "device", Name: "level_percent",
+		Help: "Level of a switch (0 or 100) or dimmer (0-100).",
+	}, deviceLabels)
+	metricLEDColor = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: "hmbridge", Subsystem: "device", Name: "led_color",
+		Help: "Color of an HM-OU-LED16 LED: 0 off, 1 red, 2 green, 3 orange.",
+	}, append(append([]string(nil), deviceLabels...), "led"))
+	metricButtonPresses = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "hmbridge", Subsystem: "device", Name: "button_presses_total",
+		Help: "Button presses of remotes, by button and type (press_short, press_long, press_long_release).",
+	}, append(append([]string(nil), deviceLabels...), "button", "type"))
+	metricStatusPolls = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "hmbridge", Subsystem: "device", Name: "status_requests_total",
+		Help: "Status requests to actuators by result (ok, error).",
+	}, []string{"address", "name", "result"})
+
 	metricFrames = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: "hmbridge", Name: "frames_received_total",
 		Help: "BidCoS frames received, by sender (known, unknown, invalid).",
@@ -107,7 +126,7 @@ var (
 	})
 	metricCommands = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: "hmbridge", Name: "commands_total",
-		Help: "Climate commands from Home Assistant by action and result (ok, error, rejected).",
+		Help: "Commands from Home Assistant by action and result (ok, error, rejected).",
 	}, []string{"action", "result"})
 	metricQueueLength = prometheus.NewGauge(prometheus.GaugeOpts{
 		Namespace: "hmbridge", Name: "command_queue_length",
@@ -124,6 +143,7 @@ func init() {
 		metricAuth, metricDecodeErrors, metricForeignDest,
 		metricAvailable, metricUnauthenticated, metricClockSynced, metricTimeRequestsSkipped,
 		metricFrames, metricUnknownSenders, metricCommands, metricQueueLength,
+		metricLevel, metricLEDColor, metricButtonPresses, metricStatusPolls,
 	)
 }
 
@@ -160,6 +180,16 @@ func (b *Bridge) updateMetrics(d *device) {
 	if st.Fault != "" {
 		metricFault.DeletePartialMatch(prometheus.Labels{"address": d.desc.Addr})
 		metricFault.WithLabelValues(append(l, st.Fault)...).Set(1)
+	}
+	if st.Level != nil {
+		metricLevel.WithLabelValues(l...).Set(*st.Level)
+	}
+	for i, c := range st.LEDs {
+		for v, name := range ha.LEDColors {
+			if c == name {
+				metricLEDColor.WithLabelValues(append(l, fmt.Sprint(i+1))...).Set(float64(v))
+			}
+		}
 	}
 }
 

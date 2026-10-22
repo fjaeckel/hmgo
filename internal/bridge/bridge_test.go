@@ -50,10 +50,12 @@ const testConfig = `{
   ]
 }`
 
-// fakePub records published messages.
+// fakePub records published messages (the last one per topic, and all
+// event messages in order).
 type fakePub struct {
-	mu   sync.Mutex
-	msgs map[string][]byte
+	mu     sync.Mutex
+	msgs   map[string][]byte
+	events []ha.Message
 }
 
 func (p *fakePub) Publish(m ha.Message) error {
@@ -63,7 +65,25 @@ func (p *fakePub) Publish(m ha.Message) error {
 		p.msgs = make(map[string][]byte)
 	}
 	p.msgs[m.Topic] = append([]byte(nil), m.Payload...)
+	if strings.HasPrefix(m.Topic, "hmbridge/") && strings.Contains(m.Topic, "/event/") {
+		p.events = append(p.events, m)
+	}
 	return nil
+}
+
+// eventLog returns the published events as "button_<n> <type>".
+func (p *fakePub) eventLog() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	var res []string
+	for _, m := range p.events {
+		var v struct {
+			EventType string `json:"event_type"`
+		}
+		json.Unmarshal(m.Payload, &v)
+		res = append(res, m.Topic[strings.LastIndex(m.Topic, "/")+1:]+" "+v.EventType)
+	}
+	return res
 }
 
 func (p *fakePub) Topics() ha.TopicConfig { return ha.TopicConfig{} }

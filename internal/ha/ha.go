@@ -1,8 +1,9 @@
 // Copyright (c) 2026 Frederic Jung
 // SPDX-License-Identifier: BSD-3-Clause
 
-// Package ha exposes HomeMatic thermostats, window contacts and heating
-// groups to Home Assistant via MQTT.
+// Package ha exposes HomeMatic thermostats, window contacts, heating
+// groups, switch and dimmer plugs, remotes, the LED display and weather
+// sensors to Home Assistant via MQTT.
 //
 // The package is decoupled from the BidCoS device packages: the bridge
 // converts device events into State values and Command values back into
@@ -18,6 +19,10 @@
 //	hmbridge/<addr>/set/temperature     "21.5"  (4.5 … 30.5, rounded to 0.5)
 //	hmbridge/<addr>/set/mode            "auto" | "heat" | "off"
 //	hmbridge/<addr>/set/preset          "boost" | "none"
+//	hmbridge/<addr>/set/switch          "ON" | "OFF"                 (switch, dimmer)
+//	hmbridge/<addr>/set/light           {"state":"on","brightness":128,"transition":2} (dimmer)
+//	hmbridge/<addr>/set/led_<n>         "off" | "red" | "green" | "orange" (n = 1…16)
+//	hmbridge/<addr>/event/button_<n>    {"event_type":"press_short","button":n} (not retained)
 //	hmbridge/group/<slug>/state         retained JSON State of a heating group
 //	hmbridge/group/<slug>/set/...       as for devices
 //	homeassistant/status                HA birth/will message ("online")
@@ -31,6 +36,11 @@
 //	homeassistant/climate/hmbridge_<addr>/config         (thermostats only)
 //	homeassistant/sensor/hmbridge_<addr>/<key>/config
 //	homeassistant/binary_sensor/hmbridge_<addr>/<key>/config
+//	homeassistant/switch/hmbridge_<addr>/switch/config   (switch plug)
+//	homeassistant/light/hmbridge_<addr>/light/config     (dimmer, template schema)
+//	homeassistant/select/hmbridge_<addr>/led_<n>/config  (LED display)
+//	homeassistant/event/hmbridge_<addr>/button_<n>/config
+//	homeassistant/device_automation/hmbridge_<addr>/button_<n>_<press type>/config
 //
 // GroupDiscoveryMessages does the same for a heating group, with node id
 // "hmbridge_group_<slug>": a climate entity and a window binary sensor on
@@ -91,6 +101,18 @@ const (
 	// HeatingGroup is a CCU-style heating group (see GroupDesc). It is
 	// not used in DeviceDesc; use the Group* functions instead.
 	HeatingGroup
+	// Switch is an HM-LC-Sw1-Pl-DN-R1 switch plug: a switch entity.
+	Switch
+	// Dimmer is an HM-LC-Dim1L-Pl-3 dimmer plug: a light entity with
+	// brightness.
+	Dimmer
+	// Remote is a push button or remote control (HM-PB-2-WM55, HM-RC-8):
+	// one event entity and three device triggers per button.
+	Remote
+	// LEDDisplay is an HM-OU-LED16: one select entity per LED.
+	LEDDisplay
+	// WeatherSensor is an outdoor sensor (HM-WDS10-TH-O, HM-WDS30-T-O).
+	WeatherSensor
 )
 
 func (k Kind) String() string {
@@ -103,6 +125,16 @@ func (k Kind) String() string {
 		return "WindowContact"
 	case HeatingGroup:
 		return "HeatingGroup"
+	case Switch:
+		return "Switch"
+	case Dimmer:
+		return "Dimmer"
+	case Remote:
+		return "Remote"
+	case LEDDisplay:
+		return "LEDDisplay"
+	case WeatherSensor:
+		return "WeatherSensor"
 	}
 	return fmt.Sprintf("Kind(%d)", int(k))
 }
@@ -116,9 +148,50 @@ func KindForModel(model string) (Kind, bool) {
 		return WallThermostat, true
 	case "HM-SEC-SC-2", "HM-SEC-SC", "HM-SEC-SCO", "HM-SEC-RHS":
 		return WindowContact, true
+	case "HM-LC-SW1-PL-DN-R1":
+		return Switch, true
+	case "HM-LC-DIM1L-PL-3":
+		return Dimmer, true
+	case "HM-PB-2-WM55", "HM-RC-8":
+		return Remote, true
+	case "HM-OU-LED16":
+		return LEDDisplay, true
+	case "HM-WDS10-TH-O", "HM-WDS30-T-O":
+		return WeatherSensor, true
 	}
 	return 0, false
 }
+
+// Buttons returns the number of buttons of a remote model (0 for other
+// models).
+func Buttons(model string) int {
+	switch strings.ToUpper(model) {
+	case "HM-PB-2-WM55":
+		return 2
+	case "HM-RC-8":
+		return 8
+	}
+	return 0
+}
+
+// HasHumidity reports whether a weather sensor model measures humidity.
+func HasHumidity(model string) bool { return strings.EqualFold(model, "HM-WDS10-TH-O") }
+
+// LEDCount is the number of LEDs of the HM-OU-LED16.
+const LEDCount = 16
+
+// LEDColors are the select options of an LED, in wire order.
+var LEDColors = []string{"off", "red", "green", "orange"}
+
+// Press types of remote buttons (event types of the event entities).
+const (
+	PressShort       = "press_short"
+	PressLong        = "press_long"
+	PressLongRelease = "press_long_release"
+)
+
+// PressTypes lists the event types of a button.
+var PressTypes = []string{PressShort, PressLong, PressLongRelease}
 
 // IsThreeState reports whether a window contact model reports
 // closed/tilted/open (HM-Sec-RHS) rather than closed/open.
@@ -132,7 +205,7 @@ type DeviceDesc struct {
 	Name   string // HA device name, e.g. "Wohnzimmer"
 	Model  string // e.g. "HM-CC-RT-DN"
 	Serial string // optional
-	Kind   Kind   // RadiatorThermostat, WallThermostat or WindowContact
+	Kind   Kind   // e.g. RadiatorThermostat, WindowContact, Remote
 }
 
 // GroupDesc describes a heating group for discovery. Group topics live
@@ -245,6 +318,14 @@ type State struct {
 	// Sabotage is the tamper contact of a window contact (all supported
 	// models report it, per eQ-3's rftypes XML).
 	Sabotage *bool
+	// On is the state of a switch or dimmer (dimmer: level > 0).
+	On *bool
+	// Level is the level of a switch or dimmer in percent (0 … 100 in
+	// 0.5 steps; the switch reports 0 or 100).
+	Level *float64
+	// LEDs are the colors of the HM-OU-LED16's LEDs (LEDColors), index 0
+	// = LED 1; "" means unknown. Merge merges them per LED.
+	LEDs []string
 }
 
 // Window contact states.
@@ -345,6 +426,22 @@ func (s *State) Merge(u State) {
 	if u.Sabotage != nil {
 		s.Sabotage = ptr(*u.Sabotage)
 	}
+	if u.On != nil {
+		s.On = ptr(*u.On)
+	}
+	if u.Level != nil {
+		s.Level = ptr(*u.Level)
+	}
+	if len(u.LEDs) > 0 {
+		leds := make([]string, max(len(s.LEDs), len(u.LEDs)))
+		copy(leds, s.LEDs)
+		for i, c := range u.LEDs {
+			if c != "" {
+				leds[i] = c
+			}
+		}
+		s.LEDs = leds
+	}
 }
 
 func ptr[T any](v T) *T { return &v }
@@ -374,6 +471,9 @@ type stateJSON struct {
 	WindowState        string   `json:"window_state,omitempty"`
 	Sabotage           *bool    `json:"sabotage,omitempty"`
 	LastCommand        string   `json:"last_command,omitempty"`
+	On                 *bool    `json:"on,omitempty"`
+	Level              *float64 `json:"level,omitempty"`
+	LEDs               []string `json:"leds,omitempty"`
 }
 
 // MarshalJSON encodes the state with snake_case field names, omitting
@@ -401,6 +501,9 @@ func (s State) MarshalJSON() ([]byte, error) {
 		WindowState:        s.WindowState,
 		Sabotage:           s.Sabotage,
 		LastCommand:        s.LastCommand,
+		On:                 s.On,
+		Level:              s.Level,
+		LEDs:               s.LEDs,
 	}
 	if !s.LastSeen.IsZero() {
 		j.LastSeen = s.LastSeen.UTC().Format(time.RFC3339)
@@ -408,7 +511,7 @@ func (s State) MarshalJSON() ([]byte, error) {
 	if s.BatteryVoltage != nil {
 		j.BatteryPercent = ptr(BatteryPercent(*s.BatteryVoltage))
 	}
-	for _, f := range []*float64{j.CurrentTemperature, j.TargetTemperature, j.BatteryVoltage} {
+	for _, f := range []*float64{j.CurrentTemperature, j.TargetTemperature, j.BatteryVoltage, j.Level} {
 		if f != nil && (math.IsNaN(*f) || math.IsInf(*f, 0)) {
 			return nil, fmt.Errorf("ha: invalid number %v in state", *f)
 		}
@@ -445,6 +548,9 @@ func (s *State) UnmarshalJSON(b []byte) error {
 		WindowState:        j.WindowState,
 		Sabotage:           j.Sabotage,
 		LastCommand:        j.LastCommand,
+		On:                 j.On,
+		Level:              j.Level,
+		LEDs:               j.LEDs,
 	}
 	if j.LastSeen != "" {
 		t, err := time.Parse(time.RFC3339, j.LastSeen)
@@ -591,6 +697,22 @@ func (c TopicConfig) CommandTopic(addr, what string) string {
 	return c.base() + "/" + strings.ToLower(addr) + "/set/" + what
 }
 
+// EventTopic is the (not retained) topic on which the presses of button
+// n (1-based) of a remote are published, as JSON
+// {"event_type": "press_short", "button": 1}.
+func (c TopicConfig) EventTopic(addr string, button int) string {
+	return fmt.Sprintf("%s/%s/event/button_%d", c.base(), strings.ToLower(addr), button)
+}
+
+// EventMessage returns the event message for a press of button.
+func EventMessage(cfg TopicConfig, addr string, button int, eventType string) Message {
+	b, _ := json.Marshal(struct {
+		EventType string `json:"event_type"`
+		Button    int    `json:"button"`
+	}{eventType, button})
+	return Message{Topic: cfg.EventTopic(addr, button), Payload: b, QoS: 1}
+}
+
 // GroupStateTopic is the retained JSON state topic of a heating group.
 func (c TopicConfig) GroupStateTopic(slug string) string {
 	return c.base() + "/group/" + slug + "/state"
@@ -647,6 +769,16 @@ const (
 	SetTemperature CommandKind = iota + 1
 	SetMode
 	SetPreset
+	// SetSwitch switches a switch (or dimmer) on or off: topic
+	// set/switch, payload "ON" / "OFF".
+	SetSwitch
+	// SetLight controls a dimmer: topic set/light, payload JSON as sent by
+	// HA's template light: {"state": "on"|"off", "brightness": 0…255,
+	// "transition": seconds}.
+	SetLight
+	// SetLED sets an LED of the HM-OU-LED16: topic set/led_<n> (n =
+	// 1…16), payload one of LEDColors.
+	SetLED
 )
 
 func (k CommandKind) String() string {
@@ -657,6 +789,12 @@ func (k CommandKind) String() string {
 		return "SetMode"
 	case SetPreset:
 		return "SetPreset"
+	case SetSwitch:
+		return "SetSwitch"
+	case SetLight:
+		return "SetLight"
+	case SetLED:
+		return "SetLED"
 	}
 	return fmt.Sprintf("CommandKind(%d)", int(k))
 }
@@ -670,6 +808,12 @@ type Command struct {
 	Temperature float64 // SetTemperature: 4.5 … 30.5 in 0.5 steps
 	Mode        string  // SetMode: "auto" | "heat" | "off"
 	Preset      string  // SetPreset: "boost" | "none"
+
+	On         bool     // SetSwitch, SetLight
+	Brightness *int     // SetLight: 0 … 255, nil = not given
+	Transition *float64 // SetLight: seconds, nil = not given
+	LED        int      // SetLED: 1 … LEDCount
+	Color      string   // SetLED: one of LEDColors
 }
 
 // ErrNotCommandTopic is returned by ParseCommand for topics that are not
@@ -731,9 +875,87 @@ func ParseCommand(cfg TopicConfig, topic string, payload []byte) (Command, error
 		}
 		cmd.Kind, cmd.Preset = SetPreset, m
 	default:
-		return Command{}, fmt.Errorf("ha: unknown command %q", what)
+		if what != "switch" && what != "light" && !strings.HasPrefix(what, "led_") {
+			return Command{}, fmt.Errorf("ha: unknown command %q", what)
+		}
+		if cmd.Group != "" {
+			return Command{}, fmt.Errorf("ha: command %q is not supported for groups", what)
+		}
+		if err := parseActuatorCommand(&cmd, what, p); err != nil {
+			return Command{}, err
+		}
 	}
 	return cmd, nil
+}
+
+// parseOnOff parses ON/OFF payloads (case-insensitive; also on/off as
+// true/false/1/0).
+func parseOnOff(p string) (bool, error) {
+	switch strings.ToLower(p) {
+	case "on", "true", "1":
+		return true, nil
+	case "off", "false", "0":
+		return false, nil
+	}
+	return false, fmt.Errorf("ha: invalid switch payload %q (want ON or OFF)", p)
+}
+
+func parseActuatorCommand(cmd *Command, what, p string) error {
+	switch {
+	case what == "switch":
+		on, err := parseOnOff(p)
+		if err != nil {
+			return err
+		}
+		cmd.Kind, cmd.On = SetSwitch, on
+	case what == "light":
+		var j struct {
+			State      string   `json:"state"`
+			Brightness *float64 `json:"brightness"`
+			Transition *float64 `json:"transition"`
+		}
+		if err := json.Unmarshal([]byte(p), &j); err != nil {
+			// Also accept a plain ON/OFF.
+			on, err2 := parseOnOff(p)
+			if err2 != nil {
+				return fmt.Errorf("ha: invalid light payload %q: %v", p, err)
+			}
+			cmd.Kind, cmd.On = SetLight, on
+			return nil
+		}
+		on, err := parseOnOff(j.State)
+		if err != nil {
+			return fmt.Errorf("ha: invalid light state %q", j.State)
+		}
+		cmd.Kind, cmd.On = SetLight, on
+		if b := j.Brightness; b != nil {
+			if math.IsNaN(*b) || *b < 0 || *b > 255 {
+				return fmt.Errorf("ha: brightness %v out of range 0..255", *b)
+			}
+			cmd.Brightness = ptr(int(math.Round(*b)))
+		}
+		if t := j.Transition; t != nil {
+			if math.IsNaN(*t) || *t < 0 || *t > 3600 {
+				return fmt.Errorf("ha: transition %v out of range 0..3600 s", *t)
+			}
+			cmd.Transition = ptr(*t)
+		}
+	default: // led_<n>
+		n, err := strconv.Atoi(strings.TrimPrefix(what, "led_"))
+		if err != nil || n < 1 || n > LEDCount {
+			return fmt.Errorf("ha: invalid LED %q", what)
+		}
+		c := strings.ToLower(p)
+		valid := false
+		for _, o := range LEDColors {
+			valid = valid || c == o
+		}
+		if !valid {
+			return fmt.Errorf("ha: invalid LED color %q (want one of %s)", p, strings.Join(LEDColors, ", "))
+		}
+		cmd.Kind, cmd.LED, cmd.Color = SetLED, n, c
+	}
+	return nil
 }
 
 func validAddr(a string) bool {

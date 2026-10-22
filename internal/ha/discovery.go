@@ -28,12 +28,21 @@ func boolTemplate(field string) string {
 	return fmt.Sprintf("{{ ('ON' if value_json.%[1]s else 'OFF') if value_json.%[1]s is defined else 'None' }}", field)
 }
 
-// entity describes one non-climate entity.
+// entity describes one non-climate entity (or device trigger).
 type entity struct {
-	component string // "sensor" | "binary_sensor"
+	component string // "sensor", "binary_sensor", "switch", "light", "event", "select", "device_automation"
 	key       string // unique suffix, also object id suffix
 	match     func(DeviceDesc) bool
 	config    map[string]any
+	// command, if set, is the command topic name (…/set/<command>).
+	command string
+	// button, if > 0, makes the entity read the button's event topic
+	// instead of the state topic (event entities, device triggers).
+	button int
+	// staleScope, if set, limits StaleDiscoveryMessages to devices for
+	// which it returns true (so that a thermostat does not get removal
+	// messages for 16 LEDs and 32 button triggers on every connect).
+	staleScope func(DeviceDesc) bool
 }
 
 func kinds(ks ...Kind) func(DeviceDesc) bool {
@@ -49,12 +58,24 @@ func kinds(ks ...Kind) func(DeviceDesc) bool {
 
 var (
 	thermostats = kinds(RadiatorThermostat, WallThermostat)
-	allKinds    = kinds(RadiatorThermostat, WallThermostat, WindowContact)
+	allKinds    = kinds(RadiatorThermostat, WallThermostat, WindowContact, Switch, Dimmer, Remote, LEDDisplay, WeatherSensor)
 	rtOnly      = kinds(RadiatorThermostat)
 	tcOnly      = kinds(WallThermostat)
 	windowKinds = kinds(WallThermostat, WindowContact)
 	rhsOnly     = func(d DeviceDesc) bool { return d.Kind == WindowContact && IsThreeState(d.Model) }
 	contactOnly = func(d DeviceDesc) bool { return d.Kind == WindowContact }
+
+	// Battery powered devices that report a low battery.
+	batteryKinds = kinds(RadiatorThermostat, WallThermostat, WindowContact, Remote, WeatherSensor)
+	// Devices with AES (the weather sensors have none).
+	aesKinds = kinds(RadiatorThermostat, WallThermostat, WindowContact, Switch, Dimmer, Remote, LEDDisplay)
+	// Devices that take commands.
+	commandKinds     = kinds(RadiatorThermostat, WallThermostat, Switch, Dimmer, LEDDisplay)
+	temperatureKinds = kinds(RadiatorThermostat, WallThermostat, WeatherSensor)
+	humidityKinds    = func(d DeviceDesc) bool {
+		return d.Kind == WallThermostat || d.Kind == WeatherSensor && HasHumidity(d.Model)
+	}
+	faultKinds = kinds(RadiatorThermostat, Dimmer)
 )
 
 func binarySensor(name, field, deviceClass string, extra map[string]any) map[string]any {
@@ -103,29 +124,29 @@ func with(ms ...map[string]any) map[string]any {
 // everything technical. Disabled by default: RSSI, message counter.
 func entities() []entity {
 	disabled := map[string]any{"enabled_by_default": false}
-	return []entity{
-		{"sensor", "temperature", thermostats, numSensor("Temperature", "current_temperature", "temperature", "°C",
+	list := []entity{
+		{component: "sensor", key: "temperature", match: temperatureKinds, config: numSensor("Temperature", "current_temperature", "temperature", "°C",
 			map[string]any{"suggested_display_precision": 1})},
-		{"sensor", "target_temperature", thermostats, numSensor("Target temperature", "target_temperature", "temperature", "°C",
+		{component: "sensor", key: "target_temperature", match: thermostats, config: numSensor("Target temperature", "target_temperature", "temperature", "°C",
 			map[string]any{"suggested_display_precision": 1})},
-		{"sensor", "humidity", tcOnly, numSensor("Humidity", "humidity", "humidity", "%", nil)},
-		{"sensor", "valve_position", rtOnly, numSensor("Valve position", "valve_position", "", "%",
+		{component: "sensor", key: "humidity", match: humidityKinds, config: numSensor("Humidity", "humidity", "humidity", "%", nil)},
+		{component: "sensor", key: "valve_position", match: rtOnly, config: numSensor("Valve position", "valve_position", "", "%",
 			map[string]any{"icon": "mdi:pipe-valve"})},
 		// Contacts report low battery only, no voltage.
-		{"sensor", "battery_voltage", thermostats, numSensor("Battery voltage", "battery_voltage", "voltage", "V",
+		{component: "sensor", key: "battery_voltage", match: thermostats, config: numSensor("Battery voltage", "battery_voltage", "voltage", "V",
 			map[string]any{"suggested_display_precision": 1})},
-		{"sensor", "battery", thermostats, numSensor("Battery (estimated)", "battery_percent", "battery", "%", nil)},
-		{"binary_sensor", "low_battery", allKinds, binarySensor("Battery low", "low_battery", "battery", nil)},
-		{"binary_sensor", "window_open", windowKinds, binarySensor("Window", "window_open", "window", nil)},
-		{"sensor", "window_state", rhsOnly, map[string]any{
+		{component: "sensor", key: "battery", match: thermostats, config: numSensor("Battery (estimated)", "battery_percent", "battery", "%", nil)},
+		{component: "binary_sensor", key: "low_battery", match: batteryKinds, config: binarySensor("Battery low", "low_battery", "battery", nil)},
+		{component: "binary_sensor", key: "window_open", match: windowKinds, config: binarySensor("Window", "window_open", "window", nil)},
+		{component: "sensor", key: "window_state", match: rhsOnly, config: map[string]any{
 			"name":           "Window state",
 			"device_class":   "enum",
 			"options":        []string{WindowClosed, WindowTilted, WindowOpened},
 			"icon":           "mdi:window-open-variant",
 			"value_template": textTemplate("window_state", "None"),
 		}},
-		{"binary_sensor", "sabotage", contactOnly, binarySensor("Sabotage", "sabotage", "tamper", diagnostic)},
-		{"sensor", "control_mode", thermostats, with(diagnostic, map[string]any{
+		{component: "binary_sensor", key: "sabotage", match: contactOnly, config: binarySensor("Sabotage", "sabotage", "tamper", diagnostic)},
+		{component: "sensor", key: "control_mode", match: thermostats, config: with(diagnostic, map[string]any{
 			"name":           "Control mode",
 			"device_class":   "enum",
 			"options":        []string{"auto", "manual", "party", "boost"},
@@ -134,41 +155,137 @@ func entities() []entity {
 		})},
 		// Both models report the remaining boost time in minutes
 		// (BOOST_STATE, unit "min" in eQ-3's rftypes XML).
-		{"sensor", "boost_minutes", thermostats, numSensor("Boost remaining", "boost_minutes", "duration", "min",
+		{component: "sensor", key: "boost_minutes", match: thermostats, config: numSensor("Boost remaining", "boost_minutes", "duration", "min",
 			with(diagnostic, map[string]any{"icon": "mdi:rocket-launch"}))},
 		// Former TC-only raw boost sensor: matches nothing, so
 		// StaleDiscoveryMessages removes it from existing installations.
-		{"sensor", "boost_state", func(DeviceDesc) bool { return false }, nil},
-		{"sensor", "last_command", thermostats, with(diagnostic, map[string]any{
+		{component: "sensor", key: "boost_state", match: func(DeviceDesc) bool { return false }, config: nil},
+		{component: "sensor", key: "last_command", match: commandKinds, config: with(diagnostic, map[string]any{
 			"name":           "Last command",
 			"icon":           "mdi:send-check-outline",
 			"value_template": textTemplate("last_command", "None"),
 		})},
-		{"sensor", "fault", rtOnly, with(diagnostic, map[string]any{
+		{component: "sensor", key: "fault", match: faultKinds, config: with(diagnostic, map[string]any{
 			"name":           "Fault",
 			"icon":           "mdi:alert-circle-outline",
 			"value_template": textTemplate("fault", "None"),
 		})},
-		{"binary_sensor", "comm_reporting", tcOnly, binarySensor("Communication reporting", "comm_reporting", "",
+		{component: "binary_sensor", key: "comm_reporting", match: tcOnly, config: binarySensor("Communication reporting", "comm_reporting", "",
 			with(diagnostic, map[string]any{"icon": "mdi:access-point"}))},
-		{"sensor", "auth_status", allKinds, with(diagnostic, map[string]any{
+		{component: "sensor", key: "auth_status", match: aesKinds, config: with(diagnostic, map[string]any{
 			"name":           "AES authentication",
 			"icon":           "mdi:shield-key-outline",
 			"value_template": textTemplate("auth_status", "None"),
 		})},
-		{"sensor", "last_seen", allKinds, with(diagnostic, map[string]any{
+		{component: "sensor", key: "last_seen", match: allKinds, config: with(diagnostic, map[string]any{
 			"name":           "Last seen",
 			"device_class":   "timestamp",
 			"value_template": textTemplate("last_seen", "None"),
 		})},
-		{"sensor", "rssi", allKinds, numSensor("RSSI", "rssi", "signal_strength", "dBm", with(diagnostic, disabled))},
-		{"sensor", "messages_received", allKinds, with(diagnostic, disabled, map[string]any{
+		{component: "sensor", key: "rssi", match: allKinds, config: numSensor("RSSI", "rssi", "signal_strength", "dBm", with(diagnostic, disabled))},
+		{component: "sensor", key: "messages_received", match: allKinds, config: with(diagnostic, disabled, map[string]any{
 			"name":           "Messages received",
 			"state_class":    "total_increasing",
 			"icon":           "mdi:counter",
 			"value_template": numTemplate("messages_received"),
 		})},
 	}
+	list = append(list, actuatorEntities()...)
+	list = append(list, buttonEntities()...)
+	return append(list, ledEntities()...)
+}
+
+// actuatorEntities: the switch plug's switch and the dimmer's light.
+func actuatorEntities() []entity {
+	return []entity{
+		{component: "switch", key: "switch", match: kinds(Switch), command: "switch", config: map[string]any{
+			"name":           nil, // entity takes the device name
+			"value_template": boolTemplate("on"),
+			"payload_on":     "ON",
+			"payload_off":    "OFF",
+			"state_on":       "ON",
+			"state_off":      "OFF",
+			"optimistic":     false,
+			"qos":            1,
+		}},
+		// Template schema: the state comes from the shared state topic,
+		// and the command carries brightness and transition as JSON.
+		{component: "light", key: "light", match: kinds(Dimmer), command: "light", config: map[string]any{
+			"name":                 nil,
+			"schema":               "template",
+			"command_on_template":  `{"state": "on"{% if brightness is defined %}, "brightness": {{ brightness }}{% endif %}{% if transition is defined %}, "transition": {{ transition }}{% endif %}}`,
+			"command_off_template": `{"state": "off"{% if transition is defined %}, "transition": {{ transition }}{% endif %}}`,
+			"state_template":       "{{ ('on' if value_json.on else 'off') if value_json.on is defined else 'None' }}",
+			"brightness_template":  "{{ (value_json.level * 2.55) | round(0) | int if value_json.level is defined else 'None' }}",
+			"optimistic":           false,
+			"qos":                  1,
+		}},
+	}
+}
+
+// MaxButtons is the largest number of buttons of a supported remote.
+const MaxButtons = 8
+
+// Device trigger types per press type (HA's names for button triggers).
+var triggerTypes = map[string]string{
+	PressShort:       "button_short_press",
+	PressLong:        "button_long_press",
+	PressLongRelease: "button_long_release",
+}
+
+// buttonEntities: per button an event entity and a device trigger per
+// press type, all reading the button's event topic.
+func buttonEntities() []entity {
+	var list []entity
+	remoteScope := kinds(Remote)
+	for n := 1; n <= MaxButtons; n++ {
+		n := n
+		has := func(d DeviceDesc) bool { return d.Kind == Remote && Buttons(d.Model) >= n }
+		list = append(list, entity{
+			component: "event", key: fmt.Sprintf("button_%d", n), match: has, button: n, staleScope: remoteScope,
+			config: map[string]any{
+				"name":         fmt.Sprintf("Button %d", n),
+				"device_class": "button",
+				"event_types":  PressTypes,
+				"qos":          1,
+			},
+		})
+		for _, pt := range PressTypes {
+			list = append(list, entity{
+				component: "device_automation", key: fmt.Sprintf("button_%d_%s", n, pt), match: has, button: n, staleScope: remoteScope,
+				config: map[string]any{
+					"automation_type": "trigger",
+					"type":            triggerTypes[pt],
+					"subtype":         fmt.Sprintf("button_%d", n),
+					"payload":         pt,
+					"value_template":  "{{ value_json.event_type }}",
+					"qos":             1,
+				},
+			})
+		}
+	}
+	return list
+}
+
+// ledEntities: one select per LED of the HM-OU-LED16.
+func ledEntities() []entity {
+	var list []entity
+	for n := 1; n <= LEDCount; n++ {
+		i := n - 1
+		list = append(list, entity{
+			component: "select", key: fmt.Sprintf("led_%d", n), match: kinds(LEDDisplay),
+			command: fmt.Sprintf("led_%d", n), staleScope: kinds(LEDDisplay),
+			config: map[string]any{
+				"name":           fmt.Sprintf("LED %d", n),
+				"options":        LEDColors,
+				"icon":           "mdi:led-on",
+				"value_template": fmt.Sprintf("{{ value_json.leds[%[1]d] if value_json.leds is defined and value_json.leds|length > %[1]d and value_json.leds[%[1]d] else 'None' }}", i),
+				"optimistic":     false,
+				"qos":            1,
+			},
+		})
+	}
+	return list
 }
 
 // node is an HA device: a BidCoS device or a heating group.
@@ -180,6 +297,8 @@ type node struct {
 	humidity   bool // climate shows current humidity
 	// deviceAvail is the per-device availability topic ("" for groups).
 	deviceAvail string
+	// eventTopic returns a button's event topic (nil for groups).
+	eventTopic func(button int) string
 }
 
 func deviceNode(cfg TopicConfig, d DeviceDesc) node {
@@ -206,6 +325,7 @@ func deviceNode(cfg TopicConfig, d DeviceDesc) node {
 		device:      dev,
 		humidity:    d.Kind == WallThermostat,
 		deviceAvail: cfg.DeviceAvailabilityTopic(addr),
+		eventTopic:  func(button int) string { return cfg.EventTopic(addr, button) },
 	}
 }
 
@@ -318,18 +438,30 @@ func retained(topic string, payload []byte) Message {
 }
 
 func entityMessage(cfg TopicConfig, n node, e entity) Message {
-	m := e.config
-	if m == nil {
-		m = map[string]any{}
+	m := with(e.config) // copy: configs may be shared
+	topic := entityTopic(cfg, e.component, n.id, e.key)
+	if e.component == "device_automation" {
+		// A device trigger is no entity: no unique_id or availability.
+		m["topic"] = n.eventTopic(e.button)
+		m["device"] = n.device
+		return retained(topic, mustJSON(m))
 	}
-	m["state_topic"] = n.stateTopic
+	if e.button > 0 {
+		m["state_topic"] = n.eventTopic(e.button)
+	} else {
+		m["state_topic"] = n.stateTopic
+	}
+	if e.command != "" {
+		m["command_topic"] = n.cmdTopic(e.command)
+	}
 	common(cfg, n, e.component, n.id+"_"+e.key, e.key, m)
-	return retained(entityTopic(cfg, e.component, n.id, e.key), mustJSON(m))
+	return retained(topic, mustJSON(m))
 }
 
 // DiscoveryMessages returns the retained HA MQTT discovery config messages
-// for d: a climate entity (thermostats only) plus the sensors and binary
-// sensors for d.Kind / d.Model.
+// for d: a climate entity (thermostats only) plus the entities (sensors,
+// binary sensors, switch, light, selects, events) and device triggers for
+// d.Kind / d.Model.
 func DiscoveryMessages(cfg TopicConfig, d DeviceDesc) []Message {
 	n := deviceNode(cfg, d)
 	var msgs []Message
@@ -366,7 +498,7 @@ func StaleDiscoveryMessages(cfg TopicConfig, d DeviceDesc) []Message {
 		msgs = append(msgs, retained(climateTopic(cfg, id), nil))
 	}
 	for _, e := range entities() {
-		if !e.match(d) {
+		if !e.match(d) && (e.staleScope == nil || e.staleScope(d)) {
 			msgs = append(msgs, retained(entityTopic(cfg, e.component, id, e.key), nil))
 		}
 	}
@@ -374,7 +506,7 @@ func StaleDiscoveryMessages(cfg TopicConfig, d DeviceDesc) []Message {
 }
 
 func groupWindowEntity() entity {
-	return entity{"binary_sensor", "window_open", nil, binarySensor("Window", "window_open", "window", nil)}
+	return entity{component: "binary_sensor", key: "window_open", config: binarySensor("Window", "window_open", "window", nil)}
 }
 
 // GroupDiscoveryMessages returns the discovery messages for a heating

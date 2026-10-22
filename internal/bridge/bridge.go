@@ -28,9 +28,9 @@ import (
 	"github.com/fjaeckel/hmgo/internal/config"
 	"github.com/fjaeckel/hmgo/internal/ha"
 	"github.com/fjaeckel/hmgo/internal/hm"
-	"github.com/fjaeckel/hmgo/internal/hm/contact"
-	"github.com/fjaeckel/hmgo/internal/hm/heating"
-	"github.com/fjaeckel/hmgo/internal/hm/thermal"
+	"github.com/fjaeckel/hmgo/internal/hm/devices"
+	"github.com/fjaeckel/hmgo/internal/hm/power"
+	"github.com/fjaeckel/hmgo/internal/hm/remote"
 	"github.com/fjaeckel/hmgo/internal/uartgw"
 )
 
@@ -57,6 +57,9 @@ type Options struct {
 	Now func() time.Time
 	// Logf logs; nil means log.Printf.
 	Logf func(format string, args ...any)
+	// Debugf logs details only wanted with -debug (e.g. messages that
+	// are not decoded); nil discards them.
+	Debugf func(format string, args ...any)
 	// RetryDelay is the delay before retrying a command a device did not
 	// answer. Zero means 20s.
 	RetryDelay time.Duration
@@ -73,21 +76,31 @@ type Options struct {
 	// StateSaveInterval overrides the configured minimum time between
 	// state file writes (for tests). Zero means the configuration.
 	StateSaveInterval time.Duration
+	// StatusPollStagger is the spacing of the status requests sent to
+	// the actuators after startup: the i-th actuator is asked after
+	// (i+1)·StatusPollStagger. Zero means 2s.
+	StatusPollStagger time.Duration
+	// ReleaseCheckInterval is how often long button presses are checked
+	// for a missing release. Zero means 500ms.
+	ReleaseCheckInterval time.Duration
 }
 
 // Bridge is the hmbridge core. Create it with New, then call Setup once
 // and Run.
 type Bridge struct {
-	cfg        *config.Config
-	radio      Radio
-	bcs        *bidcos.Sender
-	now        func() time.Time
-	logf       func(string, ...any)
-	retryDelay time.Duration
-	retries    int
-	clockSync  func() bool
-	housekeep  time.Duration
-	stateFile  string
+	cfg          *config.Config
+	radio        Radio
+	bcs          *bidcos.Sender
+	now          func() time.Time
+	logf         func(string, ...any)
+	debugf       func(string, ...any)
+	retryDelay   time.Duration
+	pollStagger  time.Duration
+	releaseCheck time.Duration
+	retries      int
+	clockSync    func() bool
+	housekeep    time.Duration
+	stateFile    string
 
 	// Event-loop-only state (not guarded by mu).
 	clockWasSynced bool // result of the last clock sync check
@@ -141,6 +154,11 @@ type device struct {
 	available, availPublished bool
 	// heardSinceStart is set once a message arrived after startup.
 	heardSinceStart bool
+	// tracker turns a remote's key events into presses (remotes only).
+	tracker *remote.Tracker
+	// lastOnLevel is the last level (percent) > 0 of a dimmer, used when
+	// Home Assistant switches it on without a brightness.
+	lastOnLevel float64
 }
 
 type group struct {
@@ -183,6 +201,9 @@ func New(opts Options) (*Bridge, error) {
 		radio:        opts.Radio,
 		now:          opts.Now,
 		logf:         opts.Logf,
+		debugf:       opts.Debugf,
+		pollStagger:  opts.StatusPollStagger,
+		releaseCheck: opts.ReleaseCheckInterval,
 		retryDelay:   opts.RetryDelay,
 		retries:      opts.Retries,
 		clockSync:    opts.ClockSynced,
@@ -213,6 +234,15 @@ func New(opts Options) (*Bridge, error) {
 	if b.logf == nil {
 		b.logf = log.Printf
 	}
+	if b.debugf == nil {
+		b.debugf = func(string, ...any) {}
+	}
+	if b.pollStagger <= 0 {
+		b.pollStagger = 2 * time.Second
+	}
+	if b.releaseCheck <= 0 {
+		b.releaseCheck = 500 * time.Millisecond
+	}
 	if b.retryDelay == 0 {
 		b.retryDelay = 20 * time.Second
 	}
@@ -226,22 +256,13 @@ func New(opts Options) (*Bridge, error) {
 	for i := range b.cfg.Devices {
 		dc := &b.cfg.Devices[i]
 		sd := hm.NewStandardDevice(b.bcs, dc.Addr(), dc.Name)
-		var dev hm.Device
 		kind, ok := ha.KindForModel(dc.Model)
 		if !ok {
 			return nil, fmt.Errorf("bridge: model %q of %s not supported by the Home Assistant layer", dc.Model, dc.Name)
 		}
-		switch dc.Model {
-		case config.ModelRTDN:
-			dev = heating.NewThermostat(sd)
-		case config.ModelTC:
-			dev = thermal.NewThermalControl(sd)
-		default:
-			c, err := contact.NewContact(sd, dc.Model)
-			if err != nil {
-				return nil, fmt.Errorf("bridge: %s: %v", dc.Name, err)
-			}
-			dev = c
+		dev, err := devices.New(sd, dc.Model)
+		if err != nil {
+			return nil, fmt.Errorf("bridge: %s: %v", dc.Name, err)
 		}
 		d := &device{
 			cfg: dc,
@@ -254,6 +275,9 @@ func New(opts Options) (*Bridge, error) {
 				Kind:   kind,
 			},
 			available: true,
+		}
+		if kind == ha.Remote {
+			d.tracker = &remote.Tracker{}
 		}
 		b.devices = append(b.devices, d)
 		b.byAddr[dc.Addr()] = d
@@ -384,7 +408,11 @@ func (b *Bridge) PublishAll() {
 func (b *Bridge) Run(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	var wg sync.WaitGroup
-	wg.Add(3)
+	wg.Add(4)
+	go func() {
+		defer wg.Done()
+		b.initialStatusPolls(ctx)
+	}()
 	go func() {
 		defer wg.Done()
 		b.worker(ctx)
@@ -423,6 +451,17 @@ func (b *Bridge) Run(ctx context.Context) error {
 	defer timeSync.Stop()
 	housekeeping := time.NewTicker(b.housekeep)
 	defer housekeeping.Stop()
+	var pollC, releaseC <-chan time.Time
+	if p := b.cfg.StatusPollInterval(); p > 0 && len(b.actuators()) > 0 {
+		poll := time.NewTicker(p)
+		defer poll.Stop()
+		pollC = poll.C
+	}
+	if b.hasRemotes() {
+		rel := time.NewTicker(b.releaseCheck)
+		defer rel.Stop()
+		releaseC = rel.C
+	}
 	b.lastSave = b.now()
 	b.checkClock()
 	// Set the module's clock now if possible: Open skips it while the
@@ -460,6 +499,14 @@ func (b *Bridge) Run(ctx context.Context) error {
 
 		case <-housekeeping.C:
 			b.housekeeping()
+
+		case <-pollC:
+			for _, d := range b.actuators() {
+				b.queue.push(statusJob(d))
+			}
+
+		case <-releaseC:
+			b.expireLongPresses()
 		}
 	}
 }
@@ -567,6 +614,29 @@ func (b *Bridge) handleFrame(frame []byte) {
 	if err != nil {
 		metricDecodeErrors.WithLabelValues(d.desc.Addr, d.cfg.Name).Inc()
 		b.logf("%s (%s): decoding cmd %02x payload %x: %v", d.cfg.Name, d.desc.Addr, pkt.Cmd, pkt.Payload, err)
+	} else if ev == nil && pkt.Cmd != bidcos.Ack {
+		b.debugf("%s (%s): ignoring cmd %02x (flags %02x) payload %x: not used for %s", d.cfg.Name, d.desc.Addr, pkt.Cmd, pkt.Flags, pkt.Payload, d.cfg.Model)
+	}
+	if le, ok := ev.(*power.LevelEvent); ok && le.Channel != power.ActuatorChannel {
+		b.debugf("%s (%s): ignoring level %.1f %% of channel %d (only channel %d is exposed)", d.cfg.Name, d.desc.Addr, le.Percent, le.Channel, power.ActuatorChannel)
+		ev = nil
+	}
+
+	var presses []remote.Press
+	if ke, ok := ev.(*remote.KeyEvent); ok {
+		// Events of AES channels count only when authenticated: a forged
+		// button press could trigger automations. (Long-press repeats
+		// without BiDi cannot be challenged; the authenticated release
+		// then also yields the long press, see remote.Tracker.)
+		if d.cfg.HasAESChannel(ke.Channel) && auth != bidcos.AuthOK {
+			metricUnauthenticated.WithLabelValues(d.desc.Addr, d.cfg.Name).Inc()
+			b.debugf("%s (%s): ignoring unauthenticated %v on an AES channel (flags %02x)", d.cfg.Name, d.desc.Addr, ke, pkt.Flags)
+			return
+		}
+		presses = d.tracker.Process(ke, now)
+		if len(presses) == 0 {
+			b.debugf("%s (%s): %v: repeat or retransmission", d.cfg.Name, d.desc.Addr, ke)
+		}
 	}
 
 	if tr, ok := ev.(*hm.TimeRequest); ok && tr.Dest == central && b.cfg.AnswersTimeRequests() {
@@ -608,6 +678,7 @@ func (b *Bridge) handleFrame(frame []byte) {
 	}
 
 	b.publishDevice(d)
+	b.publishPresses(d, presses)
 }
 
 // recordUnknown remembers a sender that is not configured.
@@ -704,11 +775,13 @@ func (b *Bridge) publisher(ctx context.Context) {
 }
 
 // outbox holds messages waiting to be published, at most one per topic
-// (the latest), in first-queued order.
+// (the latest), in first-queued order. Events (putEvent) are never
+// coalesced: every button press is published.
 type outbox struct {
 	mu     sync.Mutex
 	order  []string
 	msgs   map[string]ha.Message
+	events uint64
 	signal chan struct{}
 }
 
@@ -724,6 +797,20 @@ func (o *outbox) put(msgs ...ha.Message) {
 		}
 		o.msgs[m.Topic] = m
 	}
+	o.mu.Unlock()
+	select {
+	case o.signal <- struct{}{}:
+	default:
+	}
+}
+
+// putEvent queues an event message without replacing anything.
+func (o *outbox) putEvent(m ha.Message) {
+	o.mu.Lock()
+	o.events++
+	key := fmt.Sprintf("%s\x00%d", m.Topic, o.events)
+	o.order = append(o.order, key)
+	o.msgs[key] = m
 	o.mu.Unlock()
 	select {
 	case o.signal <- struct{}{}:
@@ -755,14 +842,17 @@ type Snapshot struct {
 }
 
 type DeviceSnapshot struct {
-	Name      string   `json:"name"`
-	Model     string   `json:"model"`
-	Address   string   `json:"address"`
-	Serial    string   `json:"serial,omitempty"`
-	Group     string   `json:"group,omitempty"`
-	AES       bool     `json:"aes"`
-	LastEvent string   `json:"last_event,omitempty"`
-	State     ha.State `json:"state"`
+	Name      string `json:"name"`
+	Model     string `json:"model"`
+	Address   string `json:"address"`
+	Serial    string `json:"serial,omitempty"`
+	Group     string `json:"group,omitempty"`
+	AES       bool   `json:"aes"`
+	LastEvent string `json:"last_event,omitempty"`
+	// Summary is a short rendering of a switch, dimmer, LED display or
+	// remote state for the status page.
+	Summary string   `json:"summary,omitempty"`
+	State   ha.State `json:"state"`
 }
 
 type GroupSnapshot struct {
@@ -787,6 +877,7 @@ func (b *Bridge) Snapshot() Snapshot {
 			Serial:    d.cfg.Serial,
 			AES:       d.cfg.AESEnabled(),
 			LastEvent: d.lastEvent,
+			Summary:   summary(d.desc.Kind, &st, d.lastEvent),
 			State:     st,
 		}
 		if d.group != nil {

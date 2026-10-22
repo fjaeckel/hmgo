@@ -380,6 +380,10 @@ func (g *generator) readHMMode() string {
 
 // resolveAES derives aes/aes_channels from the per-channel flags.
 func (d *dev) resolveAES() {
+	if !config.SupportsAES(d.model) {
+		d.aesKnown = true // e.g. the weather sensors: no AES at all
+		return
+	}
 	info, src := d.rpcAES, "rfd XML-RPC"
 	if len(info) == 0 {
 		info, src = d.fileAES, "the .dev file"
@@ -466,6 +470,10 @@ func (g *generator) build(groups []openccu.Group, radio string) ([]byte, error) 
 			if d.hasAddr {
 				where = d.addrHex()
 			}
+			if d.model == "HM-RCV-50" {
+				unsupported = append(unsupported, fmt.Sprintf("not a device: %s (%s %s) is OpenCCU's own radio (the central that hmbridge replaces)", name, d.model, where))
+				continue
+			}
 			unsupported = append(unsupported, fmt.Sprintf("not supported yet: %s (%s %s)", name, d.model, where))
 			continue
 		}
@@ -498,6 +506,10 @@ func (g *generator) build(groups []openccu.Group, radio string) ([]byte, error) 
 			}
 			if d.group != "" {
 				g.logf("group %q: %s is already in group %q; left out", gr.Name, s, d.group)
+				continue
+			}
+			if !config.IsThermostat(d.model) && !config.IsContact(d.model) {
+				g.logf("group %q: %s is a %s, not a thermostat or window contact; left out", gr.Name, s, d.model)
 				continue
 			}
 			members = append(members, d)

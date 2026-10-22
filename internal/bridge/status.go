@@ -102,9 +102,9 @@ th{background:#eee}.warn{color:#b00;font-weight:600}.muted{color:#888}
 
 <h2>Devices</h2>
 <div class="wrap"><table>
-<tr><th>Name</th><th>Model</th><th>Address</th><th>Group</th><th>Last seen</th><th>RSSI</th><th>Battery</th><th>Low bat.</th><th>Temp.</th><th>Target</th><th>Mode</th><th>Valve</th><th>Hum.</th><th>Window</th><th>Fault</th><th>AES</th><th>Msgs</th></tr>
+<tr><th>Name</th><th>Model</th><th>Address</th><th>Group</th><th>State</th><th>Last seen</th><th>RSSI</th><th>Battery</th><th>Low bat.</th><th>Temp.</th><th>Target</th><th>Mode</th><th>Valve</th><th>Hum.</th><th>Window</th><th>Fault</th><th>AES</th><th>Msgs</th></tr>
 {{range .Devices}}<tr>
-<td>{{.Name}}</td><td>{{.Model}}</td><td>{{.Address}}</td><td>{{.Group}}</td>
+<td>{{.Name}}</td><td>{{.Model}}</td><td>{{.Address}}</td><td>{{.Group}}</td><td>{{.Summary}}</td>
 <td>{{ago .State.LastSeen}}</td><td>{{i .State.RSSI}}</td>
 <td>{{f1 .State.BatteryVoltage}}{{if .State.BatteryVoltage}} V{{end}}{{pct .State.BatteryVoltage}}</td>
 <td{{if deref .State.LowBattery}} class="warn"{{end}}>{{b .State.LowBattery}}</td>

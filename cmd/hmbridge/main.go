@@ -42,7 +42,7 @@ import (
 var (
 	configPath  = flag.String("config", "/etc/hmbridge/config.json", "path to the JSON configuration")
 	checkConfig = flag.Bool("check_config", false, "validate the configuration and exit")
-	debugFrames = flag.Bool("debug", false, "log every frame exchanged with the radio module (keys are redacted)")
+	debugFrames = flag.Bool("debug", false, "log every frame exchanged with the radio module (keys are redacted) and every message hmbridge does not use")
 	showVersion = flag.Bool("version", false, "print the version and exit")
 	showLicense = flag.Bool("license", false, "print the licenses and exit")
 )
@@ -121,7 +121,15 @@ func run(ctx context.Context, cfg *config.Config, uart io.ReadWriteCloser) error
 		log.Printf("RPI-RF-MOD support is experimental: acknowledgements and AES are done in software, and parts of the module protocol are still unverified (see docs/SNIFFING.md)")
 	}
 
-	b, err := bridge.New(bridge.Options{Config: cfg, Radio: conn})
+	var debugf func(string, ...any)
+	if *debugFrames {
+		debugf = log.Printf
+	}
+	opts := bridge.Options{Config: cfg, Radio: conn, Debugf: debugf}
+	if testBridgeOptions != nil {
+		testBridgeOptions(&opts)
+	}
+	b, err := bridge.New(opts)
 	if err != nil {
 		return err
 	}
@@ -204,6 +212,10 @@ func run(ctx context.Context, cfg *config.Config, uart io.ReadWriteCloser) error
 
 // openModule initialises the radio module selected by cfg.Radio ("auto"
 // detects it).
+// testBridgeOptions lets tests shorten the bridge's delays (retries,
+// status polls). Always nil outside tests.
+var testBridgeOptions func(*bridge.Options)
+
 func openModule(cfg *config.Config, uart io.ReadWriter) (uartgw.Module, error) {
 	current, previous := cfg.Keys()
 	keys := []hmkey.Key{*current}

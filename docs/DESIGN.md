@@ -9,7 +9,10 @@ github.com/fjaeckel/hmgo).
 ## Goals (prototype)
 
 * Supported devices: HM-CC-RT-DN (radiator valve drive, “heating” package)
-  and HM-TC-IT-WM-W-EU (wall thermostat, “thermal” package).
+  and HM-TC-IT-WM-W-EU (wall thermostat, “thermal” package); later window
+  contacts (“contact”), switch and dimmer plugs (“power”), remotes
+  (“remote”), the LED display (“led16”) and weather sensors (“weather”), see
+  “Other device families” below.
 * Take over existing devices without re-pairing: hmbridge uses the
   CCU's BidCoS address (“central address”) and the CCU's AES key, so the
   devices keep talking to “their” central.
@@ -51,6 +54,7 @@ Package ownership (one owner per package while building in parallel):
 | `internal/uartgw/fakemod` | emulated HM-MOD-RPI-PCB for tests |
 | `internal/config` | JSON config, defaults, validation |
 | `internal/hm/...` | device models: event decoders (existing) + command encoders |
+| `internal/hm/devices` | model name → device model, shared by hmbridge and hmsniff |
 | `internal/ha` | HA discovery payloads, state/command topics, MQTT client |
 | `internal/bridge` | glue: registry, event loop, command handling, status page |
 | `cmd/hmbridge` | main: flags, serial setup, GPIO reset, signal handling |
@@ -245,7 +249,8 @@ Robustness:
 * **availability:** each device has a retained `<base>/<addr>/availability`
   topic; entities are available only while the bridge and the device are
   online. A device is offline once silent for longer than its stale
-  timeout (30m thermostats, 6h HM-Sec-SCo, 50h other contacts).
+  timeout (30m thermostats, 1h weather sensors, 6h HM-Sec-SCo, 50h other
+  contacts, 3 status poll intervals for actuators, never for remotes).
 * **persistence, SD-card friendly:** after a restart the state is read back
   from the broker's retained state messages (no writes on the Pi). A small
   state file is the fallback when the broker is unreachable at startup; a
@@ -265,6 +270,67 @@ Robustness:
   acknowledged, the connection fails (`uartgw.ErrModuleUnresponsive`) and
   the process exits for systemd to restart it. Module firmware ≤ 1.0.6
   is refused (`uartgw.ErrFirmwareTooOld`).
+
+## Other device families
+
+Layouts from eQ-3's device descriptions (rftypes XML, as shipped with
+Homegear) unless noted; payload byte 0 is the first byte after the
+addresses. “Captured” means seen in the user's hmsniff recordings of
+OpenCCU.
+
+| model | package | frames used |
+|---|---|---|
+| HM-LC-Sw1-Pl-DN-R1 (1 ch) | `hm/power` | LEVEL_SET `11 02 ch level ramp(2) [on_time(2)]`; LEVEL_GET `01 ch 0E` → INFO_LEVEL; ACK_STATUS `02 01 ch level flags rssi`; INFO_LEVEL `10 06 ch level flags` |
+| HM-LC-Dim1L-Pl-3 (ch 1 real, 2-3 virtual) | `hm/power` | as the switch; flags bits 4-5 direction (1 up, 2 down), 4-6 non-zero while working, bits 1-3 ERROR (3 = LOAD_FAILURE) |
+| HM-PB-2-WM55 (2 ch), HM-RC-8 (8 ch) | `hm/remote` | KEY_EVENT `40 btn counter`: btn bits 0-5 channel, bit 6 long, bit 7 low battery |
+| HM-OU-LED16 (16 ch) | `hm/led16` | SET_ONE_CHANNEL `11 80 ch color` (captured from OpenCCU, flags A0); GET `01 ch 0E`; ACK_STATUS/INFO_LEVEL `… ch color`; colors 0 off, 1 red, 2 green, 3 orange |
+| HM-WDS10-TH-O, HM-WDS30-T-O (1 ch, no AES) | `hm/weather` | WEATHER_EVENT `70 t_hi t_lo [hum]`: 15-bit signed temperature ×0.1 °C, bit 15 low battery, humidity % (TH only); captured `006450` = 10.0 °C 80 %, `008264` = 13.0 °C (third byte unused on the T-O) |
+
+Level 0x00…0xC8 = 0…100 % in 0.5 % steps; times (ramp, on time) are
+eQ-3's 16-bit tiny float: mantissa bits 5-15, exponent bits 0-4, value =
+mantissa·2^exponent·0.1 s. Actuator commands are BiDi without burst (the
+devices are mains powered and always listening).
+
+Not verified against the real devices yet (assumptions): the low battery
+bit (bit 7) of KEY_EVENT and WEATHER_EVENT (FHEM reads it so; eQ-3 derives
+LOWBAT “internally”); which flags the remotes' long-press repeats carry;
+the dimmer's ACK_STATUS while ramping.
+
+**Remotes.** eQ-3 defines PRESS_LONG_RELEASE as KEY_EVENT_LONG_BIDI: a long
+KEY_EVENT with the BiDi flag; repeats while a button is held are sent
+without BiDi, with the press counter unchanged. `remote.Tracker` turns the
+frames into events per button: short → `press_short` (a repeated counter
+within 10 s is a retransmission); the first long frame of a counter →
+`press_long`; long+BiDi → `press_long_release` (preceded by a synthetic
+`press_long` if none was seen); no repeat or release for 5 s, or a frame
+with a new counter, → synthetic `press_long_release`. Events of AES
+channels are only accepted when authenticated, so on AES buttons the
+unauthenticated repeats are dropped and the long press arrives with the
+release. Events are published to `<base>/<addr>/event/button_<n>`, not
+retained, and the outbox never coalesces them (`outbox.putEvent`); they are
+neither persisted nor part of the state. Home Assistant gets an `event`
+entity per button and `device_automation` triggers (value template
+`value_json.event_type`).
+
+**Actuators.** Commands are jobs like the climate commands, coalesced and
+superseded per output (`level:<addr>`, `led:<addr>:<n>`; the LEDs are
+independent), retried twice when unanswered, and reported in
+`last_command`. The device's direct answer (ACK_STATUS) is applied
+immediately; a plain ACK or a ramping ACK_STATUS shows the commanded level
+until the final INFO_LEVEL. A status request (LEVEL_GET) is answered with
+INFO_LEVEL instead of an ACK; the radio layer returns it like any response.
+Status requests go out once after startup (staggered by 2 s) and every
+`status_poll_interval`; they are never retried, failures are only logged
+with `-debug` (availability shows an unreachable device). Switch level,
+dimmer level (and the last level > 0, used for “on” without brightness)
+and LED colors are significant for the state file.
+
+**RPI-RF-MOD.** The software ACK path already acknowledges every BiDi
+message of a configured peer to the central, including KEY_EVENTs. AES
+challenges now follow the peer's AES channels where the channel is
+unambiguous (KEY_EVENT 0x40 and SENSOR_EVENT 0x41: low 6 bits of byte 0),
+like the radio modules' per-channel AES table; other messages of AES peers
+are challenged as before.
 
 ## Running alongside OpenCCU
 

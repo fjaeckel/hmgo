@@ -109,8 +109,8 @@ func TestGenerateAllSources(t *testing.T) {
 	if cur, prev := cfg.Keys(); cur.Index != 2 || prev == nil || prev.Index != 1 {
 		t.Errorf("key indexes: current %v previous %v", cur, prev)
 	}
-	if len(cfg.Devices) != 11 {
-		t.Errorf("%d devices, want 11\n%s", len(cfg.Devices), out)
+	if len(cfg.Devices) != 19 {
+		t.Errorf("%d devices, want 19\n%s", len(cfg.Devices), out)
 	}
 
 	type want struct {
@@ -128,6 +128,15 @@ func TestGenerateAllSources(t *testing.T) {
 		{"Wohnzimmer Heizkörper NEQ1007152", "NEQ1007152", true, []byte{1, 2, 3, 4, 5, 6}, 2},
 		{"Wohnzimmer Heizkörper PEQ1190989", "PEQ1190989", false, nil, 2},
 		{"EG Livingroom HM-CC-RT-DN", "NEQ1009870", true, []byte{1, 2, 3, 4, 5, 6}, 1},
+		// The other classic devices of the user's installation.
+		{"Stehlampe Schalter", "LEQ0123456", false, nil, 2},
+		{"Stehlampe Wohnzimmer", "PEQ1107611", true, []byte{1}, 2},
+		{"Leselampe", "MEQ1116747", false, nil, 2},
+		{"Taster Flur", "REQ1215000", true, []byte{1, 2}, 2},
+		{"Fernbedienung", "PEQ1918407", true, []byte{1, 2, 3, 4, 5, 6, 7}, 2},
+		{"Statusanzeige", "SEQ1234485", false, nil, 2},
+		{"Garten Außen", "QEQ1859460", false, nil, 2},
+		{"Teich", "TEQ0694924", false, nil, 2},
 	} {
 		d := device(cfg, w.name)
 		if d == nil {
@@ -142,8 +151,18 @@ func TestGenerateAllSources(t *testing.T) {
 		t.Errorf("Büro Heizung address %s", d.AddrHex())
 	}
 	// aes_channels is only written when not all channels are secured.
-	if strings.Contains(out, `"aes_channels": [`+"\n        1,") {
-		t.Errorf("aes_channels written for a fully secured device:\n%s", out)
+	for _, dv := range raw["devices"].([]any) {
+		m := dv.(map[string]any)
+		switch m["name"] {
+		case "Büro Heizung", "Taster Flur":
+			if m["aes_channels"] != nil {
+				t.Errorf("aes_channels written for the fully secured %v", m)
+			}
+		case "Fernbedienung":
+			if m["aes_channels"] == nil {
+				t.Errorf("aes_channels missing for the partly secured %v", m)
+			}
+		}
 	}
 
 	groups := cfg.ResolvedGroups()
@@ -161,7 +180,7 @@ func TestGenerateAllSources(t *testing.T) {
 		t.Errorf("EG Office: %+v", g)
 	}
 	// Devices are sorted by group, then name; ungrouped last.
-	if cfg.Devices[0].Name != "EG Livingroom HM-CC-RT-DN" || cfg.Devices[len(cfg.Devices)-1].Name != "Küche Heizung" {
+	if cfg.Devices[0].Name != "EG Livingroom HM-CC-RT-DN" || cfg.Devices[len(cfg.Devices)-1].Name != "Teich" {
 		t.Errorf("device order: first %q last %q", cfg.Devices[0].Name, cfg.Devices[len(cfg.Devices)-1].Name)
 	}
 
@@ -172,11 +191,23 @@ func TestGenerateAllSources(t *testing.T) {
 	}
 	joined := strings.Join(all, "\n")
 	for _, s := range []string{
-		"not supported yet: Stehlampe Schalter (HM-LC-Sw1-Pl-DN-R1 1D100C)",
-		"not supported yet: Zentrale (HM-RCV-50 458086)",
+		"not supported yet: Bewegungsmelder Flur (HM-Sen-MDIR-WM55 1D2000)",
+		"not a device: Zentrale (HM-RCV-50 458086)",
 	} {
 		if !strings.Contains(joined, s) {
 			t.Errorf("_comment lacks %q:\n%s", s, joined)
+		}
+	}
+	if strings.Contains(joined, "Stehlampe") || strings.Contains(joined, "LED16") {
+		t.Errorf("_comment lists supported devices:\n%s", joined)
+	}
+	// Models without AES get neither aes nor an "AES state unknown" note.
+	for _, name := range []string{"Garten Außen", "Teich"} {
+		for _, dv := range raw["devices"].([]any) {
+			m := dv.(map[string]any)
+			if m["name"] == name && (m["aes"] != nil || m["_comment"] != nil) {
+				t.Errorf("%s: %v", name, m)
+			}
 		}
 	}
 	sec := raw["security"].(map[string]any)
@@ -221,7 +252,7 @@ func TestGenerateXMLRPCOnly(t *testing.T) {
 	// No files at all: devices and the central address come from rfd.
 	xu, _ := servers(t)
 	cfg, _, out := generate(t, Sources{XMLRPCURL: xu})
-	if cfg.CentralAddress != "458086" || len(cfg.Devices) != 11 || cfg.Security != nil {
+	if cfg.CentralAddress != "458086" || len(cfg.Devices) != 19 || cfg.Security != nil {
 		t.Errorf("central %q, %d devices, security %v\n%s", cfg.CentralAddress, len(cfg.Devices), cfg.Security, out)
 	}
 }

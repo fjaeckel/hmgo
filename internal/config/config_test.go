@@ -21,7 +21,7 @@ func TestExampleParses(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, want := len(cfg.Devices), 5; got != want {
+	if got, want := len(cfg.Devices), 10; got != want {
 		t.Fatalf("devices: got %d, want %d", got, want)
 	}
 	cur, prev := cfg.Keys()
@@ -317,5 +317,92 @@ func TestRadioAndResetDefaults(t *testing.T) {
 	}
 	if _, err := Parse([]byte(`{"central_address":"1A2B3C","radio":"cul","devices":[{"name":"a","model":"HM-CC-RT-DN","address":"38F59C"}]}`)); err == nil || !strings.Contains(err.Error(), "radio") {
 		t.Errorf("invalid radio accepted: %v", err)
+	}
+}
+
+func TestNewModels(t *testing.T) {
+	cfg, err := Parse([]byte(`{"central_address":"458086","devices":[
+		{"name":"sw","model":"HM-LC-Sw1-Pl-DN-R1","address":"6A9D15","aes":true},
+		{"name":"dim","model":"HM-LC-Dim1L-Pl-3","address":"41E951","aes_channels":[1,3]},
+		{"name":"pb","model":"HM-PB-2-WM55","address":"73788E","aes":true},
+		{"name":"rc","model":"HM-RC-8","address":"6C10CE","aes":true},
+		{"name":"led","model":"HM-OU-LED16","address":"7564EA","aes":true},
+		{"name":"th","model":"HM-WDS10-TH-O","address":"6FCA4A"},
+		{"name":"t","model":"HM-WDS30-T-O","address":"785B74","stale_after":"3h"},
+		{"name":"rc2","model":"HM-RC-8","address":"6C10CF","stale_after":"12h"}
+	]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name     string
+		channels int
+		aes      []byte
+		stale    time.Duration
+	}{
+		{"sw", 1, []byte{1}, 3*time.Hour + 5*time.Minute},
+		{"dim", 3, []byte{1, 3}, 3*time.Hour + 5*time.Minute},
+		{"pb", 2, []byte{1, 2}, 0},
+		{"rc", 8, []byte{1, 2, 3, 4, 5, 6, 7, 8}, 0},
+		{"led", 16, []byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}, 3*time.Hour + 5*time.Minute},
+		{"th", 1, nil, time.Hour},
+		{"t", 1, nil, 3 * time.Hour},
+		{"rc2", 8, nil, 12 * time.Hour},
+	} {
+		var d *Device
+		for i := range cfg.Devices {
+			if cfg.Devices[i].Name == tc.name {
+				d = &cfg.Devices[i]
+			}
+		}
+		if d.Channels() != tc.channels || !reflect.DeepEqual(d.AESChannelList(), tc.aes) || d.StaleTimeout() != tc.stale {
+			t.Errorf("%s: %d channels, AES %v, stale %v", tc.name, d.Channels(), d.AESChannelList(), d.StaleTimeout())
+		}
+	}
+	dim := cfg.Device([3]byte{0x41, 0xe9, 0x51})
+	if !dim.HasAESChannel(3) || dim.HasAESChannel(2) {
+		t.Error("HasAESChannel")
+	}
+	if cfg.StatusPollInterval() != time.Hour {
+		t.Errorf("status_poll_interval = %v", cfg.StatusPollInterval())
+	}
+	if !IsActuator(ModelLED16) || !IsRemote(ModelPB2) || !IsWeather(ModelWDST) || SupportsAES(ModelWDSTH) || !SupportsAES(ModelRC8) {
+		t.Error("model predicates")
+	}
+
+	// Polling disabled: actuators never go stale by default.
+	cfg, err = Parse([]byte(`{"central_address":"458086","status_poll_interval":"0s","devices":[
+		{"name":"sw","model":"HM-LC-Sw1-Pl-DN-R1","address":"6A9D15"},
+		{"name":"rt","model":"HM-CC-RT-DN","address":"38F59C","stale_after":"0s"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.StatusPollInterval() != 0 || cfg.Devices[0].StaleTimeout() != 0 || cfg.Devices[1].StaleTimeout() != 0 {
+		t.Errorf("poll %v, stale %v %v", cfg.StatusPollInterval(), cfg.Devices[0].StaleTimeout(), cfg.Devices[1].StaleTimeout())
+	}
+}
+
+func TestNewModelValidation(t *testing.T) {
+	dev := func(d string) string {
+		return `{"central_address":"458086","devices":[{"name":"rt","model":"HM-CC-RT-DN","address":"38F59C"},` + d + `]`
+	}
+	for _, tc := range []struct {
+		cfg, want string
+	}{
+		{dev(`{"name":"th","model":"HM-WDS10-TH-O","address":"6FCA4A","aes":true}`) + `}`, "does not support AES"},
+		{dev(`{"name":"t","model":"HM-WDS30-T-O","address":"785B74","aes_channels":[1]}`) + `}`, "does not support AES"},
+		{dev(`{"name":"rc","model":"HM-RC-8","address":"6C10CE","aes_channels":[9]}`) + `}`, "channel 9 out of range 1..8"},
+		{dev(`{"name":"pb","model":"HM-PB-2-WM55","address":"73788E","aes_channels":[0]}`) + `}`, "channel 0 out of range 1..2"},
+		{dev(`{"name":"led","model":"HM-OU-LED16","address":"7564EA","aes_channels":[17]}`) + `}`, "out of range 1..16"},
+		{dev(`{"name":"dim","model":"HM-LC-Dim1L-Pl-3","address":"41E951","aes_channels":[4]}`) + `}`, "out of range 1..3"},
+		{dev(`{"name":"sw","model":"HM-LC-Sw1-Pl-DN-R1","address":"6A9D15"}`) + `,"groups":[{"name":"g","members":["rt","sw"]}]}`, "takes only thermostats and window contacts"},
+		{dev(`{"name":"sw","model":"HM-LC-Sw1-Pl-DN-R1","address":"6A9D15","stale_after":"10s"}`) + `}`, "stale_after"},
+		{dev(`{"name":"sw","model":"HM-LC-Sw1-Pl-DN-R1","address":"6A9D15"}`) + `,"status_poll_interval":"1m"}`, "status_poll_interval"},
+		{dev(`{"name":"x","model":"HM-RCV-50","address":"458087"}`) + `}`, "unsupported model"},
+	} {
+		_, err := Parse([]byte(tc.cfg))
+		if err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("%s: got %v, want %q", tc.cfg, err, tc.want)
+		}
 	}
 }

@@ -26,7 +26,7 @@ var (
 	})
 	metricPublished = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: "hmbridge", Subsystem: "mqtt", Name: "messages_published_total",
-		Help: "MQTT messages published successfully, by kind (discovery, state, availability, other).",
+		Help: "MQTT messages published successfully, by kind (discovery, state, availability, event, other).",
 	}, []string{"kind"})
 	metricPublishErrors = prometheus.NewCounter(prometheus.CounterOpts{
 		Namespace: "hmbridge", Subsystem: "mqtt", Name: "publish_errors_total",
@@ -34,7 +34,7 @@ var (
 	})
 	metricCommands = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: "hmbridge", Subsystem: "mqtt", Name: "commands_received_total",
-		Help: "Valid commands received from Home Assistant, by kind (temperature, mode, preset).",
+		Help: "Valid commands received from Home Assistant, by kind (temperature, mode, preset, switch, light, led).",
 	}, []string{"kind"})
 	metricInvalidCommands = prometheus.NewCounter(prometheus.CounterOpts{
 		Namespace: "hmbridge", Subsystem: "mqtt", Name: "invalid_commands_total",
@@ -57,10 +57,10 @@ func init() {
 		metricInvalidCommands,
 		metricHABirth,
 	)
-	for _, k := range []string{"discovery", "state", "availability", "other"} {
+	for _, k := range []string{"discovery", "state", "availability", "event", "other"} {
 		metricPublished.WithLabelValues(k)
 	}
-	for _, k := range []string{"temperature", "mode", "preset"} {
+	for _, k := range []string{"temperature", "mode", "preset", "switch", "light", "led"} {
 		metricCommands.WithLabelValues(k)
 	}
 }
@@ -74,6 +74,8 @@ func (c TopicConfig) messageKind(topic string) string {
 		return "discovery"
 	case strings.HasPrefix(topic, c.base()+"/") && strings.HasSuffix(topic, "/state"):
 		return "state"
+	case strings.HasPrefix(topic, c.base()+"/") && strings.Contains(topic, "/event/"):
+		return "event"
 	}
 	return "other"
 }
@@ -86,6 +88,12 @@ func (k CommandKind) metricLabel() string {
 		return "mode"
 	case SetPreset:
 		return "preset"
+	case SetSwitch:
+		return "switch"
+	case SetLight:
+		return "light"
+	case SetLED:
+		return "led"
 	}
 	return "unknown"
 }

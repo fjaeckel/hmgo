@@ -10,9 +10,7 @@ import (
 
 	"github.com/fjaeckel/hmgo/internal/bidcos"
 	"github.com/fjaeckel/hmgo/internal/hm"
-	"github.com/fjaeckel/hmgo/internal/hm/contact"
-	"github.com/fjaeckel/hmgo/internal/hm/heating"
-	"github.com/fjaeckel/hmgo/internal/hm/thermal"
+	"github.com/fjaeckel/hmgo/internal/hm/devices"
 )
 
 // Decoder turns module frames into human-readable lines.
@@ -213,20 +211,9 @@ func (d *Decoder) interpret(m Msg) string {
 	}
 	pkt := &bidcos.Packet{Msgcnt: m.Cnt, Flags: m.Flags, Cmd: m.Cmd, Source: m.Src, Dest: m.Dst, Payload: m.Payload}
 	sd := hm.NewStandardDevice(nil, m.Src, di.Serial)
-	var dev hm.Device
-	switch di.Type {
-	case "HM-CC-RT-DN":
-		dev = heating.NewThermostat(sd)
-	case "HM-TC-IT-WM-W-EU":
-		dev = thermal.NewThermalControl(sd)
-	case "HM-Sec-SCo", "HM-Sec-SC-2", "HM-Sec-SC", "HM-Sec-RHS":
-		c, err := contact.NewContact(sd, di.Type)
-		if err != nil {
-			return ""
-		}
-		dev = c
-	default:
-		return ""
+	dev, err := devices.New(sd, di.Type)
+	if err != nil {
+		return "" // a model hmbridge does not support
 	}
 	ev, err := dev.Decode(pkt)
 	if err != nil {

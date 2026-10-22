@@ -180,3 +180,28 @@ func TestLoadDevicesAndCentral(t *testing.T) {
 		t.Errorf("central = %X, want %X", got, central)
 	}
 }
+
+// The devices hmbridge added later are decoded too, e.g. a captured
+// HM-WDS30-T-O broadcast and a button press.
+func TestDescribeNewDevices(t *testing.T) {
+	wds := [3]byte{0x78, 0x5B, 0x74}
+	pb := [3]byte{0x73, 0x78, 0x8E}
+	d := &Decoder{
+		Devices: map[[3]byte]DeviceInfo{
+			wds: {Serial: "TEQ0694924", Type: "HM-WDS30-T-O", Addr: wds},
+			pb:  {Serial: "REQ1215000", Type: "HM-PB-2-WM55", Addr: pb},
+		},
+		Central: central,
+	}
+	for _, tc := range []struct {
+		msg  []byte
+		want string
+	}{
+		{msgBytes(0x31, 0x86, 0x70, wds, [3]byte{}, 0x00, 0x82, 0x64), "| 13.0 °C"},
+		{msgBytes(0x10, 0xA4, 0x40, pb, central, 0x42, 0x21), "| button 2 long release (counter 33)"},
+	} {
+		if got := d.describeMsg("RX", tc.msg, 0x40); !strings.HasSuffix(got, tc.want) {
+			t.Errorf("got %q, want suffix %q", got, tc.want)
+		}
+	}
+}

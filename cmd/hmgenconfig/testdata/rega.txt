@@ -9,5 +9,13 @@ REQ0836852	Wohnzimmer Wandthermostat
 PEQ1190989	Wohnzimmer Heizkörper
 PEQ1315854	Küche Heizung
 LEQ0123456	Stehlampe Schalter
+PEQ1107611	Stehlampe Wohnzimmer
+MEQ1116747	Leselampe
+REQ1215000	Taster Flur
+PEQ1918407	Fernbedienung
+SEQ1234485	Statusanzeige
+QEQ1859460	Garten Außen
+TEQ0694924	Teich
+LEQ0999999	Bewegungsmelder Flur
 BidCoS-RF	Zentrale
 <xml><exec>/rega.exe</exec><sessionId></sessionId><httpUserAgent></httpUserAgent><sId>2</sId><oDev>1234</oDev></xml>

@@ -11,7 +11,11 @@ import (
 	"github.com/fjaeckel/hmgo/internal/hm"
 	"github.com/fjaeckel/hmgo/internal/hm/contact"
 	"github.com/fjaeckel/hmgo/internal/hm/heating"
+	"github.com/fjaeckel/hmgo/internal/hm/led16"
+	"github.com/fjaeckel/hmgo/internal/hm/power"
+	"github.com/fjaeckel/hmgo/internal/hm/remote"
 	"github.com/fjaeckel/hmgo/internal/hm/thermal"
+	"github.com/fjaeckel/hmgo/internal/hm/weather"
 )
 
 // stateFromEvent converts a decoded device event into a (partial) Home
@@ -96,6 +100,33 @@ func stateFromEvent(d *device, ev any) ha.State {
 		if e.HasError {
 			s.Sabotage = ptr(e.Sabotage)
 		}
+
+	// switch and dimmer plugs
+	case *power.LevelEvent:
+		if e.Channel != power.ActuatorChannel {
+			break // the dimmer's virtual channels are not exposed
+		}
+		s.Level = ptr(e.Percent)
+		s.On = ptr(e.On())
+		if d.desc.Kind == ha.Dimmer && e.HasFlags {
+			s.Fault = e.ErrorString()
+		}
+
+	// HM-OU-LED16
+	case *led16.Event:
+		s.LEDs = ledUpdate(int(e.Channel), e.Color.String())
+
+	// remotes: the presses themselves are events, not state
+	case *remote.KeyEvent:
+		s.LowBattery = ptr(e.LowBattery)
+
+	// outdoor weather sensors
+	case *weather.Event:
+		s.CurrentTemperature = ptr(e.Temperature)
+		if e.Humidity != nil {
+			s.Humidity = ptr(*e.Humidity)
+		}
+		s.LowBattery = ptr(e.LowBattery)
 	}
 	return s
 }
@@ -207,6 +238,14 @@ func eventName(ev any) string {
 		return "time-request"
 	case *hm.DeviceInfo:
 		return "device-info"
+	case *power.LevelEvent:
+		return fmt.Sprintf("level-%s %s %%", e.Frame, trimFloat(e.Percent))
+	case *led16.Event:
+		return fmt.Sprintf("led %d %s", e.Channel, e.Color)
+	case *remote.KeyEvent:
+		return e.String()
+	case *weather.Event:
+		return "weather"
 	}
 	return fmt.Sprintf("%T", ev)
 }
