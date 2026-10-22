@@ -66,10 +66,17 @@ func IsContact(model string) bool {
 	return false
 }
 
+// Radio modules.
+const (
+	RadioAuto        = "auto"
+	RadioHMModRPIPCB = "hm-mod-rpi-pcb"
+	RadioRPIRFMod    = "rpi-rf-mod"
+)
+
 // Defaults.
 const (
 	DefaultSerialPort       = "/dev/serial0"
-	DefaultReset            = "gpio"
+	DefaultReset            = "auto"
 	DefaultResetGPIO        = 18
 	DefaultBroker           = "tcp://localhost:1883"
 	DefaultClientID         = "hmbridge"
@@ -83,7 +90,15 @@ const (
 type Config struct {
 	Comment    Comment `json:"_comment,omitempty"`
 	SerialPort string  `json:"serial_port"` // default /dev/serial0
-	Reset      string  `json:"reset"`       // "gpio" (default) or "none"
+	// Reset selects how the radio module is reset at startup: "gpio"
+	// (HM-MOD-RPI-PCB reset line on reset_gpio), "raw-uart" (ask
+	// OpenCCU's raw-uart kernel driver, which knows the line of either
+	// module), "none", or "auto" (default: "raw-uart" for /dev/raw-uart*,
+	// else "gpio" for an HM-MOD-RPI-PCB and "none" otherwise).
+	Reset string `json:"reset"`
+	// Radio selects the radio module: "auto" (default, detected at
+	// startup), "hm-mod-rpi-pcb" or "rpi-rf-mod".
+	Radio string `json:"radio,omitempty"`
 	ResetGPIO  int     `json:"reset_gpio"`  // BCM GPIO number, default 18 (0 = default)
 
 	// CentralAddress is the BidCoS address of the CCU to impersonate
@@ -421,12 +436,30 @@ func (c *Config) resolve() error {
 	if c.SerialPort == "" {
 		c.SerialPort = DefaultSerialPort
 	}
-	switch c.Reset {
+	switch c.Radio {
 	case "":
-		c.Reset = DefaultReset
-	case "gpio", "none":
+		c.Radio = RadioAuto
+	case RadioAuto, RadioHMModRPIPCB, RadioRPIRFMod:
 	default:
-		return fmt.Errorf("reset: %q is not one of \"gpio\", \"none\"", c.Reset)
+		return fmt.Errorf("radio: %q is not one of %q, %q, %q", c.Radio, RadioAuto, RadioHMModRPIPCB, RadioRPIRFMod)
+	}
+	switch c.Reset {
+	case "", "auto":
+		switch {
+		case strings.HasPrefix(c.SerialPort, "/dev/raw-uart"):
+			c.Reset = "raw-uart"
+		case c.Radio == RadioRPIRFMod:
+			// The RPI-RF-MOD's reset line differs from the
+			// HM-MOD-RPI-PCB's; without the raw-uart driver, start
+			// without a reset (the module is put into its app via
+			// IDENTIFY/CHANGE_APP).
+			c.Reset = "none"
+		default:
+			c.Reset = "gpio"
+		}
+	case "gpio", "raw-uart", "none":
+	default:
+		return fmt.Errorf("reset: %q is not one of \"auto\", \"gpio\", \"raw-uart\", \"none\"", c.Reset)
 	}
 	if c.ResetGPIO == 0 {
 		c.ResetGPIO = DefaultResetGPIO

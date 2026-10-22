@@ -43,3 +43,19 @@ func IsTerminal(fd uintptr) bool {
 	_, _, err := syscall.Syscall(syscall.SYS_IOCTL, fd, uintptr(syscall.TCGETS), uintptr(unsafe.Pointer(&termios)))
 	return err == 0
 }
+
+// ioctlResetRadioModule is IOCTL_IOCRESET_RADIO_MODULE of the raw-uart
+// kernel driver used by OpenCCU/piVCCU: _IO('u', 0x81). The driver pulses
+// the reset line of the attached radio module (HM-MOD-RPI-PCB or
+// RPI-RF-MOD), whichever GPIO and polarity that board uses. It fails with
+// EBUSY if another process (e.g. OpenCCU's multimacd) has the device open.
+// c.f. generic_raw_uart.c in github.com/OpenCCU/piVCCU.
+const ioctlResetRadioModule = 'u'<<8 | 0x81
+
+// ResetRawUART resets the radio module behind a raw-uart device.
+func ResetRawUART(fd uintptr) error {
+	if _, _, errno := syscall.Syscall(syscall.SYS_IOCTL, fd, ioctlResetRadioModule, 0); errno != 0 {
+		return errno
+	}
+	return nil
+}

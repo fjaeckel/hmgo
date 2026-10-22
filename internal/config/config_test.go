@@ -293,3 +293,26 @@ func TestKeyIndexAndOptions(t *testing.T) {
 		t.Errorf("thermostats = %d, want 3", len(rg.Thermostats))
 	}
 }
+
+func TestRadioAndResetDefaults(t *testing.T) {
+	for _, tt := range []struct {
+		extra, radio, reset string
+	}{
+		{``, "auto", "gpio"},
+		{`,"serial_port":"/dev/raw-uart"`, "auto", "raw-uart"},
+		{`,"serial_port":"/dev/raw-uart1","reset":"auto"`, "auto", "raw-uart"},
+		{`,"radio":"rpi-rf-mod"`, "rpi-rf-mod", "none"},
+		{`,"radio":"hm-mod-rpi-pcb","reset":"none"`, "hm-mod-rpi-pcb", "none"},
+	} {
+		c, err := Parse([]byte(`{"central_address":"1A2B3C"` + tt.extra + `,"devices":[{"name":"a","model":"HM-CC-RT-DN","address":"38F59C"}]}`))
+		if err != nil {
+			t.Fatalf("%s: %v", tt.extra, err)
+		}
+		if c.Radio != tt.radio || c.Reset != tt.reset {
+			t.Errorf("%s: radio %q reset %q, want %q %q", tt.extra, c.Radio, c.Reset, tt.radio, tt.reset)
+		}
+	}
+	if _, err := Parse([]byte(`{"central_address":"1A2B3C","radio":"cul","devices":[{"name":"a","model":"HM-CC-RT-DN","address":"38F59C"}]}`)); err == nil || !strings.Contains(err.Error(), "radio") {
+		t.Errorf("invalid radio accepted: %v", err)
+	}
+}

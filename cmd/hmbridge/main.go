@@ -252,10 +252,20 @@ func openUART(cfg *config.Config) (*os.File, error) {
 		} else {
 			log.Printf("%s is not a tty (e.g. OpenCCU's raw-uart), skipping line configuration", cfg.SerialPort)
 		}
-		if cfg.Reset == "gpio" {
+		switch cfg.Reset {
+		case "gpio":
 			log.Printf("resetting HM-MOD-RPI-PCB via GPIO %d", cfg.ResetGPIO)
 			if err := gpio.ResetUARTGW(fd, cfg.ResetGPIO); err != nil {
 				ctlErr = fmt.Errorf("resetting the radio module via GPIO %d: %w (set \"reset\": \"none\" if the module's reset line is not connected)", cfg.ResetGPIO, err)
+			}
+		case "raw-uart":
+			log.Printf("resetting the radio module via the raw-uart driver")
+			if err := serial.ResetRawUART(fd); err != nil {
+				hint := ""
+				if errors.Is(err, syscall.EBUSY) {
+					hint = " (another program uses the radio module; on OpenCCU stop multimacd first, see docs/DEPLOY.md)"
+				}
+				ctlErr = fmt.Errorf("resetting the radio module via %s: %w%s", cfg.SerialPort, err, hint)
 			}
 		}
 	}); err != nil {
