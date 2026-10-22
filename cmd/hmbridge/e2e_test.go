@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"os"
@@ -189,14 +190,22 @@ func TestEndToEnd(t *testing.T) {
 	<-done2
 }
 
+// freePort returns a port that was free a moment ago. It is chosen
+// below Linux's ephemeral range (32768-60999): a port the kernel hands
+// out (":0") may be reused as the local port of an outgoing connection
+// (e.g. an MQTT client's) before the broker or HTTP server binds it.
 func freePort(t *testing.T) int {
 	t.Helper()
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
+	for i := 0; i < 100; i++ {
+		port := 20000 + rand.IntN(10000)
+		l, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+		if err == nil {
+			l.Close()
+			return port
+		}
 	}
-	defer l.Close()
-	return l.Addr().(*net.TCPAddr).Port
+	t.Fatal("no free port")
+	return 0
 }
 
 func waitTCP(t *testing.T, addr string) {
@@ -231,4 +240,38 @@ func httpGet(t *testing.T, url string) string {
 	defer resp.Body.Close()
 	b, _ := io.ReadAll(resp.Body)
 	return string(b)
+}
+
+// An http_listen address that cannot be bound makes run fail instead of
+// running without status page and metrics.
+func TestRunHTTPListenError(t *testing.T) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	cfg, err := config.Parse([]byte(fmt.Sprintf(`{
+	  "central_address": "1A2B3C",
+	  "reset": "none",
+	  "state_file": "",
+	  "require_synced_clock": false,
+	  "mqtt": {"broker": ""},
+	  "http_listen": %q,
+	  "devices": [{"name": "Bad", "model": "HM-CC-RT-DN", "address": "38F59C"}]
+	}`, l.Addr().String())))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mod, rw := fakemod.New(fakemod.Options{})
+	defer mod.Close()
+	done := make(chan error, 1)
+	go func() { done <- run(context.Background(), cfg, rw) }()
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "http_listen") {
+			t.Errorf("run: %v, want an http_listen error", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("run did not return")
+	}
 }

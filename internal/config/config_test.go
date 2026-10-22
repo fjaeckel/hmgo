@@ -409,8 +409,10 @@ func TestNewModelValidation(t *testing.T) {
 		{dev(`{"name":"sw","model":"HM-LC-Sw1-Pl-DN-R1","address":"6A9D15","stale_after":"10s"}`) + `}`, "stale_after"},
 		{dev(`{"name":"sw","model":"HM-LC-Sw1-Pl-DN-R1","address":"6A9D15"}`) + `,"status_poll_interval":"1m"}`, "status_poll_interval"},
 		// An actuator is only heard from when polled: stale_after must exceed the poll interval.
-		{dev(`{"name":"sw","model":"HM-LC-Sw1-Pl-DN-R1","address":"6A9D15","stale_after":"30m"}`) + `}`, "stale_after 30m0s must be longer than status_poll_interval 1h0m0s"},
-		{dev(`{"name":"led","model":"HM-OU-LED16","address":"7564EA","stale_after":"2h"}`) + `,"status_poll_interval":"2h"}`, "must be longer than status_poll_interval"},
+		{dev(`{"name":"sw","model":"HM-LC-Sw1-Pl-DN-R1","address":"6A9D15","stale_after":"30m"}`) + `}`, "stale_after 30m0s must be at least status_poll_interval 1h0m0s + 5m0s"},
+		{dev(`{"name":"led","model":"HM-OU-LED16","address":"7564EA","stale_after":"2h"}`) + `,"status_poll_interval":"2h"}`, "must be at least status_poll_interval"},
+		// Just longer than the interval is not enough: the poll answer may come late.
+		{dev(`{"name":"sw","model":"HM-LC-Sw1-Pl-DN-R1","address":"6A9D15","stale_after":"64m"}`) + `}`, "must be at least status_poll_interval 1h0m0s + 5m0s"},
 		{dev(`{"name":"x","model":"HM-RCV-50","address":"458087"}`) + `}`, "unsupported model"},
 	} {
 		_, err := Parse([]byte(tc.cfg))

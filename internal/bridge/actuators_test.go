@@ -226,6 +226,31 @@ func TestDimmerWorkingReportKeepsLevel(t *testing.T) {
 	}
 }
 
+// Working bits other than a dimmer's ramp direction (e.g. 0x40, an
+// on-time running) do not make a level intermediate: a switch plug
+// switched on for a time and a dimmer on-time report are real levels.
+func TestWorkingOnTimeReportTakesLevel(t *testing.T) {
+	a := &actuatorDevices{}
+	e := newDevEnv(t, a, devConf, nil)
+	plugTopic, dimTopic := "hmbridge/6a9d15/state", "hmbridge/41e951/state"
+	e.waitFor("status after startup", func() bool {
+		return e.state(plugTopic)["level"] == 0.0 && e.state(dimTopic)["level"] == 0.0
+	})
+	e.inject(0x02, msg(0x30, 0xa4, 0x10, plug, central, 0x06, 0x01, 0xc8, 0x40))
+	e.waitFor("plug on with on-time", func() bool {
+		st := e.state(plugTopic)
+		return st["on"] == true && st["level"] == 100.0
+	})
+	e.inject(0x01, msg(0x31, 0xa4, 0x10, dim, central, 0x06, 0x01, 0x3c, 0x40, 0x00))
+	e.waitFor("dimmer 30 % with on-time", func() bool { return e.state(dimTopic)["level"] == 30.0 })
+	e.b.mu.Lock()
+	lastOn := e.b.byAddr[dim].lastOnLevel
+	e.b.mu.Unlock()
+	if lastOn != 30 {
+		t.Errorf("lastOnLevel %v (want 30)", lastOn)
+	}
+}
+
 func TestLEDDisplayUnreachable(t *testing.T) {
 	a := &actuatorDevices{}
 	e := newDevEnv(t, a, devConf, nil)

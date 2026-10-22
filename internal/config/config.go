@@ -803,8 +803,9 @@ func (c *Config) resolveDevice(d *Device, where string, fromStore bool) error {
 		return fmt.Errorf("%s: stale_after %v is too short (minimum 1m, or \"0s\" for never)", where, d.StaleAfter.Duration)
 	}
 	if poll := c.StatusPollIntervalSetting.Duration; IsActuator(d.Model) && poll > 0 &&
-		d.StaleAfter.set && d.StaleAfter.Duration != 0 && d.StaleAfter.Duration <= poll {
-		return fmt.Errorf("%s: stale_after %v must be longer than status_poll_interval %v (the actuator is only heard from when polled), or \"0s\" for never", where, d.StaleAfter.Duration, poll)
+		d.StaleAfter.set && d.StaleAfter.Duration != 0 && d.StaleAfter.Duration < poll+StalePollMargin {
+		return fmt.Errorf("%s: stale_after %v must be at least status_poll_interval %v + %v (the actuator is only heard from when polled, and a poll round takes time), or \"0s\" for never",
+			where, d.StaleAfter.Duration, poll, StalePollMargin)
 	}
 	d.staleDefault = defaultStale(d.Model, c.StatusPollIntervalSetting.Duration)
 	d.keyIndex = c.current.Index
@@ -911,6 +912,11 @@ func (c *Config) StateSaveInterval() time.Duration {
 func (c *Config) RequiresSyncedClock() bool {
 	return c.RequireSyncedClock == nil || *c.RequireSyncedClock
 }
+
+// StalePollMargin is how much longer than status_poll_interval an
+// actuator's stale_after must be at least: polls are spread out and
+// retried, so an answer can arrive a while after the interval.
+const StalePollMargin = 5 * time.Minute
 
 // DefaultStatusPollInterval is the default status_poll_interval.
 const DefaultStatusPollInterval = time.Hour

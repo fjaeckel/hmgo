@@ -132,6 +132,16 @@ func TestTracker(t *testing.T) {
 			{key(1, true, true, 4), 22000, nil},
 			{key(1, true, true, 5), 23000, []remote.Press{p(1, remote.PressLong, true), p(1, remote.PressLongRelease, false)}},
 		}},
+		{"release lost after a synthetic release: a later long press with the same counter", []step{
+			{key(1, true, false, 4), 0, []remote.Press{p(1, remote.PressLong, false)}},
+			{nil, 6000, []remote.Press{p(1, remote.PressLongRelease, true)}},
+			// within the held window: still the old press
+			{key(1, true, false, 4), 60000, nil},
+			// silent for longer than the held window: a new press
+			{key(1, true, false, 4), 60000 + 4*60000, []remote.Press{p(1, remote.PressLong, false)}},
+			{key(1, true, true, 4), 60000 + 4*60000 + 500, []remote.Press{p(1, remote.PressLongRelease, false)}},
+			{key(1, true, true, 4), 60000 + 9*60000, []remote.Press{p(1, remote.PressLong, true), p(1, remote.PressLongRelease, false)}},
+		}},
 		{"counter reused after the duplicate window", []step{
 			{key(1, false, true, 5), 0, []remote.Press{p(1, remote.PressShort, false)}},
 			{key(1, false, true, 5), 11000, []remote.Press{p(1, remote.PressShort, false)}},

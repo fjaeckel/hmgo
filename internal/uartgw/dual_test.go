@@ -1552,3 +1552,159 @@ func TestDualChallengeRateLimit(t *testing.T) {
 	}
 	expectNoRecv(t, c, 100*time.Millisecond)
 }
+
+// DUAL_ERR replies to fire-and-forget sends (software ACKs) free their
+// counter, count as oneshot_failed and as liveness failures.
+func TestDualErrOneshots(t *testing.T) {
+	c, mod := openDualTest(t, fakemod.Options{}, Config{TRXPollInterval: -1})
+	if err := c.AddPeer(context.Background(), Peer{Addr: testDevice, Channels: 2}); err != nil {
+		t.Fatal(err)
+	}
+	failed := testutil.ToFloat64(dualEvents.WithLabelValues("oneshot_failed"))
+	mod.SetDualErrAll(true)
+	for i := byte(0); i < 3; i++ {
+		mod.InjectLLMACRecv(fakemod.DefaultRSSI, msgBytes(0x40+i, 0xa2, 0x10, testDevice, testHMID, 0x06, 0x01, 0x00, 0x00))
+	}
+	select {
+	case <-c.done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("connection still up although every software ACK is answered with DUAL_ERR")
+	}
+	if !errors.Is(c.Err(), ErrModuleUnresponsive) {
+		t.Fatalf("Err = %v, want ErrModuleUnresponsive", c.Err())
+	}
+	if d := testutil.ToFloat64(dualEvents.WithLabelValues("oneshot_failed")) - failed; d != 3 {
+		t.Errorf("oneshot_failed +%v, want +3", d)
+	}
+	c.mu.Lock()
+	n := len(c.oneshots)
+	c.mu.Unlock()
+	if n != 0 {
+		t.Errorf("%d oneshot counters still in use", n)
+	}
+}
+
+// fillCounters takes every frame counter nextCnt hands out (as if
+// outstanding requests held them).
+func fillCounters(c *DualConn) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for {
+		cnt, err := c.nextCnt()
+		if err != nil {
+			return
+		}
+		c.reqs[cnt] = &dualReq{dst: dstLLMAC, ch: make(chan frame, 1)}
+	}
+}
+
+// No free frame counter counts as a liveness failure, and the IDENTIFY
+// of the bootloader check still gets its reserved counter.
+func TestDualNoCounterLiveness(t *testing.T) {
+	t.Run("unresponsive", func(t *testing.T) {
+		c, _ := openDualTest(t, fakemod.Options{}, Config{TRXPollInterval: 30 * time.Millisecond, Timeout: 200 * time.Millisecond})
+		fillCounters(c)
+		select {
+		case <-c.done:
+		case <-time.After(3 * time.Second):
+			t.Fatal("connection still up although no frame counter is free")
+		}
+		if !errors.Is(c.Err(), ErrModuleUnresponsive) || !strings.Contains(c.Err().Error(), "no free frame counter") {
+			t.Fatalf("Err = %v, want ErrModuleUnresponsive (no free counter)", c.Err())
+		}
+	})
+	t.Run("bootloader", func(t *testing.T) {
+		c, mod := openDualTest(t, fakemod.Options{}, Config{TRXPollInterval: 30 * time.Millisecond, Timeout: 200 * time.Millisecond, MaxAckTimeouts: 100})
+		fillCounters(c)
+		mod.DropToBootloader()
+		select {
+		case <-c.done:
+		case <-time.After(3 * time.Second):
+			t.Fatal("connection still up")
+		}
+		if !errors.Is(c.Err(), ErrModuleReset) {
+			t.Fatalf("Err = %v, want ErrModuleReset (IDENTIFY on the reserved counter)", c.Err())
+		}
+	})
+}
+
+// Once running, a stale announcement queued during init does not answer
+// the bootloader check's IDENTIFY.
+func TestDualIdentifyIgnoresStaleAnnouncement(t *testing.T) {
+	c, _ := openDualTest(t, fakemod.Options{}, Config{TRXPollInterval: -1})
+	c.announce <- appTagDualBootloader
+	if c.checkBootloader() {
+		t.Fatalf("stale announcement failed the connection: %v", c.Err())
+	}
+	if err := c.Err(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A late IDENTIFY reply reporting the bootloader while running fails the
+// connection.
+func TestDualLateIdentifyBootloader(t *testing.T) {
+	c, mod := openDualTest(t, fakemod.Options{}, Config{TRXPollInterval: -1})
+	// An application reply is only logged.
+	c.mu.Lock()
+	c.lateIdentify[0x77] = true
+	c.lateIdentify[0x78] = true
+	c.mu.Unlock()
+	mod.WriteRaw(frame{dst: dstDual, cnt: 0x77, cmd: 0x00, payload: []byte(appTagDualApp)}.encode())
+	time.Sleep(50 * time.Millisecond)
+	if err := c.Err(); err != nil {
+		t.Fatal(err)
+	}
+	mod.WriteRaw(frame{dst: dstDual, cnt: 0x78, cmd: 0x00, payload: []byte(appTagDualBootloader)}.encode())
+	select {
+	case <-c.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("connection still up")
+	}
+	if !errors.Is(c.Err(), ErrModuleReset) {
+		t.Fatalf("Err = %v, want ErrModuleReset", c.Err())
+	}
+}
+
+// Another message with the counter of a held one is not a
+// retransmission: the held one fails, the new one gets its own
+// challenge.
+func TestDualSoftwareAESCounterReuse(t *testing.T) {
+	orig1 := msgBytes(0x61, 0xa2, 0x10, testDevice, testHMID, 0x06, 0x01, 0xc8, 0x00)
+	orig2 := msgBytes(0x61, 0xa2, 0x10, testDevice, testHMID, 0x06, 0x01, 0x00, 0x00)
+	var mu sync.Mutex
+	challenges := 0
+	answer := aesPeerDevice(orig2, "ok")
+	c, m := openDualTest(t, fakemod.Options{OnLLMACSend: func(msg []byte) [][]byte {
+		mu.Lock()
+		defer mu.Unlock()
+		if msg[2] == 0x02 && len(msg) > 9 && msg[9] == 0x04 {
+			challenges++
+			if challenges == 1 {
+				return nil // the device gave up on orig1
+			}
+		}
+		return answer(msg)
+	}}, Config{Signer: fakeSigner{}, Rand: bytes.NewReader(append(bytes.Repeat([]byte{0xa5}, 6), bytes.Repeat([]byte{0x5a}, 6)...))})
+	if err := c.AddPeer(context.Background(), Peer{Addr: testDevice, KeyIndex: 1, AESChannels: []byte{1}}); err != nil {
+		t.Fatal(err)
+	}
+	superseded := testutil.ToFloat64(dualEvents.WithLabelValues("aes_superseded"))
+	m.InjectLLMACRecv(fakemod.DefaultRSSI, orig1)
+	waitSent(t, m, 1)
+	m.InjectLLMACRecv(fakemod.DefaultRSSI, orig2)
+	if got, want := recvOne(t, c), append([]byte{0x03, 0x00, fakemod.DefaultRSSI}, orig1...); !bytes.Equal(got, want) {
+		t.Fatalf("received %x, want %x (held message failed)", got, want)
+	}
+	if got, want := recvOne(t, c), append([]byte{0x02, 0x00, fakemod.DefaultRSSI}, orig2...); !bytes.Equal(got, want) {
+		t.Fatalf("received %x, want %x (new message authenticated)", got, want)
+	}
+	sent := waitSent(t, m, 3)
+	if bytes.Equal(sent[0], sent[1]) || sent[1][9] != 0x04 || sent[1][10] != 0x5a {
+		t.Errorf("second challenge %x, want a new one (first %x)", sent[1], sent[0])
+	}
+	if d := testutil.ToFloat64(dualEvents.WithLabelValues("aes_superseded")) - superseded; d != 1 {
+		t.Errorf("aes_superseded +%v", d)
+	}
+	expectNoRecv(t, c, 100*time.Millisecond)
+}

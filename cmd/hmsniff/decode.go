@@ -29,6 +29,8 @@ type Decoder struct {
 	// configList remembers the list opened by the last CONFIG_START per
 	// device and channel, to name the registers of CONFIG_WRITE_INDEX.
 	configList map[[4]byte]byte
+	// redacted is set while describing a frame when bytes were withheld.
+	redacted bool
 }
 
 // Msg is a BidCoS message: cnt flags cmd src(3) dst(3) payload.
@@ -48,8 +50,17 @@ func parseMsg(b []byte) (Msg, bool) {
 	return m, true
 }
 
-// Describe returns one log line for f (without timestamp/direction).
-func (d *Decoder) Describe(dir string, f Frame) string {
+// Describe returns one log line for f (without timestamp/direction) and
+// whether bytes of f were withheld from it (key material, AES
+// responses, HmIP network management): f's raw bytes must then not be
+// logged either.
+func (d *Decoder) Describe(dir string, f Frame) (desc string, redacted bool) {
+	d.redacted = false
+	desc = d.describe(dir, f)
+	return desc, d.redacted
+}
+
+func (d *Decoder) describe(dir string, f Frame) string {
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "%-6s cnt=%02X", dstName(f.Dst), f.Cnt)
 	if !f.CRCOK {
@@ -88,6 +99,7 @@ func (d *Decoder) Describe(dir string, f Frame) string {
 			return sb.String()
 		case cmd >= 0x03 && cmd <= 0x0F && cmd != 0x04 && cmd != 0x05 && cmd != 0x06 && cmd != 0x08 && len(p) >= 16:
 			// key slots (set current/temp/previous key): never log keys
+			d.redacted = true
 			fmt.Fprintf(&sb, " cmd=%02X <%d bytes redacted (key material)>", cmd, len(p))
 			return sb.String()
 		}
@@ -100,10 +112,13 @@ func (d *Decoder) Describe(dir string, f Frame) string {
 		// Homematic IP: serial command and MAC header (internal/hmip);
 		// key material is always redacted.
 		pkt, _ := hmip.ParsePacket(f.Dst, f.Cnt, f.Payload) // non-empty
-		sb.WriteString(" " + d.hmip.Describe(dir == "TX", pkt))
+		desc, redacted := d.hmip.DescribeSensitive(dir == "TX", pkt)
+		d.redacted = d.redacted || redacted
+		sb.WriteString(" " + desc)
 		return sb.String()
 	}
 	if looksLikeKey(f) {
+		d.redacted = true
 		fmt.Fprintf(&sb, " cmd=%02X <%d bytes redacted (possible key material)>", cmd, len(p))
 		return sb.String()
 	}
@@ -185,10 +200,12 @@ func (d *Decoder) describeMsg(dir string, b []byte, rssi int) string {
 		// AES key exchange: the new key, encrypted with the device's
 		// old key, which is usually the public eQ-3 default key. Always
 		// redacted, even with -no-redact.
+		d.redacted = true
 		payload = fmt.Sprintf("<%d bytes redacted>", len(m.Payload))
 	case d.RedactAES && m.Cmd == 0x03:
 		// AES responses: together with the challenge they would allow
 		// an offline attack on a weak passphrase.
+		d.redacted = true
 		payload = fmt.Sprintf("<%d bytes redacted>", len(m.Payload))
 	}
 	line := fmt.Sprintf("#%02X %s %s %s → %s %s", m.Cnt, flagString(m.Flags), cmd, d.name(m.Src), d.name(m.Dst), payload)

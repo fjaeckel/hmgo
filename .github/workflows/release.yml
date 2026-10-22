@@ -22,15 +22,15 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: release-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
   build:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    # A newer push supersedes a build still running.
+    concurrency:
+      group: release-build-${{ github.ref }}
+      cancel-in-progress: true
     steps:
       - uses: actions/checkout@v4
         with:
@@ -57,6 +57,11 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    # Never cancelled half-way (tag moved, assets not yet replaced); a
+    # newer run's publish waits for this one.
+    concurrency:
+      group: release-publish-${{ github.ref }}
+      cancel-in-progress: false
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
@@ -79,12 +84,14 @@ jobs:
       - name: Publish nightly pre-release
         if: github.ref == 'refs/heads/master'
         run: |
+          set -eo pipefail
           git -C src tag -f nightly "$GITHUB_SHA"
-          git -C src push -f origin nightly
           title="hmbridge nightly (${GITHUB_SHA::7})"
           notes="Automatic build of master at ${GITHUB_SHA}. Not a stable release."
-          # Create the release once; afterwards only replace its assets.
+          # Create the release once (its tag must exist for that);
+          # afterwards only replace its assets.
           if ! gh release view nightly >/dev/null 2>&1; then
+            git -C src push -f origin nightly
             gh release create nightly --prerelease --verify-tag --title "$title" --notes "$notes"
           fi
           gh release upload nightly dist/* --clobber
@@ -94,4 +101,6 @@ jobs:
               gh release delete-asset nightly "$name" --yes
             fi
           done
+          # Move the tag only once the assets match it.
+          git -C src push -f origin nightly
           gh release edit nightly --prerelease --title "$title" --notes "$notes"

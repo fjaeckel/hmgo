@@ -36,6 +36,13 @@ const (
 	// DefaultReleaseTimeout: a long press without a further repeat or
 	// release for this long is considered released.
 	DefaultReleaseTimeout = 5 * time.Second
+	// DefaultHeldWindow: a long frame with the counter of an open (or
+	// synthetically released) long press continues that press only if
+	// the button sent something within this time. A remote repeats long
+	// frames every few hundred milliseconds while a button is held, so a
+	// longer silence means the press ended (its release was lost) and a
+	// frame with the same counter is a new press after a wrap-around.
+	DefaultHeldWindow = 3 * time.Minute
 )
 
 type phase int
@@ -77,10 +84,13 @@ type buttonState struct {
 //   - long frames with the counter of a long press that is still open
 //     or was only released synthetically belong to that press even
 //     after DuplicateWindow (frames lost while the button was held):
-//     they never start a second press_long.
+//     they never start a second press_long. This holds only while the
+//     button was silent for less than HeldWindow; after that, the frame
+//     starts a new press (its counter wrapped around).
 type Tracker struct {
 	DuplicateWindow time.Duration // 0: DefaultDuplicateWindow
 	ReleaseTimeout  time.Duration // 0: DefaultReleaseTimeout
+	HeldWindow      time.Duration // 0: DefaultHeldWindow
 
 	buttons map[byte]*buttonState
 }
@@ -90,6 +100,13 @@ func (t *Tracker) dupWindow() time.Duration {
 		return t.DuplicateWindow
 	}
 	return DefaultDuplicateWindow
+}
+
+func (t *Tracker) heldWindow() time.Duration {
+	if t.HeldWindow > 0 {
+		return t.HeldWindow
+	}
+	return DefaultHeldWindow
 }
 
 func (t *Tracker) releaseTimeout() time.Duration {
@@ -112,9 +129,11 @@ func (t *Tracker) Process(ev *KeyEvent, now time.Time) []Press {
 	btn := int(ev.Channel)
 	sameCounter := b.known && b.counter == ev.Counter
 	same := sameCounter && now.Sub(b.last) < t.dupWindow()
-	// samePress: a long frame continuing the current long press, however
-	// long the gap (the counter only changes with a new press).
-	samePress := same || sameCounter && (b.phase == phaseLong || b.phase == phaseReleased && b.synthReleased)
+	// samePress: a long frame continuing the current long press, even
+	// after a gap longer than DuplicateWindow (the counter only changes
+	// with a new press), but not after HeldWindow of silence.
+	samePress := same || sameCounter && now.Sub(b.last) < t.heldWindow() &&
+		(b.phase == phaseLong || b.phase == phaseReleased && b.synthReleased)
 	defer func() {
 		b.known, b.counter, b.last = true, ev.Counter, now
 	}()

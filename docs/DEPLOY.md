@@ -247,7 +247,8 @@ thermostats, 1 hour for weather sensors, 6 hours for the HM-Sec-SCo, 50
 hours for other contacts, three status poll intervals (3 h 5 min) for
 switches, dimmers and the LED display, and never for remotes (they are
 silent until a button is pressed; set `stale_after` to change that). Its
-"Last seen" sensor stays visible.
+"Last seen" sensor stays visible. Actuators are only heard from when polled,
+so their `stale_after` must be at least `status_poll_interval` plus 5 minutes.
 
 After a restart or reboot, hmbridge reads its last published state back from
 the MQTT broker, so Home Assistant isn't blank until every window contact has

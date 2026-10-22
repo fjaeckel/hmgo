@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -236,6 +237,9 @@ func TestDescribeHmIP(t *testing.T) {
 	input.WriteString(kmsgLines("RX", encodeFrame(dstHmIP, 0x10, []byte{0x06, 0x01})))
 	input.WriteString(kmsgLines("TX", encodeFrame(0x0c, 0x12, append([]byte{0x0e}, secret...))))
 	input.WriteString(kmsgLines("RX", encodeFrame(0x0c, 0x13, append([]byte{0x03, 0x01}, secret[:16]...))))
+	// Routed network management (address extension): not decodable,
+	// neither the description nor a raw line may show its payload.
+	input.WriteString(kmsgLines("RX", encodeFrame(dstHmIP, 0x20, append([]byte{0x07, 0x40, 0x01, 0x08, 0x80, 1, 2, 3, 4, 5, 6}, secret...))))
 
 	d := testDecoder()
 	d.RedactAES = false // HmIP key material is redacted regardless
@@ -255,6 +259,7 @@ func TestDescribeHmIP(t *testing.T) {
 		"RX HMIP   cnt=10 RESPONSE to SET_ENC_NETWORK_KEY OK(01)",
 		"TX dst0C  cnt=12 KEY cmd=0E <66 bytes redacted>",
 		"RX dst0C  cnt=13 KEY cmd=03 <17 bytes redacted>",
+		"RX HMIP   cnt=20 EVENT rssi=-64 010203→040506 NETMGMT sec=0 v8 hop=0 ext=1 (malformed: hmip: unsupported layout: address extension 1) (66 bytes, redacted)",
 	} {
 		if !strings.Contains(log, want) {
 			t.Errorf("log lacks %q\n%s", want, log)
@@ -320,14 +325,26 @@ func TestReadLines(t *testing.T) {
 
 func TestLimitedWriter(t *testing.T) {
 	var buf bytes.Buffer
-	lw := &limitedWriter{w: &buf, max: 30, reserve: 10}
+	r := int64(len(summaryTruncated) + 10)
+	lw := &limitedWriter{w: &buf, max: 20 + r, reserve: r}
 	fmt.Fprint(lw, "0123456789")  // 10
 	fmt.Fprint(lw, "0123456789x") // would exceed 20: dropped, limit reached
 	fmt.Fprint(lw, "short")       // sticky: dropped too
 	lw.final = true
-	fmt.Fprint(lw, strings.Repeat("s", 40)) // the summary is always written
-	if want := "0123456789" + strings.Repeat("s", 40); buf.String() != want || lw.dropped != 16 {
+	fmt.Fprint(lw, strings.Repeat("s", 4)) // the summary uses the reserve
+	if want := "0123456789ssss"; buf.String() != want || lw.dropped != 16 {
 		t.Errorf("wrote %q (dropped %d)", buf.String(), lw.dropped)
+	}
+
+	// The summary itself is capped at the reserve.
+	buf.Reset()
+	lw = &limitedWriter{w: &buf, max: 100, reserve: r}
+	lw.final = true
+	fmt.Fprint(lw, "0123456789")
+	fmt.Fprint(lw, "x") // beyond the reserve
+	fmt.Fprint(lw, "y")
+	if want := "0123456789" + summaryTruncated; buf.String() != want || lw.dropped != 2 || int64(buf.Len()) > r {
+		t.Errorf("summary: wrote %q (dropped %d)", buf.String(), lw.dropped)
 	}
 }
 
@@ -342,8 +359,51 @@ func TestCreateLog(t *testing.T) {
 	if fi, _ := os.Stat(p); fi.Mode().Perm() != 0o600 {
 		t.Errorf("mode %v", fi.Mode())
 	}
-	if _, _, err := createLog(p, time.Now()); err == nil {
-		t.Error("existing file overwritten")
+	// An explicit existing file is overwritten and made private.
+	os.WriteFile(p, []byte("old contents"), 0o644)
+	os.Chmod(p, 0o644)
+	f, _, err = createLog(p, time.Now())
+	if err != nil {
+		t.Fatalf("existing file: %v", err)
+	}
+	f.WriteString("new")
+	f.Close()
+	if b, _ := os.ReadFile(p); string(b) != "new" {
+		t.Errorf("existing file not truncated: %q", b)
+	}
+	if fi, _ := os.Stat(p); fi.Mode().Perm() != 0o600 {
+		t.Errorf("mode of overwritten file %v", fi.Mode())
+	}
+	// A symlink to a character device (like /dev/stdout) is allowed…
+	if _, err := os.Stat("/dev/null"); err == nil {
+		dev := filepath.Join(dir, "stdout")
+		os.Symlink("/dev/null", dev)
+		f, _, err := createLog(dev, time.Now())
+		if err != nil {
+			t.Errorf("symlink to a device: %v", err)
+		} else {
+			f.Close()
+		}
+	}
+	// …and a named pipe.
+	fifo := filepath.Join(dir, "fifo")
+	if err := syscall.Mkfifo(fifo, 0o600); err == nil {
+		r, err := os.OpenFile(fifo, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer r.Close()
+		f, _, err := createLog(fifo, time.Now())
+		if err != nil {
+			t.Errorf("pipe: %v", err)
+		} else {
+			f.Close()
+		}
+	}
+	// A symlink to a regular file is not followed.
+	os.Symlink(p, filepath.Join(dir, "plink"))
+	if _, _, err := createLog(filepath.Join(dir, "plink"), time.Now()); err == nil {
+		t.Error("symlink to a regular file followed")
 	}
 	link := filepath.Join(dir, "link.log")
 	os.Symlink(filepath.Join(dir, "target"), link)

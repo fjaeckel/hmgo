@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: BSD-3-Clause -->
+
 # Homematic IP
 
 hmbridge does **not** support Homematic IP (HmIP) devices yet. This page says

@@ -246,9 +246,10 @@ var (
 			Name:      "dual_events_total",
 			Help: "RPI-RF-MOD software BidCoS events: software_ack, aes_challenge_sent, aes_challenge_resent (the device " +
 				"retransmitted a held message), aes_challenge_rate_limited (message dropped), aes_ok, aes_failed, " +
-				"aes_timeout, aes_duplicate (retransmission of an authenticated message, acknowledged again), " +
+				"aes_timeout, aes_superseded (another message with the counter of a held one; the held one failed), " +
+				"aes_duplicate (retransmission of an authenticated message, acknowledged again), " +
 				"aes_stray_answer (AES answer without a pending challenge, dropped), aes_challenge_received, " +
-				"response_timeout, retransmit, oneshot_failed, " +
+				"response_timeout, retransmit, oneshot_failed (software ACK or challenge not transmitted: LLMAC_ACK error, DUAL_ERR, no free counter), " +
 				"reply_scheduled, reply_late (sent at once: the host was too slow to schedule it), hmip_ignored (Homematic IP frame, " +
 				"not used for BidCoS), hmip_dropped (Homematic IP frame not passed on: handler too slow), trx_poll_failed.",
 		},
@@ -291,7 +292,12 @@ type dualReq struct {
 // errDualErr marks a DUAL_ERR reply (wrapped together with ErrNACK).
 var errDualErr = errors.New("DUAL_ERR")
 
-// errNoCounter is returned when all 255 frame counters are in use.
+// identifyCnt is the frame counter reserved for IDENTIFY (nextCnt never
+// hands it out), so that the bootloader check works even when all other
+// counters are in use.
+const identifyCnt = 0xfe
+
+// errNoCounter is returned when all 254 frame counters are in use.
 var errNoCounter = errors.New("uartgw: no free frame counter (too many outstanding requests)")
 
 // rxMsg is a received message as handed to Send.
@@ -547,6 +553,17 @@ func openDual(rw io.ReadWriter, cfg Config, p *framePump, d detection) (*DualCon
 	c.running = true
 	upGauge.Set(1)
 	c.mu.Unlock()
+	// Announcements queued during init are stale now (later ones fail
+	// the connection in dispatch); identify ignores the channel from now
+	// on, but drain it anyway.
+	for drained := false; !drained; {
+		select {
+		case tag := <-c.announce:
+			log.Printf("uartgw: discarding stale announcement %q", tag)
+		default:
+			drained = true
+		}
+	}
 
 	infoGauge.Reset()
 	infoGauge.WithLabelValues(c.firmware, c.SerialNumber()).Set(1)
@@ -739,11 +756,11 @@ func (c *DualConn) enqueue(ctx context.Context, f frame, urgent bool) error {
 
 // nextCnt returns an unused frame counter, or errNoCounter if all are
 // in use. Counter 0 is skipped, as unsolicited frames (announcements)
-// may use it. c.mu must be held.
+// may use it, and identifyCnt is reserved. c.mu must be held.
 func (c *DualConn) nextCnt() (byte, error) {
 	for i := 0; i < 256; i++ {
 		c.cnt++
-		if c.cnt == 0 {
+		if c.cnt == 0 || c.cnt == identifyCnt {
 			continue
 		}
 		if _, ok := c.reqs[c.cnt]; ok {
@@ -822,9 +839,10 @@ func (c *DualConn) requestArm(ctx context.Context, dst byte, payload []byte, tim
 }
 
 // isLivenessFailure reports whether err means the module did not
-// properly answer a request: no reply at all, or DUAL_ERR.
+// properly answer a request: no reply at all, or DUAL_ERR, or so many
+// requests left unanswered that no frame counter is free.
 func isLivenessFailure(err error) bool {
-	return errors.Is(err, ErrTimeout) || errors.Is(err, errDualErr)
+	return errors.Is(err, ErrTimeout) || errors.Is(err, errDualErr) || errors.Is(err, errNoCounter)
 }
 
 // ackTimeout counts consecutive requests the module did not ack or
@@ -905,6 +923,8 @@ func (c *DualConn) sendOneshot(msg []byte, opts [3]byte, what string) {
 	if err != nil {
 		c.mu.Unlock()
 		log.Printf("uartgw: dropping %s: %v", what, err)
+		dualEvents.WithLabelValues("oneshot_failed").Inc()
+		c.ackTimeout(err)
 		return
 	}
 	c.oneshots[cnt] = now
@@ -1049,11 +1069,17 @@ func (c *DualConn) dispatch(f frame) {
 			return // IDENTIFY reply
 		}
 		c.mu.Lock()
-		entered := c.entered
+		entered, running := c.entered, c.running
 		late := c.lateIdentify[f.cnt] && f.dst == dstDual
 		delete(c.lateIdentify, f.cnt)
 		c.mu.Unlock()
 		if late {
+			if running && isBootloaderTag(tag) {
+				// Even late, this reply was sent after the application
+				// had been running: the module fell back.
+				c.fail(fmt.Errorf("%w (late IDENTIFY reply %q)", ErrModuleReset, tag))
+				return
+			}
 			log.Printf("uartgw: ignoring late IDENTIFY reply %q", tag)
 			return
 		}
@@ -1111,6 +1137,26 @@ func (c *DualConn) dispatch(f frame) {
 		if c.debug {
 			log.Printf("uartgw: unsolicited TRX frame (meaning unknown): %v", f)
 		}
+
+	case f.dst == dstDualErr:
+		if c.deliverReq(f) {
+			return
+		}
+		c.mu.Lock()
+		_, ok := c.oneshots[f.cnt]
+		delete(c.oneshots, f.cnt)
+		c.mu.Unlock()
+		if !ok {
+			log.Printf("uartgw: ignoring unexpected frame: %v", f)
+			return
+		}
+		// A software ACK or challenge the module rejected: like an
+		// unanswered request, a sign the module is not running its
+		// application (the bootloader answers everything with DUAL_ERR).
+		dualEvents.WithLabelValues("oneshot_failed").Inc()
+		err := fmt.Errorf("%w: module answered our ACK/challenge with DUAL_ERR (cnt %d): %x", errDualErr, f.cnt, append([]byte{f.cmd}, f.payload...))
+		log.Printf("uartgw: %v", err)
+		c.ackTimeout(err)
 
 	case f.dst == dstApp && f.cmd != trxReply:
 		// Only replies (cmd 0x04) answer our requests; the counter of
@@ -1331,6 +1377,17 @@ func (c *DualConn) handleRecv(f frame) {
 
 	// 3. Software AES: challenge before accepting the message.
 	if c.softAES && toUs && bidi && isPeer && aesRequired(peer, cmd, msg[minMsgLen:]) {
+		if h := c.held[k]; h != nil && !sameMsg(h.msg, msg) {
+			// Another message with the held one's counter (the device
+			// gave up on it, e.g. after a restart): the held message
+			// failed; the new one is handled as any new message.
+			// (A timeout already firing finds it gone and does nothing.)
+			h.timer.Stop()
+			delete(c.held, k)
+			dualEvents.WithLabelValues("aes_superseded").Inc()
+			log.Printf("uartgw: %X sent another message with the counter of one awaiting our AES challenge (%x), dropping the challenge", src, h.msg)
+			c.deliverLocked(recvFrame(recvRespWithAESKO, h.info, h.rssi, h.msg))
+		}
 		if h := c.held[k]; h != nil {
 			// A retransmission: the device did not get our challenge (or
 			// its answer was lost). Challenge again, with the same
@@ -1662,13 +1719,29 @@ func (c *DualConn) identify() (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout+time.Second)
 	defer cancel()
 	c.mu.Lock()
-	cnt, err := c.nextCnt()
-	if err != nil {
+	if c.err != nil {
+		err := c.err
 		c.mu.Unlock()
 		return "", err
 	}
+	// The reserved counter is always free unless another IDENTIFY is
+	// outstanding.
+	cnt := byte(identifyCnt)
+	if _, busy := c.reqs[cnt]; busy {
+		var err error
+		if cnt, err = c.nextCnt(); err != nil {
+			c.mu.Unlock()
+			return "", err
+		}
+	}
 	r := &dualReq{dst: dstDual, sent: time.Now(), ch: make(chan frame, 1)}
 	c.reqs[cnt] = r
+	// Once running, announcements fail the connection instead of being
+	// queued; anything still in the channel is stale.
+	announce := c.announce
+	if c.running {
+		announce = nil
+	}
 	c.mu.Unlock()
 	abandon := func() {
 		c.mu.Lock()
@@ -1690,7 +1763,7 @@ func (c *DualConn) identify() (string, error) {
 			return tag, nil
 		}
 		return "", fmt.Errorf("unexpected IDENTIFY reply: %v", f)
-	case tag := <-c.announce:
+	case tag := <-announce:
 		abandon()
 		return tag, nil
 	case <-t.C:

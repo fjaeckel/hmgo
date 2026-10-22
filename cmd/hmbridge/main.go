@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -139,8 +140,14 @@ func run(ctx context.Context, cfg *config.Config, uart io.ReadWriteCloser) error
 			"serial":   conn.SerialNumber(),
 		}))
 		srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+		// Listen before serving in the background: an address that
+		// cannot be bound is a startup error, not a log line.
+		ln, err := net.Listen("tcp", addr)
+		if err != nil {
+			return fmt.Errorf("http_listen: %w", err)
+		}
 		go func() {
-			if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				log.Printf("HTTP server: %v", err)
 			}
 		}()

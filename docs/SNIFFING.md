@@ -16,11 +16,14 @@ what every one of your devices reports.
 
 1. Check the Pi's architecture on OpenCCU: `uname -m`
    (`aarch64` → `hmsniff-<version>-linux-arm64`, `armv7l` →
-   `hmsniff-<version>-linux-armv7`, from `make dist` or a release).
-2. Copy the binary to OpenCCU's `/tmp` (RAM, nothing is written to the SD card):
+   `hmsniff-<version>-linux-armv7`). Download it from the project's GitHub
+   releases (a tagged release, or the `nightly` pre-release for the latest
+   build of master), or build it with `make dist` (into `dist/`).
+2. Copy the binary to OpenCCU's `/tmp` (RAM, nothing is written to the SD card),
+   naming the exact file (with `dist/` in front if you built it):
 
    ```sh
-   scp dist/hmsniff-*-linux-arm64 root@<openccu-ip>:/tmp/hmsniff   # or *-linux-armv7
+   scp hmsniff-<version>-linux-arm64 root@<openccu-ip>:/tmp/hmsniff   # or hmsniff-<version>-linux-armv7
    ```
 
 3. On OpenCCU:

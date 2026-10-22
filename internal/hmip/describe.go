@@ -22,11 +22,28 @@ type Describer struct {
 	ShowSensitive bool
 
 	pending map[uint16]Command // dst<<8 | cnt → request
+	// redacted is set while describing a packet when bytes were
+	// withheld.
+	redacted bool
 }
 
 // Describe returns a description of p; fromHost is true for packets the
 // host wrote to the module.
 func (d *Describer) Describe(fromHost bool, p Packet) string {
+	s, _ := d.DescribeSensitive(fromHost, p)
+	return s
+}
+
+// DescribeSensitive is Describe that also reports whether bytes of p
+// were withheld from the description. Callers must then not log p's raw
+// bytes either.
+func (d *Describer) DescribeSensitive(fromHost bool, p Packet) (desc string, redacted bool) {
+	d.redacted = false
+	desc = d.describe(fromHost, p)
+	return desc, d.redacted
+}
+
+func (d *Describer) describe(fromHost bool, p Packet) string {
 	if p.Dst == DstKey {
 		// Undocumented (see DstKey); the module answers with command
 		// 0x03 and the request's counter.
@@ -58,6 +75,7 @@ func (d *Describer) redact(b []byte) string {
 	if len(b) == 0 {
 		return ""
 	}
+	d.redacted = true
 	return fmt.Sprintf("<%d bytes redacted>", len(b))
 }
 
@@ -166,7 +184,18 @@ func (d *Describer) frame(f Frame, err error, raw []byte) string {
 		fmt.Fprintf(&sb, " cyclic=%02X", f.CyclicCounter)
 	}
 	if err != nil {
-		fmt.Fprintf(&sb, " (malformed: %v) %s", err, hex.EncodeToString(raw[min(f.Len, len(raw)):]))
+		// The content (e.g. network management, carrying nonces and
+		// the encrypted network key) could not be decoded reliably:
+		// never show the bytes after the header.
+		fmt.Fprintf(&sb, " (malformed: %v)", err)
+		if rest := raw[min(f.Len, len(raw)):]; len(rest) > 0 {
+			if d.ShowSensitive {
+				sb.WriteString(" " + hex.EncodeToString(rest))
+			} else {
+				d.redacted = true
+				fmt.Fprintf(&sb, " (%d bytes, redacted)", len(rest))
+			}
+		}
 		return sb.String()
 	}
 	sb.WriteString(" | ")

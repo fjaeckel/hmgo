@@ -217,6 +217,10 @@ func TestRedaction(t *testing.T) {
 	var d Describer
 	secret := strings.Repeat("ab", 20)
 	b, _ := hex.DecodeString(secret)
+	// network management, address extension 1, version 8
+	routed := append([]byte{0x01, 0x08, 0x80, 1, 2, 3, 4, 5, 6}, b...)
+	// network management, extended security, security fields cut short
+	secured := append([]byte{0x21, 0x00, 0x80, 1, 2, 3, 4, 5, 6}, b[:6]...)
 	for _, s := range []string{
 		d.Describe(true, Packet{Dst: DstHMIP, Cnt: 1, Cmd: CmdSetEncNetworkKey, Data: b}),
 		d.Describe(false, Packet{Dst: DstHMIP, Cnt: 1, Cmd: CmdResponse, Data: append([]byte{1}, b...)}),
@@ -225,10 +229,27 @@ func TestRedaction(t *testing.T) {
 		d.Describe(false, Packet{Dst: DstHMIP, Cnt: 3, Cmd: CmdResponse, Data: append([]byte{1}, b...)}), // unknown request
 		d.Describe(true, Packet{Dst: DstKey, Cnt: 4, Cmd: 0x0e, Data: b}),
 		d.Describe(false, Packet{Dst: DstKey, Cnt: 4, Cmd: 0x03, Data: b}),
+		// Routed network management (address extension): ParseFrame
+		// fails, the bytes after the header must not be dumped.
+		d.Describe(false, Packet{Dst: DstHMIP, Cnt: 5, Cmd: CmdEvent, Data: append([]byte{0x40}, routed...)}),
+		d.Describe(true, Packet{Dst: DstHMIP, Cnt: 6, Cmd: CmdSend, Data: append([]byte{0x00}, routed...)}),
+		// Truncated security fields.
+		d.Describe(false, Packet{Dst: DstHMIP, Cnt: 7, Cmd: CmdEvent, Data: append([]byte{0x40}, secured...)}),
 	} {
 		if strings.Contains(s, "abab") || !strings.Contains(s, "redacted") {
 			t.Errorf("not redacted: %s", s)
 		}
+	}
+	for _, p := range []Packet{
+		{Dst: DstHMIP, Cnt: 5, Cmd: CmdEvent, Data: append([]byte{0x40}, routed...)},
+		{Dst: DstHMIP, Cnt: 1, Cmd: CmdSetEncNetworkKey, Data: b},
+	} {
+		if _, sensitive := d.DescribeSensitive(p.Cmd != CmdEvent, p); !sensitive {
+			t.Errorf("%v: not reported as sensitive", p.Cmd)
+		}
+	}
+	if _, sensitive := d.DescribeSensitive(false, Packet{Dst: DstHMIP, Cnt: 8, Cmd: CmdEvent, Data: []byte{0x40, 0x00, 0x00, 0x80, 1, 2, 3, 4, 5, 6, 0x01}}); sensitive {
+		t.Error("plain application frame reported as sensitive")
 	}
 	d.ShowSensitive = true
 	if s := d.Describe(true, Packet{Dst: DstKey, Cmd: 0x0e, Data: b}); !strings.Contains(s, secret) {

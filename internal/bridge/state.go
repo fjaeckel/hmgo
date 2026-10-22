@@ -106,10 +106,13 @@ func stateFromEvent(d *device, ev any) ha.State {
 		if e.Channel != power.ActuatorChannel {
 			break // the dimmer's virtual channels are not exposed
 		}
-		// While the actuator is still changing (a ramping dimmer), the
-		// level is an intermediate value: keep the last final level
-		// (and the dimmer's last on-level) until the final report.
-		if !e.Working {
+		// While a dimmer is ramping (direction up or down), the level is
+		// an intermediate value: keep the last final level (and with it
+		// the dimmer's last on-level) until the final report. The other
+		// working bits (e.g. an on-time running, 0x40) and any switch
+		// report carry a real level.
+		ramping := d.desc.Kind == ha.Dimmer && e.Direction != power.DirectionNone
+		if !ramping {
 			s.Level = ptr(e.Percent)
 			s.On = ptr(e.On())
 		}
