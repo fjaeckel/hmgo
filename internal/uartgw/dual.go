@@ -450,8 +450,8 @@ type DualConn struct {
 	now          func() time.Time // local monotonic clock (tests may skew it)
 	cnt          byte
 	reqs         map[byte]*dualReq
-	oneshots     map[byte]time.Time // fire-and-forget LLMAC_SENDs (software ACKs, challenges)
-	lateIdentify map[byte]bool      // IDENTIFY requests we gave up on
+	oneshots     map[byte]*oneshot // fire-and-forget LLMAC_SENDs (software ACKs, challenges)
+	lateIdentify map[byte]bool     // IDENTIFY requests we gave up on
 	resp         *respWaiter
 	held         map[aesKey]*heldMsg
 	authed       map[aesKey]aesDone      // recently authenticated messages
@@ -542,7 +542,7 @@ func openDual(rw io.ReadWriter, cfg Config, p *framePump, d detection) (*DualCon
 		now:             time.Now,
 		cnt:             detectCnt,
 		reqs:            make(map[byte]*dualReq),
-		oneshots:        make(map[byte]time.Time),
+		oneshots:        make(map[byte]*oneshot),
 		// detect's IDENTIFY may be answered after an announcement.
 		lateIdentify: map[byte]bool{detectCnt: true},
 		held:         make(map[aesKey]*heldMsg),
@@ -937,6 +937,13 @@ func (c *DualConn) llmacSend(ctx context.Context, msg []byte, opts [3]byte, w *r
 		// scheduled: the module waits up to ~replyDelay before sending
 		timeout += replyDelay
 	}
+	if len(msg) >= 9 {
+		var dev [3]byte
+		copy(dev[:], msg[6:9])
+		if err := c.waitOneshotsTo(ctx, dev); err != nil {
+			return err
+		}
+	}
 	f, err := c.requestArm(ctx, dstLLMAC, llmacSendPayload(opts, msg), timeout, w)
 	if err != nil {
 		if isLivenessFailure(err) {
@@ -961,6 +968,61 @@ func (c *DualConn) llmacSend(ctx context.Context, msg []byte, opts [3]byte, w *r
 	return nil
 }
 
+// oneshot is a fire-and-forget LLMAC_SEND (software ACK, challenge)
+// waiting for its LLMAC_ACK. done is closed when it is answered or given
+// up.
+type oneshot struct {
+	at   time.Time
+	dev  [3]byte
+	done chan struct{}
+}
+
+// finishOneshotLocked forgets the oneshot with counter cnt and releases
+// sends waiting for it. It reports whether there was one.
+func (c *DualConn) finishOneshotLocked(cnt byte) bool {
+	o, ok := c.oneshots[cnt]
+	if ok {
+		delete(c.oneshots, cnt)
+		close(o.done)
+	}
+	return ok
+}
+
+// waitOneshotsTo waits until our ACKs and challenges to dev that are
+// already queued have been handled by the module. They are usually
+// scheduled ~100ms after the device's message, like OpenCCU does; a
+// command to the same device sent "now" in the meantime makes the
+// module drop the scheduled one (LLMAC_ACK status 0x05, seen on a real
+// RPI-RF-MOD reading an HM-Sec-SCo's settings), so the device repeats
+// its message instead of listening, and the command fails (status 0x02).
+func (c *DualConn) waitOneshotsTo(ctx context.Context, dev [3]byte) error {
+	c.mu.Lock()
+	var waits []chan struct{}
+	for _, o := range c.oneshots {
+		if o.dev == dev {
+			waits = append(waits, o.done)
+		}
+	}
+	c.mu.Unlock()
+	if len(waits) == 0 {
+		return nil
+	}
+	t := time.NewTimer(replyDelay + c.timeout)
+	defer t.Stop()
+	for _, w := range waits {
+		select {
+		case <-w:
+		case <-t.C:
+			return nil // send anyway; the module answers for itself
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-c.done:
+			return c.Err()
+		}
+	}
+	return nil
+}
+
 // sendOneshot queues an urgent LLMAC_SEND without waiting for its
 // LLMAC_ACK (the reader goroutine cannot wait for frames it reads
 // itself). The ack is matched and counted in dispatch.
@@ -972,9 +1034,9 @@ func (c *DualConn) sendOneshot(msg []byte, opts [3]byte, what string) {
 	}
 	now := time.Now()
 	if len(c.oneshots) >= maxOneshots {
-		for cnt, t := range c.oneshots {
-			if now.Sub(t) > 10*time.Second {
-				delete(c.oneshots, cnt)
+		for cnt, o := range c.oneshots {
+			if now.Sub(o.at) > 10*time.Second {
+				c.finishOneshotLocked(cnt)
 			}
 		}
 	}
@@ -986,13 +1048,15 @@ func (c *DualConn) sendOneshot(msg []byte, opts [3]byte, what string) {
 		c.ackTimeout(err)
 		return
 	}
-	c.oneshots[cnt] = now
+	o := &oneshot{at: now, done: make(chan struct{})}
+	copy(o.dev[:], msg[6:9])
+	c.oneshots[cnt] = o
 	c.mu.Unlock()
 	f := frame{dst: dstLLMAC, cnt: cnt, cmd: llmacSend, payload: llmacSendPayload(opts, msg)[1:]}
 	if err := c.enqueue(context.Background(), f, true); err != nil {
 		floodLog.Logf(log.Printf, "oneshot_dropped", "uartgw: dropping %s: %v", what, err)
 		c.mu.Lock()
-		delete(c.oneshots, cnt)
+		c.finishOneshotLocked(cnt)
 		c.mu.Unlock()
 		return
 	}
@@ -1168,8 +1232,7 @@ func (c *DualConn) dispatch(f frame) {
 			return
 		}
 		c.mu.Lock()
-		_, ok := c.oneshots[f.cnt]
-		delete(c.oneshots, f.cnt)
+		ok := c.finishOneshotLocked(f.cnt)
 		if ok {
 			c.ackTimeouts = 0
 		}
@@ -1207,8 +1270,7 @@ func (c *DualConn) dispatch(f frame) {
 			return
 		}
 		c.mu.Lock()
-		_, ok := c.oneshots[f.cnt]
-		delete(c.oneshots, f.cnt)
+		ok := c.finishOneshotLocked(f.cnt)
 		c.mu.Unlock()
 		if !ok {
 			log.Printf("uartgw: ignoring unexpected frame: %v", f)

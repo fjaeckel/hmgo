@@ -9,6 +9,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"io"
 	"runtime"
 	"strings"
 	"sync"
@@ -1492,7 +1493,7 @@ func TestOpenModuleDetectStrayAppReply(t *testing.T) {
 }
 
 func TestDualNextCntExhausted(t *testing.T) {
-	c := &DualConn{reqs: make(map[byte]*dualReq), oneshots: make(map[byte]time.Time)}
+	c := &DualConn{reqs: make(map[byte]*dualReq), oneshots: make(map[byte]*oneshot)}
 	for i := 1; i < 256; i++ {
 		c.reqs[byte(i)] = &dualReq{}
 	}
@@ -1866,5 +1867,82 @@ func TestDualRegReadFrameCap(t *testing.T) {
 	}
 	if acks != 1+regReadFrames || challenges != 3 {
 		t.Errorf("%d ACKs, %d challenges; want %d and 3", acks, challenges, 1+regReadFrames)
+	}
+}
+
+// writeTimes records when the host wrote bytes containing a pattern.
+type writeTimes struct {
+	io.ReadWriteCloser
+	mu    sync.Mutex
+	marks map[string]time.Time
+	pats  map[string][]byte
+}
+
+func (w *writeTimes) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	for name, pat := range w.pats {
+		if _, ok := w.marks[name]; !ok && bytes.Contains(p, pat) {
+			w.marks[name] = time.Now()
+		}
+	}
+	w.mu.Unlock()
+	return w.ReadWriteCloser.Write(p)
+}
+
+// A command to a device must not overtake our ACK to that device's
+// message, which the module sends ~100ms after the message. On a real
+// RPI-RF-MOD the command, written while the ACK was still scheduled, was
+// transmitted at once and the module dropped the scheduled ACK
+// (LLMAC_ACK status 0x05); the HM-Sec-SCo then repeated its register
+// read answer instead of taking the next request. So the command may only
+// be handed to the module after the ACK was transmitted.
+func TestDualCommandWaitsForScheduledACK(t *testing.T) {
+	mod, rw := fakemod.New(fakemod.Options{DualCoPro: true})
+	t.Cleanup(func() { mod.Close() })
+	cmd := msgBytes(0x48, 0x80, 0x11, testHMID, testDevice, 0x02, 0x01, 0xc8, 0x00, 0x00)
+	wt := &writeTimes{ReadWriteCloser: rw, marks: map[string]time.Time{}, pats: map[string][]byte{"command": cmd[:9]}}
+	m, err := OpenModule(wt, dualCfg(Config{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { m.Close() })
+	c := m.(*DualConn)
+	if err := c.AddPeer(context.Background(), Peer{Addr: testDevice, KeyIndex: 1, Channels: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if err := mod.InjectLLMACRecv(0x40, msgBytes(0x3f, 0xa0, 0x10, testDevice, testHMID, 0x02, 0x02, 0x01, 0x00, 0x00)); err != nil {
+		t.Fatal(err)
+	}
+	// Wait until our ACK is queued, then send a command right away.
+	deadline := time.Now().Add(time.Second)
+	for {
+		c.mu.Lock()
+		n := len(c.oneshots)
+		c.mu.Unlock()
+		if n > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("no ACK queued")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if _, err := c.Send(context.Background(), append([]byte{0x00, 0x00, 0x00}, cmd...)); err != nil {
+		t.Fatal(err)
+	}
+	var ackAt time.Time
+	for _, s := range mod.LLMACSent() {
+		if s.Msg[2] == 0x02 && s.Msg[0] == 0x3f {
+			ackAt = s.At
+		}
+	}
+	wt.mu.Lock()
+	cmdAt, ok := wt.marks["command"]
+	wt.mu.Unlock()
+	if ackAt.IsZero() || !ok {
+		t.Fatalf("ACK transmitted at %v, command written: %v", ackAt, ok)
+	}
+	if cmdAt.Before(ackAt) {
+		t.Errorf("command handed to the module %v before our scheduled ACK was transmitted", ackAt.Sub(cmdAt))
 	}
 }
