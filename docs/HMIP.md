@@ -21,22 +21,52 @@ Homematic and HmIP over one serial line):
   header of the radio frames they carry (source/destination address, content
   type, security control, security number, integrity code, flags) plus the
   application header (frame type, sequence number). No payload semantics
-  (except the HmIP-STHO's status frame, see below), no encryption, no keys.
+  (except the HmIP-STHO's status frame), no encryption, no keys.
 * hmbridge logs every decoded HmIP frame with `-debug`, counts them in
   `hmbridge_hmip_frames_total{kind="device"|"own"|"other"|"malformed"}`, and
   lists the radio addresses of frames from other devices in the HTTP API
   (`GET /api/v1/unknown`, field `hmip_heard`), with last seen and the RSSI the
-  module measured. Nothing is published to MQTT.
+  module measured. The STATUS frames of the devices configured in `hmip`
+  are published to Home Assistant, see
+  [Receiving Homematic IP devices](#receiving-homematic-ip-devices).
 * `hmsniff` decodes OpenCCU's HmIP traffic the same way instead of printing
   only command and length. Key material (network key, inclusion data, the
   0x0c exchange) is always redacted.
 
 **hmbridge never sends anything on the HmIP destinations**: no address, no
-key, no link partner, no answer. That is also why `hmip_heard` will
-most likely stay empty: when hmbridge owns the module, nobody gives the module
-its HmIP address, security counter and network key (OpenCCU's HMIPServer does
-that at every start, see below). Whether the module then passes on any frames
-from HmIP devices at all is unknown. Under OpenCCU, `hmsniff` shows them.
+key, no link partner, no answer. The module passes on the frames of HmIP
+devices nevertheless: on an HM-MOD-RPI-PCB with dual firmware 2.8.6 that
+OpenCCU had used before, hmbridge (which never set the module's HmIP address,
+security counter or network key) listed the frames of an HmIP-STHO to
+OpenCCU's access point address in `hmip_heard` right after its start.
+
+## Receiving Homematic IP devices
+
+Devices that only report, and need no answer, can be received without any
+transmission: the HmIP-STHO (see [HmIP-STHO](#hmip-stho) below). They stay
+paired to OpenCCU's access point, whose address the module keeps answering
+to; hmbridge only needs that address and the devices:
+
+```json
+"hmip": {
+  "address": "3A4B5C",
+  "devices": [
+    { "name": "Balkon", "model": "HmIP-STHO", "address": "2B3C4D" }
+  ]
+}
+```
+
+`address` is `HM_HMIP_ADDRESS` from OpenCCU's `/var/hm_mode`; the device
+addresses are in hmbridge's `hmip_heard` (or OpenCCU's device list). Only
+STATUS frames from a configured device to that address are used. Each device
+appears in Home Assistant like a weather sensor: temperature, humidity,
+battery voltage, signal strength and last seen, unavailable after
+`stale_after` (default 1h) without a report. There is no low battery entity:
+the meaning of the status frame's other bytes is not known.
+
+The frames are signed but hmbridge does not check the signature (it has no
+key), so like the BidCoS weather sensors, which have no AES, the values can
+be forged by anyone in radio range.
 
 ## What the recordings show
 
@@ -131,7 +161,7 @@ voltage ×0.1 V, bytes 10–11 the temperature ×0.1 °C (big endian), byte 12
 the humidity in %. The captured payload above is 2.6 V, 10.4 °C and 77 %,
 as OpenCCU showed at the time. Bytes 0–3 and 5–9 are unknown. Not verified
 yet (assumption): temperatures below 0 °C as two's complement.
-`hmip.ParseSTHOStatus` decodes it; hmbridge does not use it yet.
+`hmip.ParseSTHOStatus` decodes it.
 
 ### Pairing data in OpenCCU
 
@@ -188,9 +218,11 @@ Every step below transmits, so none of it is in phase 1.
    layer against this firmware and to find out what HMIPServer stores.
    Status frames (HmIP-STHO) and the storage: done. Answers, time requests
    and a pairing: not recorded yet.
-3. Read-only operation with a pairing imported from OpenCCU: load key and
-   counter at start, decode status frames, publish to MQTT. First
-   transmissions on the HmIP destination (setup commands only).
+3. Read-only operation: decode status frames, publish to MQTT. Done for the
+   HmIP-STHO, without any transmission (the module passes the frames on
+   without setup). Devices that need an answer will need the pairing
+   imported from OpenCCU: key and counter loaded at start, the first
+   transmissions on the HmIP destination.
 4. Answers and commands for selected device types.
 5. Own pairing (key server or local keys), if still wanted.
 

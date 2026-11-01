@@ -182,15 +182,19 @@ func init() {
 
 // updateMetrics exports the device state. Caller holds b.mu.
 func (b *Bridge) updateMetrics(d *device) {
-	l := []string{d.desc.Addr, labelValue(d.cfg.Name), labelValue(d.cfg.Model)}
-	st := &d.state
+	setDeviceMetrics(d.desc.Addr, d.cfg.Name, d.cfg.Model, &d.state, d.msgs)
+}
+
+// setDeviceMetrics sets the hmbridge_device_* metrics of a device.
+func setDeviceMetrics(addr, name, model string, st *ha.State, msgs uint64) {
+	l := []string{addr, labelValue(name), labelValue(model)}
 	if !st.LastSeen.IsZero() {
 		metricLastSeen.WithLabelValues(l...).Set(float64(st.LastSeen.Unix()))
 	}
 	if st.RSSI != nil {
 		metricRSSI.WithLabelValues(l...).Set(float64(*st.RSSI))
 	}
-	metricMessages.WithLabelValues(l...).Set(float64(d.msgs))
+	metricMessages.WithLabelValues(l...).Set(float64(msgs))
 	if st.BatteryVoltage != nil {
 		metricBatteryVolts.WithLabelValues(l...).Set(*st.BatteryVoltage)
 		metricBatteryPercent.WithLabelValues(l...).Set(float64(ha.BatteryPercent(*st.BatteryVoltage)))
@@ -211,7 +215,7 @@ func (b *Bridge) updateMetrics(d *device) {
 		metricHumidity.WithLabelValues(l...).Set(float64(*st.Humidity))
 	}
 	if st.Fault != "" {
-		metricFault.DeletePartialMatch(prometheus.Labels{"address": d.desc.Addr})
+		metricFault.DeletePartialMatch(prometheus.Labels{"address": addr})
 		metricFault.WithLabelValues(append(l, labelValue(st.Fault))...).Set(1)
 	}
 	if st.Level != nil {

@@ -78,7 +78,11 @@ var (
 	contactOnly = func(d DeviceDesc) bool { return d.Kind == WindowContact }
 
 	// Battery powered devices that report a low battery.
-	batteryKinds = kinds(RadiatorThermostat, WallThermostat, WindowContact, Remote, WeatherSensor)
+	batteryKinds = func(d DeviceDesc) bool {
+		return kinds(RadiatorThermostat, WallThermostat, WindowContact, Remote, WeatherSensor)(d) && !IsHMIP(d.Model)
+	}
+	// Devices that report their battery voltage.
+	voltageKinds = func(d DeviceDesc) bool { return thermostats(d) || IsHMIP(d.Model) }
 	// Devices with AES (the weather sensors have none).
 	aesKinds = kinds(RadiatorThermostat, WallThermostat, WindowContact, Switch, Dimmer, Remote, LEDDisplay)
 	// Devices that take commands.
@@ -157,7 +161,7 @@ func entities() []entity {
 		{component: "sensor", key: "valve_position", match: rtOnly, config: numSensor("Valve position", "valve_position", "", "%",
 			map[string]any{"icon": "mdi:pipe-valve"})},
 		// Contacts report low battery only, no voltage.
-		{component: "sensor", key: "battery_voltage", match: thermostats, config: numSensor("Battery voltage", "battery_voltage", "voltage", "V",
+		{component: "sensor", key: "battery_voltage", match: voltageKinds, config: numSensor("Battery voltage", "battery_voltage", "voltage", "V",
 			map[string]any{"suggested_display_precision": 1})},
 		{component: "sensor", key: "battery", match: thermostats, config: numSensor("Battery (estimated)", "battery_percent", "battery", "%", nil)},
 		{component: "binary_sensor", key: "low_battery", match: batteryKinds, config: binarySensor("Battery low", "low_battery", "battery", nil)},
