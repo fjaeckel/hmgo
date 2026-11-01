@@ -13,10 +13,11 @@ import (
 	"github.com/fjaeckel/hmgo/internal/hmip"
 )
 
-// Homematic IP, phase 1 (docs/HMIP.md): the frames the RPI-RF-MOD
-// passes on are decoded for the debug log, and the radio addresses they
-// come from are listed by the API (/api/v1/unknown). Nothing is sent to the
-// module, nothing is published to MQTT.
+// Homematic IP (docs/HMIP.md): the frames the module passes on are
+// decoded for the debug log, and the radio addresses they come from are
+// listed by the API (/api/v1/unknown). STATUS frames of the devices in
+// hmip.devices go to the bridge (hmipsensor.go). Nothing is sent to the
+// module.
 
 var metricHMIPFrames = prometheus.NewCounterVec(prometheus.CounterOpts{
 	Namespace: "hmbridge", Subsystem: "hmip", Name: "frames_total",
@@ -53,6 +54,18 @@ type HMIPMonitor struct {
 	mu    sync.Mutex
 	desc  hmip.Describer // never shows key material
 	heard map[hmip.Address]*HMIPDevice
+	// report receives the STATUS frames of the configured devices
+	// (nil: none), which are not listed as heard.
+	report     func(hmipReport)
+	configured map[hmip.Address]bool
+}
+
+// setReporter has the monitor pass the STATUS frames of the configured
+// devices to report, which must not block.
+func (m *HMIPMonitor) setReporter(configured map[hmip.Address]bool, report func(hmipReport)) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.configured, m.report = configured, report
 }
 
 // NewHMIPMonitor returns a monitor; nil now means time.Now, nil debugf
@@ -94,6 +107,12 @@ func (m *HMIPMonitor) Handle(dst, cnt byte, packet []byte) {
 	}
 	metricHMIPFrames.WithLabelValues("device").Inc()
 	f := ev.Frame
+	if m.configured[f.Src] {
+		if err == nil {
+			m.reportStatus(f, ev)
+		}
+		return
+	}
 	d := m.heard[f.Src]
 	if d == nil {
 		if len(m.heard) >= maxHMIPDevices {
@@ -117,6 +136,20 @@ func (m *HMIPMonitor) Handle(dst, cnt byte, packet []byte) {
 	} else if f.Content == hmip.ContentNetworkMgmt && len(f.Payload) > 0 {
 		d.Last += " " + hmip.NetMgmtTypeName(f.Payload[0])
 	}
+}
+
+// reportStatus passes a configured device's STATUS frame on. m.mu
+// must be held.
+func (m *HMIPMonitor) reportStatus(f hmip.Frame, ev hmip.Event) {
+	h, payload, err := f.App()
+	if err != nil || h.Type != hmip.FrameStatus {
+		return
+	}
+	r := hmipReport{src: f.Src, dst: f.Dst, payload: append([]byte(nil), payload...)}
+	if v, ok := ev.RSSI(); ok {
+		r.rssi = &v
+	}
+	m.report(r)
 }
 
 func (m *HMIPMonitor) evictOldest() {

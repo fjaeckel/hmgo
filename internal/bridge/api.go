@@ -415,6 +415,9 @@ func (a *api) devices(w http.ResponseWriter, r *http.Request) {
 	for _, d := range b.devices {
 		res = append(res, b.apiDeviceLocked(d))
 	}
+	for _, s := range b.hmipSensors {
+		res = append(res, apiHMIPLocked(s))
+	}
 	b.mu.Unlock()
 	writeJSON(w, http.StatusOK, res)
 }
@@ -428,12 +431,16 @@ func (a *api) device(w http.ResponseWriter, r *http.Request) {
 	b := a.b
 	b.mu.Lock()
 	d := b.deviceByAddrHex(addr)
+	s := b.hmipByAddrHex(addr)
 	var res APIDevice
-	if d != nil {
+	switch {
+	case d != nil:
 		res = b.apiDeviceLocked(d)
+	case s != nil:
+		res = apiHMIPLocked(s)
 	}
 	b.mu.Unlock()
-	if d == nil {
+	if d == nil && s == nil {
 		writeJSON(w, http.StatusNotFound, APIError{Error: "no such device: " + addr})
 		return
 	}

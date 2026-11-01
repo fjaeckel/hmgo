@@ -32,6 +32,7 @@ import (
 	"github.com/fjaeckel/hmgo/internal/hm/params"
 	"github.com/fjaeckel/hmgo/internal/hm/power"
 	"github.com/fjaeckel/hmgo/internal/hm/remote"
+	"github.com/fjaeckel/hmgo/internal/hmip"
 	"github.com/fjaeckel/hmgo/internal/ratelog"
 	"github.com/fjaeckel/hmgo/internal/store"
 	"github.com/fjaeckel/hmgo/internal/uartgw"
@@ -162,7 +163,11 @@ type Bridge struct {
 	pub     Publisher
 	unknown map[[3]byte]*UnknownSender
 	hmip    *HMIPMonitor // has its own lock
-	started time.Time
+	// Homematic IP sensors (hmipsensor.go); hmipC is nil without any.
+	hmipSensors []*hmipSensor
+	hmipBy      map[hmip.Address]*hmipSensor
+	hmipC       chan hmipReport
+	started     time.Time
 	// stateDirty: any state changed since the last save;
 	// significantDirty: a change worth writing to the SD card.
 	stateDirty, significantDirty bool
@@ -373,6 +378,7 @@ func New(opts Options) (*Bridge, error) {
 		b.devices = append(b.devices, d)
 		b.byAddr[d.cfg.Addr()] = d
 	}
+	b.setupHMIP()
 	if b.store.PairingEnabled() {
 		b.loadStore()
 	}
@@ -511,6 +517,7 @@ func (b *Bridge) Setup(ctx context.Context) error {
 		}
 		b.logf("peer %s %s (%s): AES %s", d.desc.Addr, d.cfg.Name, d.cfg.Model, aes)
 	}
+	b.logHMIP()
 	b.mu.Lock()
 	b.started = b.now()
 	b.checkAvailability(b.started) // restored state may already be stale
@@ -575,6 +582,7 @@ func (b *Bridge) PublishAll() {
 		msgs = append(msgs, ha.DeviceAvailabilityMessage(topics, d.desc.Addr, d.available))
 		d.availPublished = true
 	}
+	msgs = append(msgs, b.hmipDiscoveryLocked(topics, stale)...)
 	for _, g := range b.groups {
 		msgs = append(msgs, ha.GroupDiscoveryMessages(topics, g.desc)...)
 		msgs = append(msgs, ha.GroupMembersMessage(topics, g.desc))
@@ -723,6 +731,9 @@ func (b *Bridge) Run(ctx context.Context) error {
 
 		case key := <-b.debounceC:
 			b.flushPending(key, false)
+
+		case r := <-b.hmipC:
+			b.handleHMIPReport(r)
 		}
 	}
 }

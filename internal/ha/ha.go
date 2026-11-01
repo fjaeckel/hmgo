@@ -177,7 +177,7 @@ func KindForModel(model string) (Kind, bool) {
 		return Remote, true
 	case "HM-OU-LED16":
 		return LEDDisplay, true
-	case "HM-WDS10-TH-O", "HM-WDS30-T-O":
+	case "HM-WDS10-TH-O", "HM-WDS30-T-O", "HMIP-STHO":
 		return WeatherSensor, true
 	}
 	return 0, false
@@ -196,7 +196,13 @@ func Buttons(model string) int {
 }
 
 // HasHumidity reports whether a weather sensor model measures humidity.
-func HasHumidity(model string) bool { return strings.EqualFold(model, "HM-WDS10-TH-O") }
+func HasHumidity(model string) bool {
+	return strings.EqualFold(model, "HM-WDS10-TH-O") || IsHMIP(model)
+}
+
+// IsHMIP reports whether model is a Homematic IP device (HmIP-STHO,
+// receive only): it reports its battery voltage but no low battery flag.
+func IsHMIP(model string) bool { return strings.EqualFold(model, "HmIP-STHO") }
 
 // LEDCount is the number of LEDs of the HM-OU-LED16.
 const LEDCount = 16

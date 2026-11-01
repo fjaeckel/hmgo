@@ -154,6 +154,9 @@ func ParseFrame(b []byte, securityFields bool) (Frame, error) {
 // FrameType is the 6-bit frame type of an application header.
 type FrameType byte
 
+// FrameStatus is the frame type of a device's status report.
+const FrameStatus FrameType = 5
+
 // Application frame types named by the specification.
 var frameTypeNames = map[FrameType]string{
 	1:  "CONFIG",

@@ -102,6 +102,7 @@ heating groups.
 | HM-PB-2-WM55, HM-RC-8 | 2-button wall switch, 8-button remote | an event entity per button (press_short, press_long, press_long_release) and device triggers for automations, low battery |
 | HM-OU-LED16 | 16-LED status display | a select per LED (off, red, green, orange) |
 | HM-WDS10-TH-O, HM-WDS30-T-O | outdoor sensor | temperature (and humidity), low battery |
+| HmIP-STHO (Homematic IP, receive only, `hmip` in the configuration; see [docs/HMIP.md](docs/HMIP.md#receiving-homematic-ip-devices)) | outdoor sensor | temperature, humidity, battery voltage |
 
 Every device also gets diagnostic sensors (last seen, signal strength, AES
 result, outcome of the last command). [docs/DEPLOY.md](docs/DEPLOY.md#4-home-assistant)

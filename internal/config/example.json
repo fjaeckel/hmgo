@@ -163,5 +163,13 @@
       "members": ["Wohnzimmer Wandthermostat", "Wohnzimmer Heizung", "38F5A1", "Wohnzimmer Fenster"]
     }
   ],
-  "groups_suggest_area": true
+  "groups_suggest_area": true,
+
+  "hmip": {
+    "_comment": "Homematic IP devices, receive only (HmIP-STHO). address: the radio module's own Homematic IP address (OpenCCU: HM_HMIP_ADDRESS in /var/hm_mode). Devices take name, model, address and stale_after (default 1h). Names and addresses must differ from those in devices.",
+    "address": "3A4B5C",
+    "devices": [
+      { "name": "Balkon", "model": "HmIP-STHO", "address": "2B3C4D" }
+    ]
+  }
 }

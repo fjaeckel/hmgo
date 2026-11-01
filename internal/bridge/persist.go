@@ -323,6 +323,7 @@ func (b *Bridge) checkAvailability(now time.Time) []ha.Message {
 		}
 		metricAvailable.WithLabelValues(d.desc.Addr, labelValue(d.cfg.Name), d.cfg.Model).Set(boolFloat(online))
 	}
+	msgs = append(msgs, b.hmipAvailabilityLocked(now, topics)...)
 	for _, g := range b.groups {
 		online := false
 		for _, d := range g.thermostats {

@@ -155,7 +155,7 @@ func run(ctx context.Context, cfg *config.Config, uart io.ReadWriteCloser) error
 	if *debugFrames {
 		debugf = log.Printf
 	}
-	// Homematic IP frames of the RPI-RF-MOD: shown, not supported yet.
+	// Homematic IP frames: shown, and those of hmip.devices published.
 	hmipMon := bridge.NewHMIPMonitor(nil, debugf)
 	conn, err := openModule(cfg, uart, hmipMon.Handle)
 	if err != nil {

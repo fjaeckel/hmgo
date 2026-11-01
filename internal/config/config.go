@@ -251,6 +251,8 @@ type Config struct {
 	// one, so this neither moves devices later nor overrides areas set in
 	// Home Assistant.
 	GroupsSuggestArea *bool `json:"groups_suggest_area,omitempty"`
+	// HMIP lists Homematic IP devices (receive only, see HMIP).
+	HMIP *HMIP `json:"hmip,omitempty"`
 
 	centralAddr [3]byte
 	current     hmkey.Key
@@ -906,6 +908,9 @@ func (c *Config) resolve() error {
 			return fmt.Errorf("%s: duplicate address %s (also used by devices[%d])", where, d.AddrHex(), j)
 		}
 		byAddr[d.addr] = i
+	}
+	if err := c.resolveHMIP(byName, byAddr); err != nil {
+		return err
 	}
 
 	inGroup := make(map[int]string)
