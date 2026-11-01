@@ -20,8 +20,8 @@ Homematic and HmIP over one serial line):
 * `internal/hmip` decodes the HmIP serial commands and responses, and the MAC
   header of the radio frames they carry (source/destination address, content
   type, security control, security number, integrity code, flags) plus the
-  application header (frame type, sequence number). No payload semantics, no
-  encryption, no keys.
+  application header (frame type, sequence number). No payload semantics
+  (except the HmIP-STHO's status frame, see below), no encryption, no keys.
 * hmbridge logs every decoded HmIP frame with `-debug`, counts them in
   `hmbridge_hmip_frames_total{kind="device"|"own"|"other"|"malformed"}`, and
   lists the radio addresses of frames from other devices in the HTTP API
@@ -115,6 +115,37 @@ recordings and hmbridge's own working implementation:
   another section. `internal/hmip` uses the worked examples (0x10 inclusion
   request, 0x20 inclusion accept, 0xf0/0xf2 removal).
 
+### HmIP-STHO
+
+A 15 minute recording of OpenCCU (HM-MOD-RPI-PCB, dual firmware 2.8.6) with
+an HmIP-STHO (outdoor temperature and humidity sensor): every 2–3 minutes
+the sensor sends a STATUS frame to the access point, signed (security
+control 1) but not encrypted, without “response requested”. HMIPServer does
+not answer it. Security number and sequence number count up by one per
+frame.
+
+    <sensor>→<access point> APP sec=1 v8 hop=7 sn=… mic=… cyclic=00 | STATUS seq=D4 008003001a060000010100684d
+
+The payload after the application header is 13 bytes: byte 4 the operating
+voltage ×0.1 V, bytes 10–11 the temperature ×0.1 °C (big endian), byte 12
+the humidity in %. The captured payload above is 2.6 V, 10.4 °C and 77 %,
+as OpenCCU showed at the time. Bytes 0–3 and 5–9 are unknown. Not verified
+yet (assumption): temperatures below 0 °C as two's complement.
+`hmip.ParseSTHOStatus` decodes it; hmbridge does not use it yet.
+
+### Pairing data in OpenCCU
+
+HMIPServer keeps its pairing data in `/etc/config/crRFD/data/`, in files
+named after the SGTIN: the access point in `.ap`, each device in `.dev`
+(both Kryo-serialised Java; the device file holds its radio address and
+settings such as temperature offset and cyclic info messages), and the
+network key in the access point's `.apkx`, a JSON object with six hex
+fields: `encNwk2` (16 bytes), `micNwk2` (4), `micNwk` (4), `nonceNwk` (13),
+`nonceNwk2` (13) and `otk` (16). Concatenated in this order they are the 66
+bytes HMIPServer sends with command 0x14 at every start (matched against a
+capture of a restart). The data is encrypted, presumably for the module's
+own key, so it is probably only usable with the same radio module.
+
 ## What full support would need
 
 Every step below transmits, so none of it is in phase 1.
@@ -139,12 +170,8 @@ Every step below transmits, so none of it is in phase 1.
    * **Importing OpenCCU's pairing.** The module keeps its link partners, but
      HMIPServer re-sends the encrypted network key and the security counter
      at every start, so hmbridge would need HMIPServer's stored copy of both
-     (plus the device list and addresses). The specification does **not**
-     say where OpenCCU/HMIPServer stores them. Presumably below
-     `/etc/config/crRFD/` (HMIPServer's data directory on OpenCCU) — this is
-     **unverified** and needs to be checked on a real system. Whether the
-     66-byte blob of command 0x14 is portable between hosts (it is encrypted;
-     probably for this module only) is also unknown.
+     (plus the device list and addresses), see
+     [Pairing data in OpenCCU](#pairing-data-in-openccu).
 2. **Answering devices**: acknowledgements (application frame type 2) for
    frames with “response requested”, time info answers, and the
    specification's transmission discipline (one transmission in flight,
@@ -159,6 +186,8 @@ Every step below transmits, so none of it is in phase 1.
 2. Record OpenCCU with a real HmIP device (hmsniff): status frames, answers,
    time requests, and a pairing — to check the specification's application
    layer against this firmware and to find out what HMIPServer stores.
+   Status frames (HmIP-STHO) and the storage: done. Answers, time requests
+   and a pairing: not recorded yet.
 3. Read-only operation with a pairing imported from OpenCCU: load key and
    counter at start, decode status frames, publish to MQTT. First
    transmissions on the HmIP destination (setup commands only).
