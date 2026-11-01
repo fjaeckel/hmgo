@@ -377,6 +377,13 @@ func (g *generator) readHMMode() string {
 	case "RPI-RF-MOD":
 		return config.RadioRPIRFMod
 	case "HM-MOD-RPI-PCB":
+		// With Homematic IP, OpenCCU runs eQ-3's dual firmware (2.x)
+		// on it, which only the RPI-RF-MOD driver speaks, but with the
+		// HM-MOD-RPI-PCB's reset line: leave both to the detection.
+		if v := m["HM_HMRF_VERSION"]; !strings.HasPrefix(v, "1.") {
+			g.logf("HM-MOD-RPI-PCB with firmware %q in %s: radio is detected at startup", v, g.src.HMModePath)
+			return ""
+		}
 		return config.RadioHMModRPIPCB
 	}
 	g.logf("HM_HMRF_DEV=%q in %s: radio is detected at startup", m["HM_HMRF_DEV"], g.src.HMModePath)
