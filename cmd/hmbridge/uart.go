@@ -101,8 +101,9 @@ func openUART(cfg *config.Config, logf func(string, ...any)) (*os.File, string, 
 // resetPin returns the GPIO of the module's reset line and why it was
 // chosen. With "radio": "auto" and no reset_gpio, the RPI-RF-MOD (GPIO
 // 19) is recognized by its RTC (if the RTC overlay is loaded) or by its
-// answer to IDENTIFY; otherwise the HM-MOD-RPI-PCB's line (GPIO 18) is
-// used. A wrong guess only means the module is not reset: detection
+// answer to IDENTIFY (which an HM-MOD-RPI-PCB with eQ-3's dual firmware
+// gives, too; uartgw.ProbeKind tells it by its firmware version);
+// otherwise the HM-MOD-RPI-PCB's line (GPIO 18) is used. A wrong guess only means the module is not reset: detection
 // after the reset copes with a running module.
 func resetPin(cfg *config.Config, uart *os.File, logf func(string, ...any)) (int, string) {
 	if !cfg.ResetGPIOAuto() {
@@ -124,7 +125,7 @@ func resetPin(cfg *config.Config, uart *os.File, logf func(string, ...any)) (int
 	case kind == uartgw.KindRPIRFMod:
 		return gpio.ResetPinRPIRFMod, "RPI-RF-MOD reset line: the module answered IDENTIFY"
 	case kind == uartgw.KindHMModRPIPCB:
-		return gpio.ResetPinHMModRPIPCB, "HM-MOD-RPI-PCB reset line: the module announced itself"
+		return gpio.ResetPinHMModRPIPCB, "HM-MOD-RPI-PCB reset line: the module identified itself as one"
 	}
 	return gpio.ResetPinHMModRPIPCB, "HM-MOD-RPI-PCB reset line: no RPI-RF-MOD found"
 }

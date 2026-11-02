@@ -21,7 +21,9 @@ type DeadlineReadWriter interface {
 // ProbeKind asks the module which family it belongs to before it is
 // reset, so that the right reset line can be pulsed: the RPI-RF-MOD
 // (dual-coprocessor firmware) answers IDENTIFY in its bootloader and in
-// its application; the HM-MOD-RPI-PCB's classic firmware ignores it. It
+// its application; the HM-MOD-RPI-PCB's classic firmware ignores it. An
+// HM-MOD-RPI-PCB with the dual firmware answers in its application, too,
+// and is told by its firmware version (boardForFirmware). It
 // returns KindRPIRFMod, KindHMModRPIPCB (it announced itself as one),
 // or "" if nothing identifying arrived within timeout (a classic module,
 // or no module at all).
@@ -52,7 +54,10 @@ func ProbeKind(rw DeadlineReadWriter, timeout time.Duration) (string, error) {
 		if f.dst == dstDual && f.cnt == detectCnt {
 			// The answer to our IDENTIFY (see detect).
 			if tag, ok := parseTag(f); ok {
-				if kind := tagKind(tag); kind != "" {
+				if kind := tagKind(tag); kind == KindRPIRFMod && isAppTag(tag) {
+					// The dual firmware runs on both modules.
+					return probeDualBoard(rw, fr), nil
+				} else if kind != "" {
 					return kind, nil
 				}
 				return "", fmt.Errorf("%w: it announced %q", ErrUnknownModule, tag)
@@ -65,6 +70,29 @@ func ProbeKind(rw DeadlineReadWriter, timeout time.Duration) (string, error) {
 		}
 		if kind, _ := classify(f); kind != "" {
 			return kind, nil
+		}
+	}
+}
+
+// probeDualBoard asks the dual-coprocessor application for its firmware
+// version and returns the module it implies (boardForFirmware), or
+// KindRPIRFMod if it does not answer before the read deadline.
+func probeDualBoard(rw io.Writer, fr *frameReader) string {
+	req := frame{dst: dstApp, cnt: detectCnt + 2, cmd: trxFirmware}
+	if _, err := rw.Write(req.encode()); err != nil {
+		return KindRPIRFMod
+	}
+	for {
+		f, err := fr.next()
+		switch {
+		case errors.Is(err, errBadFrame):
+			continue
+		case err != nil:
+			return KindRPIRFMod
+		}
+		// Reply: [0x04 0x01 major minor patch …], see DualConn.queryFirmware.
+		if f.dst == dstApp && f.cnt == req.cnt && f.cmd == trxReply && len(f.payload) >= 4 && f.payload[0] == 0x01 {
+			return boardForFirmware(fmt.Sprintf("%d.%d.%d", f.payload[1], f.payload[2], f.payload[3]))
 		}
 	}
 }

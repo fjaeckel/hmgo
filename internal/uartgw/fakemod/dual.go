@@ -38,7 +38,10 @@ const (
 // Application tags of the dual-coprocessor firmware.
 const (
 	TagDualBootloader = "HMIP_TRX_Bl"
-	TagDualApp        = "DualCoPro_App"
+	// TagClassicBootloader is the HM-MOD-RPI-PCB's bootloader, also
+	// with the dual firmware (Options.ClassicBootloader).
+	TagClassicBootloader = "Co_CPU_BL"
+	TagDualApp           = "DualCoPro_App"
 )
 
 // DefaultSGTIN is the SGTIN of the RPI-RF-MOD in the restart capture.
@@ -99,6 +102,41 @@ func (m *Module) announceDual(tag string) error {
 	return m.write(Frame{Dst: dst, Cnt: 0, Cmd: 0x00, Payload: []byte(tag)})
 }
 
+// classicBootloader handles f in the classic bootloader of an
+// HM-MOD-RPI-PCB with the dual firmware (Options.ClassicBootloader).
+func (m *Module) classicBootloader(f Frame) error {
+	if f.Dst != DstOS || f.Cmd != 0x03 {
+		return nil
+	}
+	if err := m.write(Frame{Dst: DstOS, Cnt: f.Cnt, Cmd: 0x04, Payload: []byte{AckOK}}); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	m.inApp = true
+	m.changeApps++
+	m.mu.Unlock()
+	m.announceDualLater(TagDualApp)
+	return nil
+}
+
+// announceDualLater announces tag after Options.AppSwitchDelay, like
+// the module once the new application runs.
+func (m *Module) announceDualLater(tag string) {
+	delay := m.opts.AppSwitchDelay
+	if delay == 0 {
+		delay = 20 * time.Millisecond
+	}
+	m.wg.Add(1)
+	go func() {
+		defer m.wg.Done()
+		select {
+		case <-time.After(delay):
+			m.announceDual(tag)
+		case <-m.done:
+		}
+	}()
+}
+
 func (m *Module) dualErr(req Frame) error {
 	return m.write(Frame{Dst: DstDualErr, Cnt: req.Cnt, Cmd: 0x04, Payload: []byte{AckNACK}})
 }
@@ -121,6 +159,9 @@ func (m *Module) handleDualCoPro(f Frame) error {
 
 	if m.opts.DualIgnore != nil && m.opts.DualIgnore(f.Dst, f.Cmd) {
 		return nil
+	}
+	if m.opts.ClassicBootloader && !inApp {
+		return m.classicBootloader(f)
 	}
 	m.mu.Lock()
 	errAll := m.dualErrAll
@@ -168,19 +209,7 @@ func (m *Module) handleDualCoPro(f Frame) error {
 		if inApp {
 			tag = TagDualApp
 		}
-		delay := m.opts.AppSwitchDelay
-		if delay == 0 {
-			delay = 20 * time.Millisecond
-		}
-		m.wg.Add(1)
-		go func() {
-			defer m.wg.Done()
-			select {
-			case <-time.After(delay):
-				m.announceDual(tag)
-			case <-m.done:
-			}
-		}()
+		m.announceDualLater(tag)
 		return nil
 
 	case f.Dst == DstApp && f.Cmd == 0x03 && inApp: // TRX status poll

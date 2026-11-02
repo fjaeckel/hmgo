@@ -143,7 +143,8 @@ const detectCnt = 0xa0
 
 // detection is the result of detect.
 type detection struct {
-	kind   string  // KindHMModRPIPCB or KindRPIRFMod
+	kind   string  // KindHMModRPIPCB or KindRPIRFMod: the protocol (classic or dual firmware)
+	board  string  // the module, if it differs from kind or is known (see leaveBootloader); "" unknown
 	tag    string  // announced/identified application, "" if unknown
 	banner bool    // the module announced itself (as opposed to: answered IDENTIFY, or nothing at all)
 	frames []frame // other frames received during detection
@@ -344,6 +345,11 @@ func OpenModule(rw io.ReadWriter, cfg Config) (Module, error) {
 		return nil, err
 	}
 	log.Printf("uartgw: detected %s (application %q)", d.kind, d.tag)
+	if d, err = leaveBootloader(p, rw, d, timeout, cfg.Debug); err != nil {
+		p.stop()
+		closeRW(rw)
+		return nil, err
+	}
 	switch d.kind {
 	case KindRPIRFMod:
 		c, err := openDual(rw, cfg, p, d)
@@ -362,6 +368,74 @@ func OpenModule(rw io.ReadWriter, cfg Config) (Module, error) {
 		}
 		return c, nil
 	}
+}
+
+// leaveBootloader starts the application of an HM-MOD-RPI-PCB that
+// announced its bootloader (“Co_CPU_BL”) and returns the detection for
+// the application it runs. The bootloader is the same for the classic
+// and eQ-3's dual firmware (OpenCCU installs the latter for Homematic
+// IP), so only the application tells which protocol the module speaks.
+// The switch is the classic CHANGE_APP (dst OS, 0x03), as Conn sends
+// it; the classic Conn then finds the application just started, the
+// dual-coprocessor one is handed to DualConn. Other detections are
+// returned unchanged.
+func leaveBootloader(p *framePump, w io.Writer, d detection, timeout time.Duration, debug bool) (detection, error) {
+	if d.kind != KindHMModRPIPCB || d.tag != appNameBootloader {
+		return d, nil
+	}
+	f := frame{dst: dstOS, cnt: detectCnt + 1, cmd: osChangeApp}
+	if debug {
+		log.Printf("uartgw: detect: send %v (CHANGE_APP)", f)
+	}
+	if _, err := w.Write(f.encode()); err != nil {
+		return d, fmt.Errorf("uartgw: writing to radio module: %w", err)
+	}
+	framesSent.WithLabelValues(dstLabel(f.dst), cmdLabel(f.cmd)).Inc()
+	var frames []frame
+	t := time.NewTimer(timeout)
+	defer t.Stop()
+	for {
+		select {
+		case r := <-p.ch:
+			if r.err != nil {
+				return d, fmt.Errorf("uartgw: reading from radio module: %w", r.err)
+			}
+			framesReceived.WithLabelValues(dstLabel(r.f.dst), cmdLabel(r.f.cmd)).Inc()
+			if debug {
+				log.Printf("uartgw: detect: recv %v", r.f)
+			}
+			if r.f.dst == dstOS && r.f.cnt == f.cnt && r.f.cmd == osAck {
+				if len(r.f.payload) > 0 && r.f.payload[0] == ackNACK {
+					return d, fmt.Errorf("%w: application switch failed, application firmware probably corrupted", ErrNACK)
+				}
+				continue
+			}
+			frames = append(frames, r.f)
+			tag, ok := parseTag(r.f)
+			if !ok || !isAppTag(tag) {
+				continue
+			}
+			kind := tagKind(tag)
+			if kind == "" {
+				return d, fmt.Errorf("%w: it announced %q", ErrUnknownModule, tag)
+			}
+			log.Printf("uartgw: the HM-MOD-RPI-PCB started %q", tag)
+			return detection{kind: kind, board: KindHMModRPIPCB, tag: tag, banner: true, frames: frames}, nil
+		case <-t.C:
+			return d, fmt.Errorf("%w: no application announced within %v after leaving the bootloader", ErrTimeout, timeout)
+		}
+	}
+}
+
+// boardForFirmware tells the module carrying eQ-3's dual firmware by
+// its version: the HM-MOD-RPI-PCB's dual firmware is 2.x (2.8.6 under
+// OpenCCU), the RPI-RF-MOD's 4.x (4.4.22 in the captures) or later.
+// ASSUMPTION from these two versions.
+func boardForFirmware(fw string) string {
+	if strings.HasPrefix(fw, "2.") {
+		return KindHMModRPIPCB
+	}
+	return KindRPIRFMod
 }
 
 func closeRW(rw io.ReadWriter) error {
