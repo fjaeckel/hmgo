@@ -124,8 +124,9 @@ sudo useradd --system --no-create-home --shell /usr/sbin/nologin --groups dialou
 ### Step 5: Install hmbridge
 
 Take the binary from a [release](https://github.com/fjaeckel/hmgo/releases):
-a tagged release `v…`, or `nightly`, the latest build of the `master`
-branch (not a stable release). Each release has the binaries for all architectures
+a tagged release `v…` (made automatically for every merged pull
+request, with a semantic version; the newest is marked "Latest"), or
+`nightly`, the latest build of the `master` branch (not a stable release). Each release has the binaries for all architectures
 (`hmbridge-<version>-linux-arm64` for 64-bit Raspberry Pi OS) and a checksum
 file `SHA256SUMS-<version>`; the binaries carry a signed build provenance
 attestation from GitHub Actions.
@@ -134,7 +135,7 @@ With the [GitHub CLI](https://cli.github.com/) (`gh`, logged in with
 `gh auth login`; you can also do this on your desktop and copy the file):
 
 ```sh
-TAG=v0.1.0   # or: nightly
+TAG=$(gh release view -R fjaeckel/hmgo --json tagName -q .tagName)   # the latest, or e.g. v0.0.1, or nightly
 gh release download "$TAG" -R fjaeckel/hmgo -p 'hmbridge-*-linux-arm64' -p 'SHA256SUMS-*'
 sha256sum --ignore-missing -c SHA256SUMS-*      # must print "OK"
 gh attestation verify hmbridge-*-linux-arm64 -R fjaeckel/hmgo
