@@ -130,6 +130,13 @@ type Options struct {
 	// announces “DualCoPro_App”.
 	AnnounceApp bool
 
+	// ClassicBootloader (DualCoPro) emulates an HM-MOD-RPI-PCB with
+	// eQ-3's dual firmware: its bootloader is the classic one, which
+	// announces “Co_CPU_BL” on dst OS, ignores everything but the
+	// classic CHANGE_APP (dst OS, 0x03; acked) and then starts the
+	// dual-coprocessor application.
+	ClassicBootloader bool
+
 	// BannerOnOS (DualCoPro) sends announcements on dst OS ([0x00
 	// tag…]) instead of COMMON.
 	BannerOnOS bool
@@ -268,9 +275,12 @@ func New(opts Options) (*Module, io.ReadWriteCloser) {
 		go func() {
 			defer m.wg.Done()
 			if opts.DualCoPro {
-				if opts.AnnounceApp {
+				switch {
+				case opts.AnnounceApp:
 					m.announceDual(TagDualApp)
-				} else {
+				case opts.ClassicBootloader:
+					m.announce(TagClassicBootloader)
+				default:
 					m.announceDual(TagDualBootloader)
 				}
 			} else if opts.DualFirmware {

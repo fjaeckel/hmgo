@@ -12,7 +12,6 @@ import (
 	"io/fs"
 	"log"
 	"path/filepath"
-	"strings"
 	"syscall"
 
 	"github.com/fjaeckel/hmgo/internal/config"
@@ -117,8 +116,8 @@ func probeModule(w io.Writer, cfg *config.Config, uart io.ReadWriteCloser) error
 	if s, ok := conn.(interface{ SGTIN() string }); ok && s.SGTIN() != "" {
 		fmt.Fprintf(w, "SGTIN:          %s\n", s.SGTIN())
 	}
-	if conn.Kind() == uartgw.KindHMModRPIPCB && strings.HasPrefix(conn.FirmwareVersion(), "2.") {
-		fmt.Fprintf(w, "note:           firmware 2.x is eQ-3's dual firmware; hmbridge expects 1.x on the HM-MOD-RPI-PCB (see docs/DEPLOY.md, Module firmware)\n")
+	if _, dual := conn.(*uartgw.DualConn); dual && conn.Kind() == uartgw.KindHMModRPIPCB {
+		fmt.Fprintf(w, "note:           an HM-MOD-RPI-PCB with eQ-3's dual firmware (Homematic IP); supported, experimental (see docs/DEPLOY.md, Module firmware)\n")
 	}
 	fmt.Fprintf(w, "OK: the radio module works. Next: hmbridge init (see docs/DEPLOY.md).\n")
 	return nil

@@ -445,9 +445,11 @@ ls /etc/config/rfd/
 ```
 
 `/var/hm_mode` tells you which radio board you have (`HM_HMRF_DEV`):
-`HM-MOD-RPI-PCB` (classic firmware 1.x) or `RPI-RF-MOD` (eQ-3 dual firmware,
-e.g. 4.4.22). hmbridge supports both and detects them; RPI-RF-MOD support is
-experimental (see the README).
+`HM-MOD-RPI-PCB` or `RPI-RF-MOD`, and its firmware (`HM_HMRF_VERSION`): the
+classic firmware 1.x on the HM-MOD-RPI-PCB, or eQ-3's dual firmware (2.x on
+the HM-MOD-RPI-PCB, e.g. 2.8.6, when OpenCCU uses it for Homematic IP; 4.x on
+the RPI-RF-MOD, e.g. 4.4.22). hmbridge supports all of them and detects them;
+support for the dual firmware is experimental (see the README).
 
 If you set a "system security key" in OpenCCU, put that passphrase into
 `security.passphrase`. Its index is 1 if you set the key once, and goes up by
@@ -1127,4 +1129,10 @@ application if needed and does the BidCoS work the firmware leaves to the
 host (ACKs, AES, retransmissions) itself. No firmware downgrade is needed,
 and OpenCCU updating the module firmware does not get in the way.
 
-An HM-MOD-RPI-PCB with the classic firmware (1.x) is supported as well.
+An HM-MOD-RPI-PCB with the classic firmware (1.x) is supported as well, and
+so is one with eQ-3's dual firmware (2.x, e.g. 2.8.6), which OpenCCU installs
+on it for Homematic IP. Its bootloader is the classic one (“Co_CPU_BL”), so
+hmbridge starts the application first and then picks the driver; the module
+is told from an RPI-RF-MOD by its firmware version (2.x, an assumption from
+the versions seen so far) and keeps the HM-MOD-RPI-PCB's reset line, GPIO 18.
+`"radio"` names the module, not the firmware.

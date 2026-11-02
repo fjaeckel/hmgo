@@ -437,6 +437,7 @@ type DualConn struct {
 	firmware    string
 	serial      string
 	sgtin       string
+	board       string // KindRPIRFMod or KindHMModRPIPCB, see Kind
 	cfgFirmware string
 
 	sem      chan struct{} // serializes user requests
@@ -493,6 +494,9 @@ func OpenDual(rw io.ReadWriter, cfg Config) (*DualConn, error) {
 	}
 	p := newFramePump(rw)
 	d, err := detect(p, rw, announceWait, timeout, cfg.Debug)
+	if err == nil {
+		d, err = leaveBootloader(p, rw, d, timeout, cfg.Debug)
+	}
 	if err != nil {
 		p.stop()
 		closeRW(rw)
@@ -520,6 +524,7 @@ func openDual(rw io.ReadWriter, cfg Config, p *framePump, d detection) (*DualCon
 	c := &DualConn{
 		rw:              rw,
 		next:            p.next,
+		board:           d.board,
 		hmid:            cfg.HMID,
 		timeout:         cfg.Timeout,
 		responseTimeout: cfg.ResponseTimeout,
@@ -654,8 +659,9 @@ func (c *DualConn) SerialNumber() string {
 // digits), or "" if the module did not report it.
 func (c *DualConn) SGTIN() string { return c.sgtin }
 
-// Kind returns KindRPIRFMod.
-func (c *DualConn) Kind() string { return KindRPIRFMod }
+// Kind returns the module: KindRPIRFMod, or KindHMModRPIPCB for an
+// HM-MOD-RPI-PCB with eQ-3's dual firmware (see boardForFirmware).
+func (c *DualConn) Kind() string { return c.board }
 
 // Application returns the application tag the module reported, e.g.
 // “DualCoPro_App”.
@@ -1831,6 +1837,9 @@ func (c *DualConn) init(cfg Config, d detection) error {
 	// application answers).
 	if err := c.queryFirmware(); err != nil {
 		return fmt.Errorf("uartgw: getting the firmware version: %w", err)
+	}
+	if c.board == "" {
+		c.board = boardForFirmware(c.firmware)
 	}
 	// Optional: SGTIN and serial number.
 	if err := c.querySGTIN(); err != nil {

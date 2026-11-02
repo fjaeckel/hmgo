@@ -31,6 +31,7 @@ import (
 	"github.com/fjaeckel/hmgo/internal/bridge"
 	"github.com/fjaeckel/hmgo/internal/buildinfo"
 	"github.com/fjaeckel/hmgo/internal/config"
+	"github.com/fjaeckel/hmgo/internal/gpio"
 	"github.com/fjaeckel/hmgo/internal/ha"
 	"github.com/fjaeckel/hmgo/internal/hmkey"
 	"github.com/fjaeckel/hmgo/internal/store"
@@ -164,8 +165,11 @@ func run(ctx context.Context, cfg *config.Config, uart io.ReadWriteCloser) error
 	}
 	defer conn.Close()
 	log.Printf("radio module ready: %s, firmware %s, serial %s, central address %x", conn.Kind(), conn.FirmwareVersion(), conn.SerialNumber(), cfg.CentralAddr())
-	if conn.Kind() == uartgw.KindRPIRFMod {
-		log.Printf("RPI-RF-MOD support is experimental: acknowledgements and AES are done in software, and parts of the module protocol are still unverified (see docs/SNIFFING.md)")
+	if _, dual := conn.(*uartgw.DualConn); dual {
+		log.Printf("support for eQ-3's dual firmware is experimental: acknowledgements and AES are done in software, and parts of the module protocol are still unverified (see docs/SNIFFING.md)")
+		if cfg.Radio == config.RadioRPIRFMod && conn.Kind() == uartgw.KindHMModRPIPCB && cfg.ResetGPIO == gpio.ResetPinRPIRFMod {
+			log.Printf("warning: the radio module looks like an HM-MOD-RPI-PCB (dual firmware %s), but \"radio\": %q resets it on GPIO %d, the RPI-RF-MOD's line; set \"radio\": \"auto\" or \"reset_gpio\": %d", conn.FirmwareVersion(), cfg.Radio, cfg.ResetGPIO, gpio.ResetPinHMModRPIPCB)
+		}
 	}
 
 	for _, m := range cfg.Deprecations() {
@@ -304,22 +308,19 @@ func openModule(cfg *config.Config, uart io.ReadWriter, hmipHandler func(dst, cn
 		err error
 	)
 	switch cfg.Radio {
-	case config.RadioHMModRPIPCB:
-		var c *uartgw.Conn
-		if c, err = uartgw.Open(uart, ucfg); err == nil {
-			mod = c
-		}
 	case config.RadioRPIRFMod:
 		var c *uartgw.DualConn
 		if c, err = uartgw.OpenDual(uart, ucfg); err == nil {
 			mod = c
 		}
 	default:
+		// "hm-mod-rpi-pcb" names the module (its reset line); it may run
+		// the classic or eQ-3's dual firmware, which OpenModule detects.
 		mod, err = uartgw.OpenModule(uart, ucfg)
 	}
 	if err != nil {
 		if errors.Is(err, uartgw.ErrDualCoProFirmware) {
-			return nil, fmt.Errorf("%w\n\nThe radio module is an RPI-RF-MOD (or an HM-MOD-RPI-PCB with eQ-3's dual firmware), but the configuration says \"radio\": %q. Set \"radio\": \"auto\" or \"rpi-rf-mod\"", err, cfg.Radio)
+			return nil, fmt.Errorf("%w\n\nThe radio module runs eQ-3's dual firmware, but was taken for one with the classic firmware. Set \"radio\": \"rpi-rf-mod\" (on an HM-MOD-RPI-PCB also \"reset_gpio\": %d)", err, gpio.ResetPinHMModRPIPCB)
 		}
 		return nil, fmt.Errorf("initialising the radio module on %s: %w", cfg.SerialPort, err)
 	}

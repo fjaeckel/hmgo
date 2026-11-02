@@ -144,7 +144,10 @@ type Config struct {
 	// UART, e.g. on a USB adapter: "none").
 	Reset string `json:"reset"`
 	// Radio selects the radio module: "auto" (default, detected at
-	// startup), "hm-mod-rpi-pcb" or "rpi-rf-mod".
+	// startup), "hm-mod-rpi-pcb" or "rpi-rf-mod". It names the module
+	// (and with it the reset line), not the firmware: an
+	// HM-MOD-RPI-PCB may run the classic or eQ-3's dual firmware, which
+	// is detected either way.
 	Radio string `json:"radio,omitempty"`
 	// ResetGPIO is the BCM GPIO number of the reset line. 0 or absent
 	// means the module's line: 18 for the HM-MOD-RPI-PCB, 19 for the
