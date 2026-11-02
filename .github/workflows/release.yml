@@ -2,14 +2,23 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 # Builds the release binaries and publishes them as a GitHub release:
-#  - pushing a tag v* (e.g. git tag v0.1.0 && git push origin v0.1.0)
-#    creates the release for that tag;
+#  - every merged pull request makes a semantic-version release: the
+#    push to master it causes gets the next version tag (v0.0.1 first)
+#    and its release. The PR's label picks the bump: semver:major,
+#    semver:minor, semver:patch (the default without a label) or
+#    semver:skip (no release); see .github/scripts/next-version.sh.
+#    Commits pushed to master without a PR are not released;
+#  - pushing a tag v* by hand (git tag v1.2.3 && git push origin v1.2.3)
+#    still creates the release for that tag;
 #  - every push to master updates the "nightly" pre-release, so the latest
 #    build is always downloadable for testing.
 #
 # The build job runs the tests and builds with a read-only token and
 # without persisted git credentials; only the publish job, which runs no
 # project code, can write (and attests the binaries' build provenance).
+# A release is only made once the tests pass; if they fail, the next
+# merge's release includes the PR (the version covers all PRs merged
+# since the last release tag).
 # Third-party actions are pinned by commit (the comment names the tag).
 
 name: Release
@@ -23,20 +32,42 @@ on:
 permissions:
   contents: read
 
+# One run per ref at a time and never cancelled half-way, so that two
+# merges in quick succession cannot pick the same version. A queued run
+# superseded by a newer one is covered by that one's release.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   build:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-    # A newer push supersedes a build still running.
-    concurrency:
-      group: release-build-${{ github.ref }}
-      cancel-in-progress: true
+      pull-requests: read # the merged PRs' semver labels
+    outputs:
+      release: ${{ steps.version.outputs.release }}
+      version: ${{ steps.version.outputs.version }}
+      previous: ${{ steps.version.outputs.previous }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0 # tags, for the version in the file names
           persist-credentials: false
+      - name: Next version
+        id: version
+        if: github.ref == 'refs/heads/master'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: .github/scripts/next-version.sh "$GITHUB_SHA"
+      # Only local (this job cannot push): make dist names the files
+      # after it. The publish job pushes the tag.
+      - name: Tag the version
+        if: steps.version.outputs.release == 'true'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: git tag -f "$VERSION" "$GITHUB_SHA"
       # The newest 1.27 patch release (security fixes) rather than the
       # minimum in go.mod's go line.
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
@@ -67,11 +98,6 @@ jobs:
       # with: gh attestation verify <file> -R <owner>/<repo>).
       id-token: write
       attestations: write
-    # Never cancelled half-way (tag moved, assets not yet replaced); a
-    # newer run's publish waits for this one.
-    concurrency:
-      group: release-publish-${{ github.ref }}
-      cancel-in-progress: false
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
@@ -89,12 +115,38 @@ jobs:
         run: |
           gh release create "$GITHUB_REF_NAME" dist/* \
             --title "hmbridge $GITHUB_REF_NAME" --generate-notes --verify-tag
-      # Moving the nightly tag needs git credentials: only this step's
-      # checkout has them.
+      # Pushing the version tag and moving the nightly tag need git
+      # credentials: only this checkout has them.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         if: github.ref == 'refs/heads/master'
         with:
           path: src
+      # A tag pushed with this job's token starts no further workflow
+      # run, so the tag trigger above does not release it a second time.
+      - name: Publish semver release
+        if: github.ref == 'refs/heads/master' && needs.build.outputs.release == 'true'
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+          PREVIOUS: ${{ needs.build.outputs.previous }}
+        run: |
+          set -eo pipefail
+          # Push the tag unless a re-run already did; never move it.
+          remote=$(git -C src ls-remote origin "refs/tags/$VERSION" | cut -f1)
+          if [ -z "$remote" ]; then
+            git -C src tag "$VERSION" "$GITHUB_SHA"
+            git -C src push origin "refs/tags/$VERSION"
+          elif [ "$remote" != "$GITHUB_SHA" ]; then
+            echo "::error::tag $VERSION already exists on $remote, not on $GITHUB_SHA"
+            exit 1
+          fi
+          if gh release view "$VERSION" >/dev/null 2>&1; then
+            gh release upload "$VERSION" dist/* --clobber
+          else
+            args=(--title "hmbridge $VERSION" --generate-notes --verify-tag --latest)
+            if [ -n "$PREVIOUS" ]; then args+=(--notes-start-tag "$PREVIOUS"); fi
+            gh release create "$VERSION" dist/* "${args[@]}"
+          fi
+          echo "Released [$VERSION]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/tag/$VERSION)" >>"$GITHUB_STEP_SUMMARY"
       - name: Publish nightly pre-release
         if: github.ref == 'refs/heads/master'
         run: |
