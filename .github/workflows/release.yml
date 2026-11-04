@@ -76,6 +76,15 @@ jobs:
           check-latest: true
       - name: Install mosquitto (end-to-end tests)
         run: sudo apt-get update && sudo apt-get install -y mosquitto
+      # Ubuntu 26.04 confines mosquitto with an AppArmor profile that only
+      # lets it read its config from /etc/mosquitto; the tests start it with
+      # a config in t.TempDir(). Unload the profile on the runner.
+      - name: Unconfine mosquitto (AppArmor)
+        run: |
+          ls /etc/apparmor.d | grep -i mosquitto || true
+          for p in /etc/apparmor.d/*mosquitto*; do
+            [ -f "$p" ] && sudo apparmor_parser -R "$p" || true
+          done
       - name: Test
         run: go vet ./... && go test -race ./...
       - name: Known vulnerabilities (govulncheck)
