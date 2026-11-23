@@ -43,6 +43,12 @@ const zeroVersion = "v0.0.0-00010101000000-000000000000"
 
 func mainVersion(bi *debug.BuildInfo) string {
 	if bi.Main.Path == modulePath || bi.Main.Path == "" {
+		// Go reports the module that contains the main package as the
+		// main module, also when it is built from another module (as
+		// gokrazy does), with the version that module requires.
+		if bi.Main.Version == zeroVersion {
+			return ""
+		}
 		return bi.Main.Version
 	}
 	for _, d := range bi.Deps {

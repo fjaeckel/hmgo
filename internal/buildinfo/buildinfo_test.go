@@ -44,6 +44,7 @@ func TestMainVersion(t *testing.T) {
 			Main: debug.Module{Path: "gokrazy/build/hmbridge", Version: "(devel)"},
 			Deps: []*debug.Module{{Path: modulePath, Version: "v0.0.0", Replace: &debug.Module{Path: "../.."}}},
 		}, ""},
+		{"built from gokrazy's module, local replace", debug.BuildInfo{Main: debug.Module{Path: modulePath, Version: zeroVersion}}, ""},
 		{"local checkout without replace info", debug.BuildInfo{
 			Main: debug.Module{Path: "gokrazy/build/hmbridge", Version: "(devel)"},
 			Deps: []*debug.Module{{Path: modulePath, Version: zeroVersion}},
