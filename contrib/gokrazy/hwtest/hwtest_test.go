@@ -592,13 +592,30 @@ func TestBringUp(t *testing.T) {
 }
 
 // TestPairedDevices reports every device's reception and fails for
-// devices Home Assistant shows as unavailable.
+// devices Home Assistant shows as unavailable. During the first hour
+// after hmbridge's start (HWTEST_SETTLE), devices it has not heard yet
+// are only reported: window contacts send on a change or about hourly.
 func TestPairedDevices(t *testing.T) {
 	e := setup(t)
 	devs := e.devices(t)
 	if len(devs) == 0 {
 		t.Skip("no devices yet (TestPairing pairs some)")
 	}
+	var b bridgeInfo
+	if _, err := e.apiGet("/api/v1/bridge", &b); err != nil {
+		t.Fatal(err)
+	}
+	settle := time.Hour
+	if v := os.Getenv("HWTEST_SETTLE"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			t.Fatalf("HWTEST_SETTLE=%q: %v", v, err)
+		}
+		settle = d
+	}
+	up := time.Duration(b.UptimeSeconds) * time.Second
+	started := time.Now().Add(-up)
+	notYet := 0
 	for _, d := range devs {
 		seen, rssi := "never", "-"
 		if d.LastSeen != nil {
@@ -608,12 +625,19 @@ func TestPairedDevices(t *testing.T) {
 			rssi = fmt.Sprintf("%d dBm", *d.RSSI)
 		}
 		t.Logf("%s %-20s %-18s seen %-12s rssi %-8s msgs %-5d aes %v/%d auth %v", d.Address, d.Name, d.Model, seen, rssi, d.Messages, d.AES.Enabled, d.AES.KeyIndex, d.State["auth_status"])
-		if !d.Available {
+		heard := d.LastSeen != nil && d.LastSeen.After(started)
+		switch {
+		case !heard && up < settle:
+			notYet++
+		case !d.Available:
 			t.Errorf("%s (%s) is unavailable", d.Name, d.Address)
 		}
 		if d.State["auth_status"] == "failed" {
 			t.Errorf("%s (%s): last message failed AES authentication", d.Name, d.Address)
 		}
+	}
+	if notYet > 0 {
+		t.Logf("%d of %d devices not heard yet since hmbridge started %v ago; run again after %v (HWTEST_SETTLE) to check them", notYet, len(devs), up, settle)
 	}
 }
 

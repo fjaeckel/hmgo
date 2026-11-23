@@ -108,6 +108,8 @@ func TestIoctlNumbers(t *testing.T) {
 		{"GPIO_GET_LINEHANDLE_IOCTL", gpioGetLinehandleIoctl, iowr(0xB4, 0x03, unsafe.Sizeof(gpiohandleRequest{}))},
 		// #define GPIOHANDLE_SET_LINE_VALUES_IOCTL _IOWR(0xB4, 0x09, struct gpiohandle_data)
 		{"GPIOHANDLE_SET_LINE_VALUES_IOCTL", gpiohandleSetLineValuesIoctl, iowr(0xB4, 0x09, unsafe.Sizeof(gpiohandleData{}))},
+		// #define GPIO_V2_LINE_SET_CONFIG_IOCTL _IOWR(0xB4, 0x0D, struct gpio_v2_line_config)
+		{"GPIO_V2_LINE_SET_CONFIG_IOCTL", gpioV2LineSetConfigIoctl, iowr(0xB4, 0x0D, unsafe.Sizeof(gpioV2LineConfig{}))},
 	} {
 		if tt.got != tt.want {
 			t.Errorf("%s = %#x, want %#x", tt.name, tt.got, tt.want)
@@ -123,6 +125,10 @@ func TestIoctlNumbers(t *testing.T) {
 }
 
 func TestFlagValues(t *testing.T) {
+	// enum gpio_v2_line_flag: GPIO_V2_LINE_FLAG_INPUT = _BITULL(2)
+	if gpioV2LineFlagInput != 4 {
+		t.Errorf("GPIO_V2_LINE_FLAG_INPUT = %d, want 4", gpioV2LineFlagInput)
+	}
 	// enum gpio_v2_line_flag: GPIO_V2_LINE_FLAG_OUTPUT = _BITULL(3)
 	if gpioV2LineFlagOutput != 8 {
 		t.Errorf("GPIO_V2_LINE_FLAG_OUTPUT = %d, want 8", gpioV2LineFlagOutput)

@@ -44,6 +44,10 @@ func TestMainVersion(t *testing.T) {
 			Main: debug.Module{Path: "gokrazy/build/hmbridge", Version: "(devel)"},
 			Deps: []*debug.Module{{Path: modulePath, Version: "v0.0.0", Replace: &debug.Module{Path: "../.."}}},
 		}, ""},
+		{"local checkout without replace info", debug.BuildInfo{
+			Main: debug.Module{Path: "gokrazy/build/hmbridge", Version: "(devel)"},
+			Deps: []*debug.Module{{Path: modulePath, Version: zeroVersion}},
+		}, ""},
 		{"not a dependency", debug.BuildInfo{Main: debug.Module{Path: "example.com/x", Version: "v2.0.0"}}, "v2.0.0"},
 	} {
 		if got := mainVersion(&tc.bi); got != tc.want {

@@ -37,6 +37,10 @@ func Version() string {
 
 // mainVersion returns the version of this module in bi: the main
 // module's, or, if the main module is another one, the dependency's.
+// zeroVersion is the placeholder version of a requirement that a replace
+// directive points to a local directory (what gok add writes).
+const zeroVersion = "v0.0.0-00010101000000-000000000000"
+
 func mainVersion(bi *debug.BuildInfo) string {
 	if bi.Main.Path == modulePath || bi.Main.Path == "" {
 		return bi.Main.Version
@@ -45,10 +49,14 @@ func mainVersion(bi *debug.BuildInfo) string {
 		if d.Path != modulePath {
 			continue
 		}
+		v := d.Version
 		if d.Replace != nil {
-			return d.Replace.Version // "" for a local directory
+			v = d.Replace.Version // "" for a local directory
 		}
-		return d.Version
+		if v == zeroVersion {
+			return ""
+		}
+		return v
 	}
 	return bi.Main.Version
 }

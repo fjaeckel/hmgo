@@ -910,10 +910,21 @@ read, and reads can have deadlines (used by the probe below). A
 `pivccu,reset-gpios = <&gpio 18 0>, <&gpio 19 0>`: GPIO 18 for the
 HM-MOD-RPI-PCB, GPIO 19 for the RPI-RF-MOD. The raw-uart driver
 (`generic_raw_uart.c`) uses the second one when it finds the RPI-RF-MOD's
-RTC (RX8130, I²C 0x32), and pulses the line low (50 ms low, 50 ms high, then
-input). hmbridge (`internal/gpio`) holds it low for 150 ms, flushes the UART
-input, drives it high and keeps the line requested, through the GPIO
-character device (uAPI v2, v1 fallback). The chip is the one labelled
+RTC (RX8130, I²C 0x32), and drives the line 50 ms low, 50 ms high, then
+releases it as an input. hmbridge (`internal/gpio`) does the same through
+the GPIO character device (uAPI v2, v1 fallback), after flushing stale UART
+input. The two modules have opposite reset polarities, which this sequence
+covers without knowing which one is attached. The HM-MOD-RPI-PCB is reset
+while the line is low. The RPI-RF-MOD is reset while it is high: on a real
+module (Raspberry Pi 3 B+, firmware 4.4.22), holding the line high kept it
+silent, and releasing it low made it announce its bootloader
+(`HMIP_TRX_Bl`) within 20 ms. RFNETHM also notes the RPI-RF-MOD as active
+high. Released, each module's own pull resistor keeps it running. An
+earlier version held the line low for 150 ms, flushed and then kept it
+high. That worked for the HM-MOD-RPI-PCB, but held an RPI-RF-MOD in reset,
+and its flush dropped the announcement the module had already sent. In the
+bootloader, the RPI-RF-MOD answers CHANGE_APP (`fe 03`: ack `05 01`, then
+`DualCoPro_App` about 2 s later), but not IDENTIFY. The chip is the one labelled
 `pinctrl-bcm2835`/`-bcm2711`/`-bcm2712`/`-rp1` (`GPIO_GET_CHIPINFO_IOCTL`),
 falling back to `/dev/gpiochip0`; on a Pi 5 the header's chip number depends
 on the kernel version.
