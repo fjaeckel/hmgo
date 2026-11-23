@@ -92,3 +92,23 @@ func TestHMModeAndCentral(t *testing.T) {
 		t.Errorf("central = %X %v", a, ok)
 	}
 }
+
+func TestDecodeDeviceListIndexRange(t *testing.T) {
+	devs, err := DecodeDeviceList([]any{
+		map[string]any{"ADDRESS": "NEQ0000001:1", "TYPE": "SWITCH", "INDEX": int64(1)},
+		// Out of range (would wrap on 32-bit builds): the address's
+		// channel number is used instead.
+		map[string]any{"ADDRESS": "NEQ0000001:2", "TYPE": "SWITCH", "INDEX": int64(1) << 40},
+		map[string]any{"ADDRESS": "NEQ0000001:3", "TYPE": "SWITCH", "INDEX": int64(-5)},
+		map[string]any{"ADDRESS": "NEQ0000002:99999999999", "TYPE": "SWITCH", "INDEX": "1099511627776"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []int{1, 2, 3, -1}
+	for i, d := range devs {
+		if d.Index != want[i] {
+			t.Errorf("%s: Index %d, want %d", d.Address, d.Index, want[i])
+		}
+	}
+}

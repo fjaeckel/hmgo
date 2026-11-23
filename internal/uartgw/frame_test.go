@@ -158,3 +158,37 @@ func TestTimePayload(t *testing.T) {
 		t.Errorf("timePayload(UTC-3) = %x, want %x", got, want)
 	}
 }
+
+func TestEncodePayloadLimit(t *testing.T) {
+	f := frame{dst: dstApp, payload: make([]byte, maxFramePayload)}
+	if got := decodeLength(t, f.encode()); got != 0xffff {
+		t.Errorf("length field %#x, want 0xffff", got)
+	}
+	defer func() {
+		if recover() == nil {
+			t.Errorf("encode of a too long payload did not panic")
+		}
+	}()
+	frame{dst: dstApp, payload: make([]byte, maxFramePayload+1)}.encode()
+}
+
+// decodeLength returns the length field of an encoded frame.
+func decodeLength(t *testing.T, enc []byte) int {
+	t.Helper()
+	raw := unescapeForTest(enc)
+	return int(raw[1])<<8 | int(raw[2])
+}
+
+// unescapeForTest reverses escape.
+func unescapeForTest(b []byte) []byte {
+	out := []byte{b[0]}
+	for i := 1; i < len(b); i++ {
+		if b[i] == escapeByte && i+1 < len(b) {
+			i++
+			out = append(out, b[i]|0x80)
+			continue
+		}
+		out = append(out, b[i])
+	}
+	return out
+}

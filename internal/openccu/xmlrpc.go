@@ -282,6 +282,9 @@ func ListDevices(ctx context.Context, client *http.Client, url string) ([]Device
 	return DecodeDeviceList(v)
 }
 
+// maxChannelIndex is the largest valid channel index.
+const maxChannelIndex = 255
+
 // DecodeDeviceList converts a decoded listDevices result.
 func DecodeDeviceList(v any) ([]DeviceDescription, error) {
 	arr, ok := v.([]any)
@@ -303,10 +306,13 @@ func DecodeDeviceList(v any) ([]DeviceDescription, error) {
 		if dd.Address == "" {
 			continue
 		}
-		if n, ok := asInt(m["INDEX"]); ok {
+		// Channel indexes are small (a BidCoS channel is one byte); an
+		// out-of-range INDEX is ignored like a missing one, also so that
+		// int(n) cannot wrap on 32-bit builds.
+		if n, ok := asInt(m["INDEX"]); ok && n >= 0 && n <= maxChannelIndex {
 			dd.Index = int(n)
 		} else if _, ch, ok := strings.Cut(dd.Address, ":"); ok {
-			if n, err := strconv.Atoi(ch); err == nil {
+			if n, err := strconv.Atoi(ch); err == nil && n >= 0 && n <= maxChannelIndex {
 				dd.Index = n
 			}
 		}

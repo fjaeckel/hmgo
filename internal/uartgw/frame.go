@@ -67,9 +67,18 @@ func (f frame) String() string {
 	return fmt.Sprintf("dst=%s cnt=%d cmd=%02x payload=%x", dstName(f.dst), f.cnt, f.cmd, f.payload)
 }
 
+// maxFramePayload is the largest payload a frame can carry: the length
+// field (dst, cnt, cmd and payload) has 16 bits.
+const maxFramePayload = 0xffff - 3
+
 // encode returns the frame as it needs to be written to the wire
 // (including frame delimiter, CRC and escaping).
 func (f frame) encode() []byte {
+	if len(f.payload) > maxFramePayload {
+		// The frames hmbridge sends are a few dozen bytes; a longer
+		// payload is a programming error, not data from outside.
+		panic(fmt.Sprintf("uartgw: frame payload of %d bytes exceeds the format's limit of %d", len(f.payload), maxFramePayload))
+	}
 	length := 3 + len(f.payload)
 	raw := make([]byte, 0, 1+2+length+2)
 	raw = append(raw,
