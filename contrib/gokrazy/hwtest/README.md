@@ -142,6 +142,8 @@ On the Pi (start breakglass in the web interface, then `ssh hmbridge`):
 
 ### 3. Devices
 
+If the settings show "not read", press **Refresh settings** on each
+heating group first (see [Moving from OpenCCU](../README.md#moving-from-openccu)).
 An hour after the start, run `TestPairedDevices`: every device must have
 been heard, with no failed AES. Change something on one device of each
 kind in Home Assistant (a thermostat's temperature, a plug) and trigger

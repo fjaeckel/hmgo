@@ -92,10 +92,12 @@ again.
 | hmbridge's `config.json` | central address, key or passphrase, devices, groups, MQTT. If you don't know where it is: `ps w \| grep hmbridge` on the running system shows `-config`. |
 | `devices.json` from its `state_dir` | only if you paired devices *with hmbridge*; devices taken over from the CCU are in `config.json` |
 | `system.key` | only if `security` uses a `key_file` |
+| `settings.json` from its `state_dir` | the device settings hmbridge has read (week profiles, window and boost settings, …), if the file exists. On OpenCCU, the default `state_dir` (`/var/lib/hmbridge`) is in RAM and lost at every reboot, so there is often none. |
 
-You don't need `settings.json` or `state.json`; hmbridge rebuilds them. You
-don't need anything from OpenCCU itself either: the module's firmware
-lives on the module. Keep the old SD card as it is: it is your way back.
+You don't need `state.json`: hmbridge restores the devices' last state
+from the MQTT broker. You don't need anything from OpenCCU itself either:
+the module's firmware lives on the module. Keep the old SD card as it is:
+it is your way back.
 
 **Then:**
 
@@ -126,7 +128,18 @@ For the key, choose one:
   configured, hmbridge refuses to create a new key: it stops instead of
   locking your devices out.
 
-`devices.json`, if you have one, goes to `/perm/hmbridge/` the same way.
+`devices.json` and `settings.json`, if you have them, go to
+`/perm/hmbridge/` the same way.
+
+**After the first start, read the device settings.** hmbridge reads a
+device's settings only when asked: after pairing, or when you press
+**Refresh settings**. Without a `settings.json`, the settings and the
+heating groups' settings show empty values and "Unknown" in Home
+Assistant. Press **Refresh settings** on each heating group's device in
+Home Assistant (this reads all its thermostats), or on single devices. A
+thermostat takes a few seconds. Window contacts and buttons are read when
+their config button is pressed. The values are then kept in
+`/perm/hmbridge/settings.json`.
 
 ## Writing the SD card
 
