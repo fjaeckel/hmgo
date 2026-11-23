@@ -924,7 +924,8 @@ earlier version held the line low for 150 ms, flushed and then kept it
 high. That worked for the HM-MOD-RPI-PCB, but held an RPI-RF-MOD in reset,
 and its flush dropped the announcement the module had already sent. In the
 bootloader, the RPI-RF-MOD answers CHANGE_APP (`fe 03`: ack `05 01`, then
-`DualCoPro_App` about 2 s later), but not IDENTIFY. The chip is the one labelled
+`DualCoPro_App` about 2 s later) and IDENTIFY (`05 01 "HMIP_TRX_Bl"`), like
+the application (`05 01 "DualCoPro_App"`). The chip is the one labelled
 `pinctrl-bcm2835`/`-bcm2711`/`-bcm2712`/`-rp1` (`GPIO_GET_CHIPINFO_IOCTL`),
 falling back to `/dev/gpiochip0`; on a Pi 5 the header's chip number depends
 on the kernel version.
@@ -936,8 +937,13 @@ on the kernel version.
 RPI-RF-MOD; otherwise `uartgw.ProbeKind` sends IDENTIFY (dst COMMON, the
 counter `detectCnt`) and reads frames for up to 1 s with a read deadline: an
 IDENTIFY answer or any dual-firmware destination means RPI-RF-MOD, a
-classic ack/announcement means HM-MOD-RPI-PCB, silence falls back to GPIO
-18. A wrong guess only leaves the module un-reset: `OpenModule` detects a
+classic ack/announcement means HM-MOD-RPI-PCB. Without an answer (a classic
+module, or an RPI-RF-MOD that hangs), `resetPin` resets GPIO 19 and listens
+for 500 ms (`uartgw.ListenKind`). A real RPI-RF-MOD announces its bootloader
+within 20 ms, so an announcement means RPI-RF-MOD. Silence falls back to GPIO
+18. The HM-MOD-RPI-PCB sits on header pins 1–12, so the reset on GPIO 19
+(pin 35) leaves it alone. Tested on a real RPI-RF-MOD in its bootloader, in
+its application, and held in reset. A wrong guess only leaves the module un-reset: `OpenModule` detects a
 running application as well (the dual-firmware application is not rebooted
 anyway, the classic `Conn` restarts its module itself). After the reset,
 detection runs as before: the bootloader announcement (`Co_CPU_BL` /

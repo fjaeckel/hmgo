@@ -22,6 +22,15 @@ import (
 // IDENTIFY sent to choose the reset line (see resetPin).
 const probeKindTimeout = time.Second
 
+// rpiRFModAnnounceWait is how long resetPin listens for an RPI-RF-MOD's
+// announcement after resetting GPIO 19. A real module announces its
+// bootloader within 20ms of the reset.
+const rpiRFModAnnounceWait = 500 * time.Millisecond
+
+// resetModule resets the radio module through its reset line (a
+// variable for tests).
+var resetModule = gpio.Reset
+
 // openUART opens and configures the serial port and resets the module
 // as configured. It returns a description of the reset (for hmbridge
 // probe).
@@ -64,7 +73,7 @@ func openUART(cfg *config.Config, logf func(string, ...any)) (*os.File, string, 
 		pin, why := resetPin(cfg, uart, logf)
 		var chip string
 		if err := rc.Control(func(fd uintptr) {
-			chip, ctlErr = gpio.Reset(fd, pin)
+			chip, ctlErr = resetModule(fd, pin)
 		}); err != nil {
 			ctlErr = err
 		}
@@ -103,8 +112,13 @@ func openUART(cfg *config.Config, logf func(string, ...any)) (*os.File, string, 
 // 19) is recognized by its RTC (if the RTC overlay is loaded) or by its
 // answer to IDENTIFY (which an HM-MOD-RPI-PCB with eQ-3's dual firmware
 // gives, too; uartgw.ProbeKind tells it by its firmware version);
-// otherwise the HM-MOD-RPI-PCB's line (GPIO 18) is used. A wrong guess only means the module is not reset: detection
-// after the reset copes with a running module.
+// if the module does not answer (an RPI-RF-MOD that hangs, or a classic
+// HM-MOD-RPI-PCB, which ignores IDENTIFY), GPIO 19 is reset and an
+// RPI-RF-MOD recognized by its announcement. Otherwise the
+// HM-MOD-RPI-PCB's line (GPIO 18) is used. The HM-MOD-RPI-PCB sits on
+// the header's pins 1-12, so resetting GPIO 19 (pin 35) does not
+// affect it. A wrong guess only means the module is not reset:
+// detection after the reset copes with a running module.
 func resetPin(cfg *config.Config, uart *os.File, logf func(string, ...any)) (int, string) {
 	if !cfg.ResetGPIOAuto() {
 		switch {
@@ -127,5 +141,31 @@ func resetPin(cfg *config.Config, uart *os.File, logf func(string, ...any)) (int
 	case kind == uartgw.KindHMModRPIPCB:
 		return gpio.ResetPinHMModRPIPCB, "HM-MOD-RPI-PCB reset line: the module identified itself as one"
 	}
+	if err == nil && rpiRFModAfterReset(uart, logf) {
+		return gpio.ResetPinRPIRFMod, "RPI-RF-MOD reset line: the module announced itself after a reset on it"
+	}
 	return gpio.ResetPinHMModRPIPCB, "HM-MOD-RPI-PCB reset line: no RPI-RF-MOD found"
+}
+
+// rpiRFModAfterReset resets GPIO 19, the RPI-RF-MOD's reset line, and
+// reports whether an RPI-RF-MOD announced itself afterwards.
+func rpiRFModAfterReset(uart *os.File, logf func(string, ...any)) bool {
+	rc, err := uart.SyscallConn()
+	if err != nil {
+		return false
+	}
+	var resetErr error
+	if err := rc.Control(func(fd uintptr) { _, resetErr = resetModule(fd, gpio.ResetPinRPIRFMod) }); err != nil {
+		resetErr = err
+	}
+	if resetErr != nil {
+		logf("no answer to IDENTIFY; resetting GPIO %d to look for an RPI-RF-MOD: %v", gpio.ResetPinRPIRFMod, resetErr)
+		return false
+	}
+	kind, err := uartgw.ListenKind(uart, rpiRFModAnnounceWait)
+	if err != nil {
+		logf("no answer to IDENTIFY; listening after a reset on GPIO %d: %v", gpio.ResetPinRPIRFMod, err)
+		return false
+	}
+	return kind == uartgw.KindRPIRFMod
 }

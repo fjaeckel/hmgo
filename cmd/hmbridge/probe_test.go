@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 	"unsafe"
@@ -104,19 +105,36 @@ func TestProbeOverPTY(t *testing.T) {
 }
 
 // With "radio": "auto" and no reset_gpio, the reset line is chosen by
-// asking the module (IDENTIFY) on the real tty before the reset.
+// asking the module (IDENTIFY) on the real tty before the reset, and,
+// without an answer, by resetting GPIO 19 and listening for an
+// RPI-RF-MOD.
 func TestResetPinAuto(t *testing.T) {
 	for _, tt := range []struct {
 		name string
 		opts fakemod.Options
-		pin  int
+		// rpiRFMod: the module is an RPI-RF-MOD, which a reset on GPIO
+		// 19 restarts (it announces its bootloader).
+		rpiRFMod bool
+		pin      int
+		resets   []int // resets while choosing
 	}{
-		{"rpi-rf-mod", fakemod.Options{DualCoPro: true, StartInApp: true}, gpio.ResetPinRPIRFMod},
-		{"hm-mod-rpi-pcb", fakemod.Options{StartInApp: true}, gpio.ResetPinHMModRPIPCB},
-		{"silent", fakemod.Options{Mute: true}, gpio.ResetPinHMModRPIPCB},
+		{"rpi-rf-mod", fakemod.Options{DualCoPro: true, StartInApp: true}, true, gpio.ResetPinRPIRFMod, nil},
+		{"rpi-rf-mod in the bootloader", fakemod.Options{DualCoPro: true}, true, gpio.ResetPinRPIRFMod, nil},
+		{"rpi-rf-mod not answering IDENTIFY", fakemod.Options{DualCoPro: true, StartInApp: true, IgnoreIdentify: true}, true, gpio.ResetPinRPIRFMod, []int{19}},
+		{"hm-mod-rpi-pcb", fakemod.Options{StartInApp: true}, false, gpio.ResetPinHMModRPIPCB, nil}, // rejects IDENTIFY with a classic ack
+		{"silent", fakemod.Options{Mute: true}, false, gpio.ResetPinHMModRPIPCB, []int{19}},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			port, _ := ptyModule(t, tt.opts)
+			port, mod := ptyModule(t, tt.opts)
+			var resets []int
+			resetModule = func(_ uintptr, pin int) (string, error) {
+				resets = append(resets, pin)
+				if tt.rpiRFMod && pin == gpio.ResetPinRPIRFMod {
+					mod.Reset()
+				}
+				return "/dev/gpiochip0", nil
+			}
+			t.Cleanup(func() { resetModule = gpio.Reset })
 			cfg := probeConfig(t, fmt.Sprintf(`,"serial_port":%q,"reset":"none"`, port))
 			if !cfg.ResetGPIOAuto() {
 				t.Fatal("not auto")
@@ -129,6 +147,9 @@ func TestResetPinAuto(t *testing.T) {
 			pin, why := resetPin(cfg, uart, t.Logf)
 			if pin != tt.pin {
 				t.Errorf("pin %d (%s), want %d", pin, why, tt.pin)
+			}
+			if !slices.Equal(resets, tt.resets) {
+				t.Errorf("resets while choosing the line: %v, want %v", resets, tt.resets)
 			}
 		})
 	}

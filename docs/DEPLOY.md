@@ -38,9 +38,11 @@ What has been tested how:
 |---|---|
 | serial port setup (115200 8N1, raw, no flow control, non-blocking reads) | tested on a pseudo terminal with the emulated module (unit tests) |
 | module detection after a reset, bootloader → application, firmware/serial query, `hmbridge probe` | tested with the emulated module (both kinds) |
-| choosing the reset line (RTC present / module answers IDENTIFY) | tested on a pseudo terminal and with a fake sysfs |
+| choosing the reset line (RTC present / module answers IDENTIFY / announces itself after a reset on GPIO 19) | tested on a pseudo terminal and with a fake sysfs; on a real RPI-RF-MOD (Pi 3 B+): in its bootloader, in its application, and held in reset |
 | `hmbridge init`, key file, permissions, refusal to overwrite | tested |
-| pulsing GPIO 19 on a real RPI-RF-MOD, GPIO chip lookup on a Pi 5 | **needs a hardware test** (GPIO 18 on the HM-MOD-RPI-PCB worked before) |
+| resetting a real RPI-RF-MOD on GPIO 19 | tested on a Pi 3 B+ (firmware 4.4.22, gokrazy): reset, bootloader, CHANGE_APP, application |
+| resetting an HM-MOD-RPI-PCB on GPIO 18 with the current sequence (50 ms low, 50 ms high, released) | **needs a hardware test** (the sequence of OpenCCU's driver; the old one worked) |
+| GPIO chip lookup on a Pi 5 | **needs a hardware test** |
 | RTC/LED overlay `contrib/raspberrypi/hmbridge-rpi-rf-mod.dts` | compiles; **needs a hardware test** |
 | factory-reset procedures below | from eQ-3's manuals where marked; others **unverified** |
 

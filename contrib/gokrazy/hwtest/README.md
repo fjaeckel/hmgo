@@ -45,12 +45,17 @@ and these parts are new on real hardware:
 
 * **Serial port:** the standard PL011 driver (`/dev/ttyAMA0`, line set up
   by hmbridge) instead of eQ-3's raw-uart driver.
-* **Reset and cold start:** hmbridge pulls GPIO 19 low for 150 ms, then
-  takes the module from its bootloader into the application. On OpenCCU,
-  OpenCCU had already started the module.
+* **Reset and cold start:** hmbridge resets the module like OpenCCU's
+  driver (50 ms low, 50 ms high, then the line released), then takes it
+  from its bootloader into the application. On OpenCCU, OpenCCU had
+  already started the module. The RPI-RF-MOD's reset is active high: the
+  first version of this code held it in reset (fixed, verified on a Pi 3
+  B+ with firmware 4.4.22).
 * **Detection:** without the RTC overlay, hmbridge asks the module
-  (IDENTIFY) which reset line to use. If no answer comes, it falls back
-  to GPIO 18, the HM-MOD-RPI-PCB's line. `"radio": "rpi-rf-mod"` in
+  (IDENTIFY) which reset line to use. It answers in its bootloader and in
+  its application. If no answer comes (a hung module), hmbridge resets
+  GPIO 19 and listens for the RPI-RF-MOD's announcement before falling
+  back to GPIO 18, the HM-MOD-RPI-PCB's line. `"radio": "rpi-rf-mod"` in
   `hmbridge.json` skips the question and always uses GPIO 19.
 
 Every boot exercises all three, so the reboot and power-cut tests matter
@@ -96,7 +101,8 @@ gok --parent_dir ~/gokrazy -i hmbridge-debug logs -s hmbridge    # the log, live
 ```
 
 First check the startup lines in the log: `reset the radio module via
-GPIO 19 … (RPI-RF-MOD reset line: the module answered IDENTIFY)`, then
+GPIO 19 … (RPI-RF-MOD reset line: the module answered IDENTIFY)` (or
+`…: the module announced itself after a reset on it`), then
 `radio module ready: RPI-RF-MOD, firmware …`. If detection picks GPIO 18
 or the module does not come up, set `"radio": "rpi-rf-mod"` and try again
 (`gok update`). That tells detection problems apart from reset problems.

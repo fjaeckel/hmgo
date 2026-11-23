@@ -96,3 +96,29 @@ func probeDualBoard(rw io.Writer, fr *frameReader) string {
 		}
 	}
 }
+
+// ListenKind reads what the module sends until timeout, e.g. the
+// announcement after a reset, and returns the module kind the first
+// telling frame implies (KindRPIRFMod, KindHMModRPIPCB), or "" if none
+// arrived. It sends nothing. The read deadline is cleared on return.
+func ListenKind(rw DeadlineReadWriter, timeout time.Duration) (string, error) {
+	if err := rw.SetReadDeadline(time.Now().Add(timeout)); err != nil {
+		return "", fmt.Errorf("uartgw: listen: %w", err)
+	}
+	defer rw.SetReadDeadline(time.Time{})
+	fr := newFrameReader(rw)
+	for {
+		f, err := fr.next()
+		switch {
+		case errors.Is(err, errBadFrame):
+			continue
+		case errors.Is(err, os.ErrDeadlineExceeded):
+			return "", nil
+		case err != nil:
+			return "", fmt.Errorf("uartgw: reading from radio module: %w", err)
+		}
+		if kind, _ := classify(f); kind != "" {
+			return kind, nil
+		}
+	}
+}
