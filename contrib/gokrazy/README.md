@@ -366,8 +366,16 @@ heartbeat (`dtparam=act_led_trigger=heartbeat`):
 | all off | no power, or the kernel has stopped |
 
 With the power LED off, the Pi no longer shows a weak power supply on it.
-The Pi still detects undervoltage itself (`/sys/class/hwmon/*/in0_lcrit_alarm`,
-sensor `rpi_volt`). The Zero 2 W has no power LED. To get the power LED
+hmbridge reports it instead, from the Pi's undervoltage alarm (sensor
+`rpi_volt`, read every 2 s):
+
+* in the log: `WARNING: undervoltage: the Raspberry Pi's power supply is too weak …`;
+* as metrics: `hmbridge_system_undervoltage` (1 while it lasts) and
+  `hmbridge_system_undervoltage_events_total` (also catches short dips);
+* in `/api/v1/health`, as status `degraded` with a warning;
+* as an alert in
+  [contrib/prometheus/hmbridge.rules.yml](../prometheus/hmbridge.rules.yml)
+  (`HomematicPiUndervoltage`). The Zero 2 W has no power LED. To get the power LED
 back, remove the line from `BootloaderExtraLines` in `config.json` and run
 `gok update`.
 

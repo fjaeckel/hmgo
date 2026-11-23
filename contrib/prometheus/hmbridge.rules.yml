@@ -22,6 +22,16 @@ groups:
         annotations:
           summary: "The Pi's clock is not NTP-synchronised; hmbridge does not answer the devices' time requests"
 
+      - alert: HomematicPiUndervoltage
+        # The Raspberry Pi's power supply is too weak (below about
+        # 4.63 V): SD card corruption, radio module resets. The counter
+        # also catches short dips between two scrapes.
+        expr: hmbridge_system_undervoltage == 1 or increase(hmbridge_system_undervoltage_events_total[1h]) > 0
+        labels: { severity: warning }
+        annotations:
+          summary: "The Raspberry Pi running hmbridge reports undervoltage: its power supply is too weak"
+          description: "Use a stronger power supply (2.5 A for a Pi 3, 3 A for a Pi 4) and a short, thick cable."
+
       - alert: HomematicBatteryLow
         expr: hmbridge_device_low_battery == 1
         for: 1h

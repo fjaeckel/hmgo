@@ -270,6 +270,7 @@ Everything is under `/metrics` on the status port (default `:8013`):
 | `hmbridge_pairing_*` | Pairing: attempts by result, unpairings, pairing mode active, number of paired devices. |
 | `hmbridge_control_fallback_active` | Groups and thermostats under Home Assistant control: 1 while the fail-safe runs the week program. |
 | `hmbridge_settings_operations_total` | Device settings: reads and writes by result (ok, failed, pending, rejected). |
+| `hmbridge_system_*` | The system: clock synchronised (`clock_synced`), and on a Raspberry Pi its undervoltage alarm (`undervoltage`, 1 while the power supply is too weak; `undervoltage_events_total`). |
 | `hmheating_*`, `hmthermal_*`, `hmcontact_*` | Raw decoded device events, kept compatible with hmgo. |
 
 Example alerting rules are in

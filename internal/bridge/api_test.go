@@ -241,6 +241,33 @@ func TestAPIHealthDegradedAndDown(t *testing.T) {
 	}
 }
 
+// Undervoltage of the Raspberry Pi makes the health report degraded
+// with a warning, and nothing else.
+func TestAPIHealthUndervoltage(t *testing.T) {
+	var under atomic.Bool
+	e := newEnvWith(t, testConfig, fakemod.Options{}, func(o *Options) { o.Undervoltage = under.Load })
+	h := e.b.API(APIOptions{})
+	health := func() map[string]any {
+		r := apiDo(h, "GET", "/api/v1/health")
+		if r.code != http.StatusOK {
+			t.Errorf("status code %d", r.code)
+		}
+		return r.json(t)
+	}
+	if v := health(); v["status"] != "ok" || len(v["warnings"].([]any)) != 0 {
+		t.Errorf("without undervoltage: %v", v)
+	}
+	under.Store(true)
+	v := health()
+	if w := v["warnings"].([]any); v["status"] != "degraded" || len(w) != 1 || !strings.Contains(w[0].(string), "undervoltage") {
+		t.Errorf("with undervoltage: %v", v)
+	}
+	under.Store(false)
+	if v := health(); v["status"] != "ok" {
+		t.Errorf("after undervoltage: %v", v)
+	}
+}
+
 // No response contains key material: neither the system key (also
 // given to AES devices on pairing) nor the eQ-3 default key, in any
 // encoding.

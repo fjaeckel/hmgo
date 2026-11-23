@@ -74,6 +74,10 @@ type Options struct {
 	// nil means asking the kernel (adjtimex). Only consulted when the
 	// configuration requires a synced clock.
 	ClockSynced func() bool
+	// Undervoltage reports whether the Raspberry Pi's power supply is
+	// too weak right now (internal/power); nil if the system has no
+	// such sensor. Undervoltage makes the health report "degraded".
+	Undervoltage func() bool
 	// HousekeepingInterval is how often device availability is checked
 	// and a state file save is considered. Zero means 1 minute.
 	HousekeepingInterval time.Duration
@@ -124,6 +128,7 @@ type Bridge struct {
 	releaseCheck time.Duration
 	retries      int
 	clockSync    func() bool
+	undervoltage func() bool
 	housekeep    time.Duration
 	store        *store.Store
 	stateFile    *store.File // nil = no state file
@@ -310,6 +315,7 @@ func New(opts Options) (*Bridge, error) {
 		retryDelay:   opts.RetryDelay,
 		retries:      opts.Retries,
 		clockSync:    opts.ClockSynced,
+		undervoltage: opts.Undervoltage,
 		housekeep:    opts.HousekeepingInterval,
 		store:        opts.Store,
 		pairTick:     opts.PairingTick,

@@ -315,6 +315,10 @@ func (b *Bridge) Health(configWarnings []string) APIHealth {
 		degraded = true
 		h.Warnings = append(h.Warnings, "system clock not synchronised (NTP): device time requests are not answered")
 	}
+	if b.undervoltage != nil && b.undervoltage() {
+		degraded = true
+		h.Warnings = append(h.Warnings, "undervoltage: the Raspberry Pi's power supply is too weak")
+	}
 	if degraded && h.Status == HealthOK {
 		h.Status = HealthDegraded
 	}

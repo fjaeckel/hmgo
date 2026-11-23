@@ -22,6 +22,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"sync"
 	"syscall"
 	"time"
 
@@ -35,6 +36,7 @@ import (
 	"github.com/fjaeckel/hmgo/internal/gpio"
 	"github.com/fjaeckel/hmgo/internal/ha"
 	"github.com/fjaeckel/hmgo/internal/hmkey"
+	"github.com/fjaeckel/hmgo/internal/power"
 	"github.com/fjaeckel/hmgo/internal/store"
 	"github.com/fjaeckel/hmgo/internal/uartgw"
 	"github.com/fjaeckel/hmgo/licenses"
@@ -74,6 +76,10 @@ var configInsecure = prometheus.NewGauge(prometheus.GaugeOpts{
 })
 
 func init() { prometheus.MustRegister(buildInfo, configInsecure) }
+
+// powerMetrics registers the undervoltage metrics once (run is called
+// more than once in tests).
+var powerMetrics = sync.OnceValue(func() *power.Metrics { return power.NewMetrics(prometheus.DefaultRegisterer) })
 
 func main() {
 	if len(os.Args) > 1 {
@@ -195,6 +201,12 @@ func run(ctx context.Context, cfg *config.Config, uart io.ReadWriteCloser) error
 		log.Printf("state_dir is \"\": no state file, pairing disabled")
 	}
 	opts := bridge.Options{Config: cfg, Radio: conn, Debugf: debugf, HMIP: hmipMon, Version: version(), Store: st}
+	// The Raspberry Pi's undervoltage alarm, if it has one.
+	if alarm := power.FindSensor("/sys"); alarm != "" {
+		mon := power.NewMonitor(alarm, powerMetrics(), log.Printf)
+		go mon.Run(ctx, power.PollInterval)
+		opts.Undervoltage = mon.Undervoltage
+	}
 	if testBridgeOptions != nil {
 		testBridgeOptions(&opts)
 	}

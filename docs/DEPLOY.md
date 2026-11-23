@@ -667,7 +667,7 @@ firewall rule).
 | endpoint | content |
 |---|---|
 | `GET /` | index of the endpoints |
-| `GET /api/v1/health` | `status` (`ok`, `degraded`, `down`), `radio` (`ok`, `kind`, `last_error`), `mqtt` (`enabled`, `connected`), `clock_synced`, `clock_sync_required`, `warnings`. HTTP 200 for `ok` and `degraded`, **503 for `down`** |
+| `GET /api/v1/health` | `status` (`ok`, `degraded`, `down`), `radio` (`ok`, `kind`, `last_error`), `mqtt` (`enabled`, `connected`), `clock_synced`, `clock_sync_required`, `warnings`. HTTP 200 for `ok` and `degraded`, **503 for `down`**. `degraded` also while a Raspberry Pi reports undervoltage (its power supply is too weak). |
 | `GET /api/v1/bridge` | `version`, `go_version`, `started`, `uptime_seconds`, `module` (`kind`, `firmware`, `serial`, `sgtin`), `central_address`, `state_dir`, `pairing` (`enabled`, `disabled_reason`, `active`, `status`, `remaining_seconds`, `aes`, `last_result`, `last_result_at`, `unpair_waiting`), `devices` (count), `command_queue`, `warnings` (insecure configuration permissions, `devices.json` problems) |
 | `GET /api/v1/devices` | list of devices, each as below |
 | `GET /api/v1/devices/{address}` | one device (address: 6 hex digits, any case; 404 if unknown): `name`, `model`, `address`, `serial`, `source` (`config` or `paired`), `group`, `available`, `last_seen`, `rssi`, `messages_received`, `aes` (`enabled`, `channels`, `key_index`), `last_event`, `summary`, `last_command`, `state` (exactly as published to Home Assistant on `hmbridge/<address>/state`), `settings` (as published on `hmbridge/<address>/settings`: `current`, `status`, `detail` per changed setting, `read_at`; `null` for models without settings) |
