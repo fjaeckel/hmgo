@@ -88,9 +88,17 @@ var (
 		Namespace: "hmbridge", Subsystem: "device", Name: "unauthenticated_ignored_total",
 		Help: "Messages from AES devices that were ignored because they were not AES-authenticated (see hmbridge_aes_rejected_total for the reasons).",
 	}, []string{"address", "name"})
+	metricDeviceInfo = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: "hmbridge", Subsystem: "device", Name: "info",
+		Help: "Always 1 per device; group is the heating group it belongs to (\"\" for none). Join on address to group other device metrics by room.",
+	}, []string{"address", "name", "model", "group"})
 	metricClockSynced = prometheus.NewGauge(prometheus.GaugeOpts{
 		Namespace: "hmbridge", Name: "system_clock_synced",
 		Help: "1 if the kernel reports the system clock as NTP-synchronised.",
+	})
+	metricClockSyncRequired = prometheus.NewGauge(prometheus.GaugeOpts{
+		Namespace: "hmbridge", Name: "system_clock_sync_required",
+		Help: "1 if hmbridge hands out the time only while the clock is NTP-synchronised (require_synced_clock), so that hmbridge_system_clock_synced == 0 matters.",
 	})
 	metricTimeRequestsSkipped = prometheus.NewCounter(prometheus.CounterOpts{
 		Namespace: "hmbridge", Name: "time_requests_skipped_total",
@@ -167,6 +175,7 @@ func init() {
 		metricValve, metricHumidity, metricSabotage, metricFault,
 		metricAuth, metricDecodeErrors, metricForeignDest,
 		metricAvailable, metricUnauthenticated, metricClockSynced, metricTimeRequestsSkipped,
+		metricDeviceInfo, metricClockSyncRequired,
 		metricFrames, metricUnknownSenders, metricCommands, metricQueueLength,
 		metricLevel, metricLEDColor, metricButtonPresses, metricStatusPolls,
 		metricPairing, metricUnpair, metricPairingActive, metricPairedDevices,

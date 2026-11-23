@@ -322,6 +322,11 @@ func (b *Bridge) checkAvailability(now time.Time) []ha.Message {
 			}
 		}
 		metricAvailable.WithLabelValues(d.desc.Addr, labelValue(d.cfg.Name), d.cfg.Model).Set(boolFloat(online))
+		groupName := ""
+		if d.group != nil {
+			groupName = d.group.name
+		}
+		metricDeviceInfo.WithLabelValues(d.desc.Addr, labelValue(d.cfg.Name), d.cfg.Model, labelValue(groupName)).Set(1)
 	}
 	msgs = append(msgs, b.hmipAvailabilityLocked(now, topics)...)
 	for _, g := range b.groups {

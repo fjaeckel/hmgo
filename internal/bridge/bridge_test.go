@@ -19,6 +19,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
+
 	"github.com/fjaeckel/hmgo/internal/config"
 	"github.com/fjaeckel/hmgo/internal/ha"
 	"github.com/fjaeckel/hmgo/internal/uartgw"
@@ -1167,5 +1169,28 @@ func TestUndervoltageSensor(t *testing.T) {
 	e2.b.SystemChanged()
 	if p := e2.pub.get(state); p != nil {
 		t.Errorf("system state published without a sensor: %s", p)
+	}
+}
+
+// hmbridge_device_info names each device's heating group, so that
+// dashboards can group device metrics by room; and
+// hmbridge_system_clock_sync_required follows require_synced_clock.
+func TestDeviceInfoAndClockMetrics(t *testing.T) {
+	cfg := strings.Replace(testConfig, `"members": ["Wohnzimmer Heizung", "Wohnzimmer Heizung 2", `, `"members": ["Wohnzimmer Heizung", `, 1) // Heizung 2: in no group
+	if cfg == testConfig {
+		t.Fatal("test configuration changed: group members not found")
+	}
+	e := newEnv(t, cfg, fakemod.Options{})
+	e.waitFor("device info", func() bool {
+		return testutil.ToFloat64(metricDeviceInfo.WithLabelValues("38f59c", "Wohnzimmer Heizung", "HM-CC-RT-DN", "Wohnzimmer")) == 1
+	})
+	if v := testutil.ToFloat64(metricDeviceInfo.WithLabelValues("38f5a1", "Wohnzimmer Heizung 2", "HM-CC-RT-DN", "")); v != 1 {
+		t.Errorf("device outside any group: info %v, want 1 with group \"\"", v)
+	}
+	if v := testutil.ToFloat64(metricDeviceInfo.WithLabelValues("4c5d6e", "Wohnzimmer Fenster", "HM-Sec-SCo", "Wohnzimmer")); v != 1 {
+		t.Errorf("window contact: info %v", v)
+	}
+	if v := testutil.ToFloat64(metricClockSyncRequired); v != 1 { // require_synced_clock defaults to true
+		t.Errorf("clock_sync_required %v, want 1", v)
 	}
 }

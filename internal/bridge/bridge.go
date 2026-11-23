@@ -418,6 +418,7 @@ func New(opts Options) (*Bridge, error) {
 		b.bySlug[slug] = g
 	}
 	b.setupControl(opts)
+	metricClockSyncRequired.Set(boolFloat(b.cfg.RequiresSyncedClock()))
 	if b.stateFile != nil {
 		if err := b.loadState(b.stateFile); err != nil {
 			b.logf("state file: %v", err)

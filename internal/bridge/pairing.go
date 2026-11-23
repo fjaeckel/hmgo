@@ -1115,7 +1115,7 @@ var deviceMetricVecs = []interface {
 	metricLowBattery, metricWindowOpen, metricCurrentTemp, metricTargetTemp, metricValve,
 	metricHumidity, metricSabotage, metricFault, metricAuth, metricForeignDest, metricAvailable,
 	metricUnauthenticated, metricDecodeErrors, metricLevel, metricLEDColor, metricButtonPresses,
-	metricStatusPolls,
+	metricStatusPolls, metricDeviceInfo,
 }
 
 // deleteDeviceMetrics removes the metric series of a device.
