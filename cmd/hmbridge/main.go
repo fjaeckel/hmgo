@@ -201,11 +201,12 @@ func run(ctx context.Context, cfg *config.Config, uart io.ReadWriteCloser) error
 		log.Printf("state_dir is \"\": no state file, pairing disabled")
 	}
 	opts := bridge.Options{Config: cfg, Radio: conn, Debugf: debugf, HMIP: hmipMon, Version: version(), Store: st}
-	// The Raspberry Pi's undervoltage alarm, if it has one.
+	// The Raspberry Pi's undervoltage alarm, if it has one; started
+	// below, once the bridge can publish its changes.
+	var powerMon *power.Monitor
 	if alarm := power.FindSensor("/sys"); alarm != "" {
-		mon := power.NewMonitor(alarm, powerMetrics(), log.Printf)
-		go mon.Run(ctx, power.PollInterval)
-		opts.Undervoltage = mon.Undervoltage
+		powerMon = power.NewMonitor(alarm, powerMetrics(), log.Printf)
+		opts.Undervoltage = powerMon.Undervoltage
 	}
 	if testBridgeOptions != nil {
 		testBridgeOptions(&opts)
@@ -213,6 +214,10 @@ func run(ctx context.Context, cfg *config.Config, uart io.ReadWriteCloser) error
 	b, err := bridge.New(opts)
 	if err != nil {
 		return err
+	}
+	if powerMon != nil {
+		powerMon.OnChange = func(bool) { b.SystemChanged() }
+		go powerMon.Run(ctx, power.PollInterval)
 	}
 	if err := b.Setup(ctx); err != nil {
 		return err

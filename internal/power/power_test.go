@@ -65,6 +65,12 @@ func TestMonitor(t *testing.T) {
 		mu.Unlock()
 	}
 	m := NewMonitor(alarm, metrics, logf)
+	var changes []bool
+	m.OnChange = func(under bool) {
+		mu.Lock()
+		changes = append(changes, under)
+		mu.Unlock()
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go m.Run(ctx, 5*time.Millisecond)
@@ -104,6 +110,9 @@ func TestMonitor(t *testing.T) {
 		case strings.HasPrefix(l, "undervoltage over"):
 			normal++
 		}
+	}
+	if want := []bool{true, false, true}; fmt.Sprint(changes) != fmt.Sprint(want) {
+		t.Errorf("OnChange calls %v, want %v", changes, want)
 	}
 	if warnings != 2 || normal != 1 {
 		t.Errorf("log: %d warnings, %d recoveries, want 2 and 1: %q", warnings, normal, lines)

@@ -31,6 +31,22 @@ func NameMessage(cfg TopicConfig, addr, name string) Message {
 // PairingTopic is the retained JSON pairing state topic.
 func (c TopicConfig) PairingTopic() string { return c.base() + "/bridge/pairing" }
 
+// SystemTopic is the retained JSON SystemState topic.
+func (c TopicConfig) SystemTopic() string { return c.base() + "/bridge/system" }
+
+// SystemState is the state of the system hmbridge runs on.
+type SystemState struct {
+	// Undervoltage: the Raspberry Pi's power supply is too weak right
+	// now (internal/power).
+	Undervoltage bool `json:"undervoltage"`
+}
+
+// SystemStateMessage returns the retained system state message.
+func SystemStateMessage(cfg TopicConfig, s SystemState) Message {
+	b, _ := json.Marshal(s) // only plain fields
+	return retained(cfg.SystemTopic(), b)
+}
+
 // PairCommandTopic is the topic that starts pairing mode.
 func (c TopicConfig) PairCommandTopic() string { return c.base() + "/bridge/set/pair" }
 
@@ -77,6 +93,7 @@ func bridgeNode(cfg TopicConfig, swVersion string) node {
 		cmdTopic: func(what string) string {
 			return cfg.base() + "/bridge/set/" + what
 		},
+		topic:  func(suffix string) string { return cfg.base() + "/bridge/" + suffix },
 		device: dev,
 	}
 }
@@ -110,6 +127,15 @@ func bridgeEntities() []entity {
 			"icon":           "mdi:link-variant",
 			"value_template": textTemplate("status", "None"),
 		}},
+		{component: "binary_sensor", key: "undervoltage", stateSuffix: "system", config: map[string]any{
+			"name":            "Undervoltage",
+			"device_class":    "problem",
+			"entity_category": "diagnostic",
+			"icon":            "mdi:flash-alert",
+			"payload_on":      "ON",
+			"payload_off":     "OFF",
+			"value_template":  "{{ 'ON' if value_json.undervoltage else 'OFF' }}",
+		}},
 		{component: "sensor", key: "pairing_last_result", config: map[string]any{
 			"name": "Last pairing result",
 			"icon": "mdi:message-text-outline",
@@ -120,15 +146,25 @@ func bridgeEntities() []entity {
 	}
 }
 
+// BridgeOptions selects hmbridge's own HA entities.
+type BridgeOptions struct {
+	// PairingEnabled: the “Pair new device” button (without it, the
+	// pairing sensors show "disabled").
+	PairingEnabled bool
+	// Undervoltage: the system has an undervoltage sensor (a Raspberry
+	// Pi), shown as the binary sensor “Undervoltage” (SystemState).
+	Undervoltage bool
+}
+
 // BridgeDiscoveryMessages returns the discovery messages of hmbridge's
-// own HA device: the “Pair new device” button and the pairing mode
-// sensors. With pairing disabled, the button is removed and the sensors
-// show "disabled".
-func BridgeDiscoveryMessages(cfg TopicConfig, swVersion string, pairingEnabled bool) []Message {
+// own HA device: the “Pair new device” button, the pairing mode sensors
+// and, on a Raspberry Pi, the undervoltage sensor. Entities that are not
+// selected are removed.
+func BridgeDiscoveryMessages(cfg TopicConfig, swVersion string, opts BridgeOptions) []Message {
 	n := bridgeNode(cfg, swVersion)
 	var msgs []Message
 	for _, e := range bridgeEntities() {
-		if e.key == "pair" && !pairingEnabled {
+		if (e.key == "pair" && !opts.PairingEnabled) || (e.key == "undervoltage" && !opts.Undervoltage) {
 			msgs = append(msgs, retained(entityTopic(cfg, e.component, n.id, e.key), nil))
 			continue
 		}

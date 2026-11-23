@@ -233,6 +233,7 @@ once the MQTT integration is set up. Topics, with base topic `hmbridge`:
 | `hmbridge/<address>/event/button_<n>` | `{"event_type": "press_short", "button": 1}`, not retained (remotes) |
 | `hmbridge/bridge/set/pair` | `PRESS` (or seconds, 10 … 600): start pairing mode |
 | `hmbridge/bridge/pairing` | JSON pairing state: `status`, `active`, `remaining`, `last_result` |
+| `hmbridge/bridge/system` | JSON system state on a Raspberry Pi: `undervoltage` (the binary sensor "Undervoltage" on the hmbridge device) |
 | `hmbridge/<address>/set/unpair`, `…/set/name` | unpair / rename a device paired with hmbridge |
 | `hmbridge/<address>/settings` | JSON device settings: `current` values, `status`, `detail` per setting, `read_at` |
 | `hmbridge/<address>/set/setting_<key>` | change a setting, e.g. `setting_temperature_offset` `1.5`, `setting_week_profile_monday` `06:00 17, 22:00 21, 24:00 17` |

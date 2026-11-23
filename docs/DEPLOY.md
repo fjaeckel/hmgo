@@ -726,7 +726,9 @@ entity and an "Unpair" button (disabled by default). Devices with settings
 (section 6) have configuration entities, a "Settings" status sensor and a
 "Refresh settings" button. hmbridge itself appears
 as the device "hmbridge" with the "Pair new device" button and the pairing
-sensors. Each heating group is a device "*name* (group)" with its climate
+sensors. On a Raspberry Pi it also has the diagnostic binary sensor
+"Undervoltage" (device class problem): on while the Pi's power supply is
+too weak. Each heating group is a device "*name* (group)" with its climate
 entity and one entity per member (see
 [Heating groups in Home Assistant](#heating-groups-in-home-assistant)).
 

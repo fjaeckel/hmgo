@@ -372,6 +372,8 @@ hmbridge reports it instead, from the Pi's undervoltage alarm (sensor
 * in the log: `WARNING: undervoltage: the Raspberry Pi's power supply is too weak …`;
 * as metrics: `hmbridge_system_undervoltage` (1 while it lasts) and
   `hmbridge_system_undervoltage_events_total` (also catches short dips);
+* in Home Assistant, as the binary sensor **Undervoltage** on the hmbridge
+  device (a diagnostic "problem" sensor: "OK" or "Problem");
 * in `/api/v1/health`, as status `degraded` with a warning;
 * as an alert in
   [contrib/prometheus/hmbridge.rules.yml](../prometheus/hmbridge.rules.yml)

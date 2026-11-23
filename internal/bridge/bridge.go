@@ -543,6 +543,22 @@ func (b *Bridge) SetPublisher(p Publisher) {
 	}
 }
 
+// systemState returns the state of the system hmbridge runs on.
+func (b *Bridge) systemState() ha.SystemState {
+	return ha.SystemState{Undervoltage: b.undervoltage != nil && b.undervoltage()}
+}
+
+// SystemChanged publishes the system state (Options.Undervoltage) to
+// Home Assistant. Call it when it changes (power.Monitor's OnChange).
+func (b *Bridge) SystemChanged() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.pub == nil || b.undervoltage == nil {
+		return
+	}
+	b.outbox.put(ha.SystemStateMessage(b.pub.Topics(), b.systemState()))
+}
+
 // Commands returns the channel on which Home Assistant commands are
 // accepted (typically fed from ha.Client.Commands).
 func (b *Bridge) Commands() chan<- ha.Command { return b.commands }
@@ -565,8 +581,14 @@ func (b *Bridge) PublishAll() {
 		// entities (button events/triggers, LED selects included).
 		stale, b.allStaleSent = ha.AllStaleDiscoveryMessages, true
 	}
-	msgs = append(msgs, ha.BridgeDiscoveryMessages(topics, b.version, b.pair.enabled)...)
+	msgs = append(msgs, ha.BridgeDiscoveryMessages(topics, b.version, ha.BridgeOptions{
+		PairingEnabled: b.pair.enabled,
+		Undervoltage:   b.undervoltage != nil,
+	})...)
 	msgs = append(msgs, ha.PairingStateMessage(topics, b.pairingStateLocked(b.now())))
+	if b.undervoltage != nil {
+		msgs = append(msgs, ha.SystemStateMessage(topics, b.systemState()))
+	}
 	for _, d := range b.devices {
 		msgs = append(msgs, ha.DiscoveryMessages(topics, d.desc)...)
 		msgs = append(msgs, stale(topics, d.desc)...)

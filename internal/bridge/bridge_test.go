@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1137,3 +1138,34 @@ func (nopRadio) Recv() <-chan []byte                          { return nil }
 func (nopRadio) Err() error                                   { return nil }
 func (nopRadio) AddPeer(context.Context, uartgw.Peer) error   { return nil }
 func (nopRadio) SetTime(context.Context, time.Time) error     { return nil }
+
+// The undervoltage sensor: discovered and published on the Raspberry Pi
+// (Options.Undervoltage set), updated by SystemChanged, removed
+// elsewhere.
+func TestUndervoltageSensor(t *testing.T) {
+	const (
+		disc  = "homeassistant/binary_sensor/hmbridge_bridge/undervoltage/config"
+		state = "hmbridge/bridge/system"
+	)
+	var under atomic.Bool
+	e := newEnvWith(t, testConfig, fakemod.Options{}, func(o *Options) { o.Undervoltage = under.Load })
+	e.b.PublishAll()
+	e.waitFor("discovery and state", func() bool {
+		return len(e.pub.get(disc)) > 0 && string(e.pub.get(state)) == `{"undervoltage":false}`
+	})
+	under.Store(true)
+	e.b.SystemChanged()
+	e.waitFor("undervoltage published", func() bool { return string(e.pub.get(state)) == `{"undervoltage":true}` })
+
+	// Not a Raspberry Pi: no sensor, an old one removed.
+	e2 := newEnv(t, testConfig, fakemod.Options{})
+	e2.b.PublishAll()
+	e2.waitFor("pairing state", func() bool { return len(e2.pub.get("hmbridge/bridge/pairing")) > 0 })
+	if p := e2.pub.get(disc); len(p) != 0 {
+		t.Errorf("undervoltage sensor discovered without a sensor: %s", p)
+	}
+	e2.b.SystemChanged()
+	if p := e2.pub.get(state); p != nil {
+		t.Errorf("system state published without a sensor: %s", p)
+	}
+}

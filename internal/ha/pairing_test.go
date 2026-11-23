@@ -109,7 +109,7 @@ func TestPairedDeviceEntities(t *testing.T) {
 }
 
 func TestBridgeDiscovery(t *testing.T) {
-	msgs := BridgeDiscoveryMessages(TopicConfig{}, "v1.2", true)
+	msgs := BridgeDiscoveryMessages(TopicConfig{}, "v1.2", BridgeOptions{PairingEnabled: true, Undervoltage: true})
 	got := map[string]map[string]any{}
 	for _, m := range msgs {
 		got[m.Topic] = decode(t, m)
@@ -128,10 +128,26 @@ func TestBridgeDiscovery(t *testing.T) {
 			t.Errorf("%s: %v", key, e)
 		}
 	}
-	for _, m := range BridgeDiscoveryMessages(TopicConfig{}, "", false) {
-		if m.Topic == "homeassistant/button/hmbridge_bridge/pair/config" && len(m.Payload) != 0 {
-			t.Error("pair button published with pairing disabled")
+	uv := got["homeassistant/binary_sensor/hmbridge_bridge/undervoltage/config"]
+	if uv == nil || uv["state_topic"] != "hmbridge/bridge/system" || uv["device_class"] != "problem" ||
+		uv["entity_category"] != "diagnostic" || uv["availability_topic"] != "hmbridge/bridge/availability" ||
+		uv["value_template"] != "{{ 'ON' if value_json.undervoltage else 'OFF' }}" || uv["unique_id"] != "hmbridge_bridge_undervoltage" {
+		t.Errorf("undervoltage sensor %v", uv)
+	}
+	for _, m := range BridgeDiscoveryMessages(TopicConfig{}, "", BridgeOptions{}) {
+		switch m.Topic {
+		case "homeassistant/button/hmbridge_bridge/pair/config":
+			if len(m.Payload) != 0 {
+				t.Error("pair button published with pairing disabled")
+			}
+		case "homeassistant/binary_sensor/hmbridge_bridge/undervoltage/config":
+			if len(m.Payload) != 0 || !m.Retain {
+				t.Error("undervoltage sensor published without a sensor (want a retained removal)")
+			}
 		}
+	}
+	if m := SystemStateMessage(TopicConfig{}, SystemState{Undervoltage: true}); m.Topic != "hmbridge/bridge/system" || !m.Retain || string(m.Payload) != `{"undervoltage":true}` {
+		t.Errorf("system state %s %s", m.Topic, m.Payload)
 	}
 
 	m := PairingStateMessage(TopicConfig{}, PairingState{Status: PairingActive, Active: true, Remaining: 42, LastResult: "paired x"})

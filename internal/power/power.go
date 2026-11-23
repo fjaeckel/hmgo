@@ -72,6 +72,9 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 
 // Monitor polls the undervoltage alarm.
 type Monitor struct {
+	// OnChange, if set before Run, is called after the state changed.
+	OnChange func(undervoltage bool)
+
 	path    string
 	metrics *Metrics
 	logf    func(string, ...any)
@@ -127,6 +130,9 @@ func (m *Monitor) poll() {
 	}
 	if !changed {
 		return
+	}
+	if m.OnChange != nil {
+		defer m.OnChange(under)
 	}
 	if under {
 		m.metrics.Events.Inc()
