@@ -149,6 +149,9 @@ else
 	# The radio module needs the PL011 UART on GPIO 14/15 (/dev/ttyAMA0):
 	# Bluetooth off on the Pi 3, 4 and Zero 2; UART0 on the Pi 5's
 	# header. SerialConsole "disabled" keeps the kernel console off it.
+	# LEDs: the red power LED (always on, it only says "powered") is
+	# switched off, and the green activity LED blinks a heartbeat while
+	# the system runs.
 	i2c=
 	if [ $debug = 1 ]; then
 		i2c=', "dtparam=i2c_arm=on"'
@@ -159,7 +162,7 @@ else
     "[pi4]", "dtoverlay=disable-bt",
     "[pi02]", "dtoverlay=disable-bt",
     "[pi5]", "dtparam=uart0=on",
-    "[all]"'"$i2c"'
+    "[all]", "dtparam=pwr_led_trigger=none", "dtparam=act_led_trigger=heartbeat"'"$i2c"'
   ],'
 fi
 

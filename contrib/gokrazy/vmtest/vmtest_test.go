@@ -259,7 +259,7 @@ func TestRaspberryPiImage(t *testing.T) {
 	boot := img + "@@4194304"
 	config := run(t, repo, []string{"MTOOLS_SKIP_CHECK=1"}, mtype, "-i", boot, "::config.txt")
 	cmdline := run(t, repo, []string{"MTOOLS_SKIP_CHECK=1"}, mtype, "-i", boot, "::cmdline.txt")
-	for _, want := range []string{"enable_uart=1", "[pi4]\ndtoverlay=disable-bt", "[pi5]\ndtparam=uart0=on"} {
+	for _, want := range []string{"enable_uart=1", "[pi4]\ndtoverlay=disable-bt", "[pi5]\ndtparam=uart0=on", "dtparam=pwr_led_trigger=none", "dtparam=act_led_trigger=heartbeat"} {
 		if !strings.Contains(config, want) {
 			t.Errorf("config.txt lacks %q:\n%s", want, config)
 		}
