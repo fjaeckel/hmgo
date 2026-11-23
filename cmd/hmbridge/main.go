@@ -11,6 +11,7 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"flag"
 	"fmt"
@@ -45,6 +46,7 @@ var (
 	debugFrames = flag.Bool("debug", false, "log every frame exchanged with the radio module (keys are redacted) and every message hmbridge does not use")
 	showVersion = flag.Bool("version", false, "print the version and exit")
 	showLicense = flag.Bool("license", false, "print the licenses and exit")
+	createKey   = flag.Bool("create_key_file", false, "create security.key_file with a new random AES system key if it does not exist and no devices are configured or paired yet (for appliance images such as gokrazy, see contrib/gokrazy)")
 	probe       = flag.Bool("probe", false, "reset and identify the radio module, print its kind, firmware and serial number, and exit (see hmbridge probe -h)")
 )
 
@@ -107,19 +109,22 @@ func main() {
 	}
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 
-	cfg, err := config.Load(*configPath)
+	cfg, keyNote, err := loadConfig(*configPath, *createKey, *checkConfig, rand.Reader)
 	if err != nil {
 		log.Fatal(err)
 	}
 	if *checkConfig {
 		fmt.Printf("%s: OK (%d devices, %d groups)\n", *configPath, len(cfg.Devices), len(cfg.Groups))
+		if keyNote != "" {
+			fmt.Println(keyNote)
+		}
 		for _, m := range cfg.Deprecations() {
 			fmt.Printf("warning: %s\n", m)
 		}
 		for _, m := range cfg.PermissionWarnings() {
 			fmt.Printf("WARNING: %s\n", m)
 		}
-		if s := cfg.Security; s != nil && s.KeyFile != "" {
+		if s := cfg.Security; s != nil && s.KeyFile != "" && keyNote == "" {
 			cur, _ := cfg.Keys()
 			fmt.Printf("AES system key: read from %s (index %d)\n", s.KeyFile, cur.Index)
 		}
@@ -130,6 +135,9 @@ func main() {
 			fmt.Printf("paired devices are read from %s (pairing AES: %s)\n", p, cfg.PairingAES())
 		}
 		return
+	}
+	if keyNote != "" {
+		log.Print(keyNote)
 	}
 	log.Printf("hmbridge %s (%s) starting, %d devices, %d groups", version(), runtime.Version(), len(cfg.Devices), len(cfg.Groups))
 

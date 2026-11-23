@@ -15,6 +15,12 @@ There are two ways to set up hmbridge:
 Sections 4 (Home Assistant), 5 (Adding devices) and 6 (Device settings)
 apply to both.
 
+A third way, an appliance image that runs only hmbridge on
+[gokrazy](https://gokrazy.org/) (read-only system, updates over the
+network to A/B root partitions), is described in
+[contrib/gokrazy](../contrib/gokrazy/README.md). It replaces steps 1 to 8
+of the fresh installation.
+
 ## Fresh installation (no OpenCCU)
 
 What you need: a Raspberry Pi 3 or 4 (a Pi 5 should work, see step 2), an

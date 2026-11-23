@@ -5,7 +5,7 @@ VERSION ?= $(shell git describe --tags --match 'v*' --always --dirty 2>/dev/null
 LDFLAGS := -s -w
 GOFLAGS := -trimpath
 
-.PHONY: build test dist clean
+.PHONY: build test dist clean gokrazy-vmtest
 
 build:
 	go build $(GOFLAGS) -ldflags '$(LDFLAGS)' -o hmbridge ./cmd/hmbridge
@@ -31,3 +31,13 @@ dist:
 
 clean:
 	rm -rf dist hmbridge
+
+# Acceptance test of the gokrazy image (contrib/gokrazy): builds it,
+# boots it in QEMU with an emulated radio module and updates it over
+# the network. Runs in a container (Docker, e.g. OrbStack) with QEMU,
+# mosquitto and gok; the Go module cache is kept in a volume.
+gokrazy-vmtest:
+	docker build -t hmbridge-vmtest contrib/gokrazy/vmtest
+	docker run --rm -v $(CURDIR):/src -v hmbridge-vmtest-gomod:/root/go/pkg/mod -w /src \
+		-e GOFLAGS=-buildvcs=false hmbridge-vmtest \
+		go test -tags vmtest -v -count=1 -timeout 30m ./contrib/gokrazy/vmtest/

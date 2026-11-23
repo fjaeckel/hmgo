@@ -49,3 +49,14 @@ jobs:
         with:
           name: hmbridge-binaries
           path: dist/
+
+  # The gokrazy image (contrib/gokrazy): built for QEMU, booted with an
+  # emulated radio module, a device paired, updated over the network.
+  # On an arm64 runner: the image is arm64 like the Raspberry Pi's, and
+  # QEMU emulates the same architecture (the test takes about a minute).
+  gokrazy:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Acceptance test of the gokrazy image
+        run: make gokrazy-vmtest

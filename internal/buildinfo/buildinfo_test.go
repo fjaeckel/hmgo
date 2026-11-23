@@ -28,3 +28,26 @@ func TestFormat(t *testing.T) {
 		}
 	}
 }
+
+func TestMainVersion(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		bi   debug.BuildInfo
+		want string
+	}{
+		{"main module", debug.BuildInfo{Main: debug.Module{Path: modulePath, Version: "v1.2.0"}}, "v1.2.0"},
+		{"dependency (gokrazy)", debug.BuildInfo{
+			Main: debug.Module{Path: "gokrazy/build/hmbridge", Version: "(devel)"},
+			Deps: []*debug.Module{{Path: "example.com/other", Version: "v9.9.9"}, {Path: modulePath, Version: "v1.3.0"}},
+		}, "v1.3.0"},
+		{"replaced by a local directory", debug.BuildInfo{
+			Main: debug.Module{Path: "gokrazy/build/hmbridge", Version: "(devel)"},
+			Deps: []*debug.Module{{Path: modulePath, Version: "v0.0.0", Replace: &debug.Module{Path: "../.."}}},
+		}, ""},
+		{"not a dependency", debug.BuildInfo{Main: debug.Module{Path: "example.com/x", Version: "v2.0.0"}}, "v2.0.0"},
+	} {
+		if got := mainVersion(&tc.bi); got != tc.want {
+			t.Errorf("%s: mainVersion = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}

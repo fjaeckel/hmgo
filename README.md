@@ -128,6 +128,9 @@ together with `press_long_release` when the button is let go.
 * Raspberry Pi OS (a fresh installation needs no CCU: `hmbridge init`
   creates the configuration and a new system key), or an existing OpenCCU
   installation to take over.
+  Or a [gokrazy](https://gokrazy.org/) SD card image that runs only
+  hmbridge, with A/B updates over the network: see
+  [contrib/gokrazy](contrib/gokrazy/README.md).
 
 ## Quick start
 
