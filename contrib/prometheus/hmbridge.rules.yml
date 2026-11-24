@@ -4,17 +4,6 @@
 groups:
   - name: hmbridge
     rules:
-      - alert: HomematicDeviceSilent
-        # hmbridge marks a device unavailable after its stale timeout
-        # (30m for thermostats, 6h for HM-Sec-SCo, 50h for other contacts;
-        # stale_after in the configuration).
-        expr: hmbridge_device_available == 0
-        for: 15m
-        labels: { severity: warning }
-        annotations:
-          summary: "{{ $labels.name }} ({{ $labels.model }}) has stopped reporting"
-          description: "Battery empty, out of range, or the radio module is not receiving."
-
       - alert: HomematicClockNotSynced
         # Only where hmbridge requires a synced clock (require_synced_clock;
         # off on gokrazy, whose NTP client never marks the clock synced).
